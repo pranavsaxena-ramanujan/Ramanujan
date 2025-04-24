@@ -131,6 +131,10 @@ enum BuiltInFunctions {
     TAN, // tan
     ASIN, // asin
     ACOS, // acos
+    ATAN, // atan
+    FLOOR,
+    CEIL,
+    EXP,
 };
 
 class BuiltInFunctionsImpl : public FunctionCommandRE {
@@ -210,6 +214,30 @@ public:
     void process() override;
 };
 
+class ATAN : public BuiltInFunctionsImpl {
+public:
+    ATAN(FunctionCall *pCall1) : BuiltInFunctionsImpl(pCall1) {}
+    void process() override;
+};
+
+class FLOOR : public BuiltInFunctionsImpl {
+public:
+    FLOOR(FunctionCall *pCall1) : BuiltInFunctionsImpl(pCall1) {}
+    void process() override;
+};
+
+class CEIL : public BuiltInFunctionsImpl {
+public:
+    CEIL(FunctionCall *pCall1) : BuiltInFunctionsImpl(pCall1) {}
+    void process() override;
+};
+
+class EXP : public BuiltInFunctionsImpl {
+public:
+    EXP(FunctionCall *pCall1) : BuiltInFunctionsImpl(pCall1) {}
+    void process() override;
+};
+
 
 static FunctionCommandRE* GetFunctionCommandRE(FunctionCall* functionCommand, std::string& id, std::unordered_map<std::string, RuleEngineInputUnits *> *map)
 {
@@ -232,6 +260,14 @@ static FunctionCommandRE* GetFunctionCommandRE(FunctionCall* functionCommand, st
         return new class ASIN(functionCommand);
     } else if(id == "ACOS") {
         return new class ACOS(functionCommand);
+    } else if(id == "ATAN") {
+        return new class ATAN(functionCommand);
+    } else if(id == "FLOOR") {
+        return new class FLOOR(functionCommand);
+    } else if(id == "CEIL") {
+        return new class CEIL(functionCommand);
+    } else if(id == "EXP") {
+        return new class EXP(functionCommand);
     }
 
     return new FunctionCommandRE(functionCommand, (FunctionCallRE *) map->at(functionCommand->id));
