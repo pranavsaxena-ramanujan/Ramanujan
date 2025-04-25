@@ -10,14 +10,24 @@ public:
     std::string arrayId;
     std::vector<std::string> newDimensions;
     std::vector<VariableRE*> dimensionVariableREs;
-
     std::vector<int> staticDimensions; // Stores integer values for static dimensions, 0 if not static
     std::vector<bool> isVariableDimension; // true if dimension is a variable, false if explicit integer
+
+    // Pointer to the ArrayValue* of the target ArrayRE
+    ArrayValue **arrayValuePtr = nullptr;
 
     void setFields(std::unordered_map<std::string, RuleEngineInputUnits*> *map) {
         dimensionVariableREs.clear();
         staticDimensions.clear();
         isVariableDimension.clear();
+        // Find the ArrayRE and keep pointer to its ArrayValue*
+        auto itArr = map->find(arrayId);
+        if (itArr != map->end()) {
+            ArrayRE* arrayRE = dynamic_cast<ArrayRE*>(itArr->second);
+            if (arrayRE) {
+                arrayValuePtr = arrayRE->getValPtr();
+            }
+        }
         for (const auto& varId : newDimensions) {
             auto it = map->find(varId);
             if (it != map->end()) {
@@ -46,8 +56,18 @@ public:
 
     // Optionally, initial values can be added here
 
+    int dimsCount = 0;
+    int* dims = nullptr;
+
     RedefineArrayCommandRE(const std::string& arrayId, const std::vector<std::string>& newDimensions)
-        : arrayId(arrayId), newDimensions(newDimensions) {}
+        : arrayId(arrayId), newDimensions(newDimensions) {
+        dimsCount = newDimensions.size();
+        dims = new int[dimsCount];
+    }
+
+    ~RedefineArrayCommandRE() {
+        if (dims) delete[] dims;
+    }
 
     void process(); // To be implemented: logic to redefine the array in memory
 };
