@@ -7,6 +7,5 @@ import java.util.List;
 public class RedefineArrayCommand {
     private String id;
     private String arrayId;
-    private List<Integer> newDimensions;
-    private Object initialValue; // Optional: can be null or a map of index->value
+    private List<String> newDimensions; 
 }

@@ -8,10 +8,45 @@
 class RedefineArrayCommandRE : public RuleEngineInputUnits {
 public:
     std::string arrayId;
-    std::vector<int> newDimensions;
+    std::vector<std::string> newDimensions;
+    std::vector<VariableRE*> dimensionVariableREs;
+
+    std::vector<int> staticDimensions; // Stores integer values for static dimensions, 0 if not static
+    std::vector<bool> isVariableDimension; // true if dimension is a variable, false if explicit integer
+
+    void setFields(std::unordered_map<std::string, RuleEngineInputUnits*> *map) {
+        dimensionVariableREs.clear();
+        staticDimensions.clear();
+        isVariableDimension.clear();
+        for (const auto& varId : newDimensions) {
+            auto it = map->find(varId);
+            if (it != map->end()) {
+                VariableRE* varRe = dynamic_cast<VariableRE*>(it->second);
+                if (varRe) {
+                    dimensionVariableREs.push_back(varRe);
+                    staticDimensions.push_back(0); // 0 or any sentinel value for non-static
+                    isVariableDimension.push_back(true);
+                    continue;
+                }
+            }
+            // If not found in map, check if it's an integer
+            bool isInt = !varId.empty() && std::all_of(varId.begin(), varId.end(), ::isdigit);
+            if (isInt) {
+                dimensionVariableREs.push_back(nullptr);
+                staticDimensions.push_back(std::stoi(varId));
+                isVariableDimension.push_back(false);
+            } else {
+                // Not a variable and not an integer, treat as invalid or unknown
+                dimensionVariableREs.push_back(nullptr);
+                staticDimensions.push_back(0);
+                isVariableDimension.push_back(false);
+            }
+        }
+    }
+
     // Optionally, initial values can be added here
 
-    RedefineArrayCommandRE(const std::string& arrayId, const std::vector<int>& newDimensions)
+    RedefineArrayCommandRE(const std::string& arrayId, const std::vector<std::string>& newDimensions)
         : arrayId(arrayId), newDimensions(newDimensions) {}
 
     void process(); // To be implemented: logic to redefine the array in memory

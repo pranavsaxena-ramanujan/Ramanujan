@@ -37,36 +37,47 @@ public class VariableInitLogicConverter implements CodeConverterLogic {
                     String variableNameTrimmed = variableName.trim();
                     String[] variableNameTrimmedWithIndex = variableNameTrimmed.split("\\[");
                     variableName = variableNameTrimmedWithIndex[0].trim();
-                    array = new Array();
+                    
                     boolean hasNonConstantDimension = false;
                     List<Integer> constantDims = new java.util.ArrayList<>();
-                    List<String> rawDims = new java.util.ArrayList<>();
+                    List<String> resolvedDims = new java.util.ArrayList<>();
                     for(int index = 1; index < variableNameTrimmedWithIndex.length; index++) {
                         String dimStr = variableNameTrimmedWithIndex[index].replace("]", "").trim();
-                        rawDims.add(dimStr);
                         try {
                             int dim = Integer.parseInt(dimStr);
                             constantDims.add(dim);
+                            resolvedDims.add(dimStr); // keep integer as string
                         } catch (NumberFormatException nfe) {
                             hasNonConstantDimension = true;
-                            // Use a placeholder (e.g., 1) for now, will be redefined at runtime
-                            constantDims.add(1);
+                            constantDims.add(1); // Use a placeholder for now
+                            // Resolve variable name to variable ID
+                            Variable dimVar = in.ramanujan.middleware.base.utils.CodeConversionUtils.getVariable(
+                                codeConverter.getVariableMap(), dimStr, variableScope);
+                            if (dimVar != null) {
+                                resolvedDims.add(dimVar.getId());
+                            } else {
+                                throw new CompilationException(null, null, "Dimension variable '" + dimStr + "' not found in scope");
+                            }
                         }
                     }
+                    array = new Array();
+                    if(!hasNonConstantDimension) {
+                    
                     array.setDimension(constantDims);
                     array.setId((variableScope.size() > 0 ? variableScope.get(variableScope.size() - 1) : "") +
                             UUID.randomUUID().toString());
                     array.setName(variableName);
                     array.setDataType(dataType);
                     ruleEngineInput.getArrays().add(array);
+                    
                     codeConverter.setArray(array, variableScope.size() > 0 ? variableScope.get(variableScope.size() - 1) : "");
+                    }
                     // If any dimension is not a constant, emit RedefineArrayCommand
                     if (hasNonConstantDimension) {
                         in.ramanujan.pojo.ruleEngineInputUnitsExt.array.RedefineArrayCommand redefineCmd = new in.ramanujan.pojo.ruleEngineInputUnitsExt.array.RedefineArrayCommand();
                         redefineCmd.setId(UUID.randomUUID().toString());
                         redefineCmd.setArrayId(array.getId());
-                        redefineCmd.setNewDimensions(constantDims);
-                        redefineCmd.setInitialValue(null);
+                        redefineCmd.setNewDimensions(resolvedDims);
                         in.ramanujan.pojo.ruleEngineInputUnitsExt.Command redefineCommand = new in.ramanujan.pojo.ruleEngineInputUnitsExt.Command();
                         redefineCommand.setId("command_" + UUID.randomUUID().toString());
                         redefineCommand.setRedefineArrayCommand(redefineCmd);

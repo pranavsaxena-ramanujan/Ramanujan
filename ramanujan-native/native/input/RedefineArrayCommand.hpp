@@ -11,14 +11,14 @@
 class RedefineArrayCommand : public RuleEngineInputUnit {
 public:
     std::string arrayId;
-    std::vector<int> newDimensions;
+    std::vector<std::string> newDimensions;
     // Optionally, initial values can be added here
 
     RedefineArrayCommand(Json::Value* value) {
         this->id = (*value)["id"].asString();
         this->arrayId = (*value)["arrayId"].asString();
         for (int i = 0; i < (*value)["newDimensions"].size(); i++) {
-            this->newDimensions.push_back((*value)["newDimensions"][i].asInt());
+            this->newDimensions.push_back((*value)["newDimensions"][i].asString());
         }
         // TODO: Parse initialValue if needed
     }
