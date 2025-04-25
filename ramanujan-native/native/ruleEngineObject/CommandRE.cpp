@@ -89,6 +89,12 @@ void CommandRE::setFields(std::unordered_map<std::string, RuleEngineInputUnits *
         commandTypeProcessingDefinition = new FunctionReProcessing(functionCommandRE);
     }
 
+    // Set the correct unit for RedefineArrayCommandRE after all other units, before DefaultRuleEngineUnits
+    if (command->redefineArrayCommand != nullptr) {
+        unit = new RedefineArrayCommandRE(command->redefineArrayCommand->arrayId, command->redefineArrayCommand->newDimensions);
+        // Optionally, set a specific processing definition if needed
+    }
+
     if(unit == nullptr) {
         unit = new DefaultRuleEngineUnits();
     }
