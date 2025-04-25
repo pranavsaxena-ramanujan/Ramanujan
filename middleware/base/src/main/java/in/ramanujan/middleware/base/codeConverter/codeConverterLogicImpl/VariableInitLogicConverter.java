@@ -34,25 +34,44 @@ public class VariableInitLogicConverter implements CodeConverterLogic {
             if (Constants.array.equalsIgnoreCase(dataType)) {
                 Array array = null;
                 for (String variableName : variableNames) {
-                    /*
-                    * arr[dim1][dim2]...[dimN]
-                    * Developer can give any dimensional array. for ex: arr[4][5][6]: this creates a 3D array, with
-                    * first dimension can have 4, second can have 5, third can have 6.
-                    */
                     String variableNameTrimmed = variableName.trim();
                     String[] variableNameTrimmedWithIndex = variableNameTrimmed.split("\\[");
                     variableName = variableNameTrimmedWithIndex[0].trim();
                     array = new Array();
+                    boolean hasNonConstantDimension = false;
+                    List<Integer> constantDims = new java.util.ArrayList<>();
+                    List<String> rawDims = new java.util.ArrayList<>();
                     for(int index = 1; index < variableNameTrimmedWithIndex.length; index++) {
-                        array.getDimension().add(Integer.parseInt(variableNameTrimmedWithIndex[index]
-                                .replace("]", "").trim()));
+                        String dimStr = variableNameTrimmedWithIndex[index].replace("]", "").trim();
+                        rawDims.add(dimStr);
+                        try {
+                            int dim = Integer.parseInt(dimStr);
+                            constantDims.add(dim);
+                        } catch (NumberFormatException nfe) {
+                            hasNonConstantDimension = true;
+                            // Use a placeholder (e.g., 1) for now, will be redefined at runtime
+                            constantDims.add(1);
+                        }
                     }
+                    array.setDimension(constantDims);
                     array.setId((variableScope.size() > 0 ? variableScope.get(variableScope.size() - 1) : "") +
                             UUID.randomUUID().toString());
                     array.setName(variableName);
                     array.setDataType(dataType);
                     ruleEngineInput.getArrays().add(array);
                     codeConverter.setArray(array, variableScope.size() > 0 ? variableScope.get(variableScope.size() - 1) : "");
+                    // If any dimension is not a constant, emit RedefineArrayCommand
+                    if (hasNonConstantDimension) {
+                        in.ramanujan.pojo.ruleEngineInputUnitsExt.array.RedefineArrayCommand redefineCmd = new in.ramanujan.pojo.ruleEngineInputUnitsExt.array.RedefineArrayCommand();
+                        redefineCmd.setId(UUID.randomUUID().toString());
+                        redefineCmd.setArrayId(array.getId());
+                        redefineCmd.setNewDimensions(constantDims);
+                        redefineCmd.setInitialValue(null);
+                        in.ramanujan.pojo.ruleEngineInputUnitsExt.Command redefineCommand = new in.ramanujan.pojo.ruleEngineInputUnitsExt.Command();
+                        redefineCommand.setId("command_" + UUID.randomUUID().toString());
+                        redefineCommand.setRedefineArrayCommand(redefineCmd);
+                        ruleEngineInput.getCommands().add(redefineCommand);
+                    }
                 }
                 return array;
             }
