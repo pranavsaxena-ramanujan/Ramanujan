@@ -325,7 +325,7 @@ def execForAnOptimizationFunc(var fnId: integer)
                     exp =  (b * l);
                     exec EXP(exp);
                     
-                    var code : double;
+                    var cos : double;
                     cos = l*2*3.14;
                     exec COS(cos);
 
