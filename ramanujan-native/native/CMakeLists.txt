@@ -36,6 +36,7 @@ set(SOURCE_FILES
         input/RuleEngineInputUnit.hpp
         input/Variable.hpp
         input/While.hpp
+        input/RedefineArrayCommand.hpp
         processing/ProcessingResult.hpp
         processing/Processor.cpp
         processing/Processor.hpp
@@ -54,6 +55,8 @@ set(SOURCE_FILES
         ruleEngineObject/dataContainer/AbstractDataContainer.h
         ruleEngineObject/dataContainer/DataContainerRE.h
         ruleEngineObject/CommandRE.cpp
+        ruleEngineObject/RedefineArrayCommandRE.h
+        ruleEngineObject/RedefineArrayCommandRE.cpp
         input/Command.cpp
         ruleEngineObject/dataContainer/VaraiableRE.cpp
         input/Variable.cpp

@@ -164,7 +164,7 @@ public class OperationLogicConverter implements CodeConverterLogic {
             if (c == ' ') {
                 continue;
             }
-            if (Character.isDigit(c) || Character.isAlphabetic(c) || c == '.') {
+            if (Character.isDigit(c) || Character.isAlphabetic(c) || c == '.' || c == '_') {
                 operand.append(c);
             } else if(c == '['){
               // operand is an array, parse the string till last correct stack-pop based ], there can be multiple

@@ -40,7 +40,7 @@ def F10(var lb : integer, var ub : integer, var dim : integer)
 }
 
 
-def Get_Functions_details(var fnId: integervar lb : integer, var ub : integer, var dim : integer)
+def Get_Functions_details(var fnId: integer, var lb : integer, var ub : integer, var dim : integer)
 {
     if(fnId == 1) {
         exec F1(lb, ub, dim);
@@ -83,7 +83,6 @@ def Get_Functions_details(var fnId: integervar lb : integer, var ub : integer, v
     }
 }
 
-//define execF1 .... execF9
 def execF1(var fitness: double, var x : array)
 {
 
@@ -179,15 +178,15 @@ def execExactFunc(var fncId : integer, var x : array, var fitness: double)
 }
 
 
-var searchAgents: integer;
-searchAgents = 30;
-
-var maxIterations: integer;
-maxIterations = 500;
-
 
 def execForAnOptimizationFunc(var fnId: integer)
 {
+    var searchAgents: integer;
+    searchAgents = 30;
+
+    var maxIterations: integer;
+    maxIterations = 500;
+
     var lb: integer;
     var ub: integer;
     var dim: integer;
@@ -198,13 +197,13 @@ def execForAnOptimizationFunc(var fnId: integer)
     var Positions[searchAgents][dim] : array;
 
     var Leader_score: double;
-    PINF(Leader_score);
+    exec PINF(Leader_score);
 
     exec RAND(Positions);
     var iterSearchAgents, iterDim: integer;
     iterSearchAgents = 0;
     iterDim = 0;
-    while (iter < searchAgents)
+    while (iterSearchAgents < searchAgents)
     {
         while (iterDim < dim)
         {

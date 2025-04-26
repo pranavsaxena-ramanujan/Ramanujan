@@ -61,17 +61,19 @@ public class VariableInitLogicConverter implements CodeConverterLogic {
                         }
                     }
                     array = new Array();
-                    if(!hasNonConstantDimension) {
-                    
-                    array.setDimension(constantDims);
                     array.setId((variableScope.size() > 0 ? variableScope.get(variableScope.size() - 1) : "") +
                             UUID.randomUUID().toString());
                     array.setName(variableName);
                     array.setDataType(dataType);
-                    ruleEngineInput.getArrays().add(array);
+                    if(!hasNonConstantDimension) {
+
+                        array.setDimension(constantDims);
+
+                        ruleEngineInput.getArrays().add(array);
+                    }
                     
                     codeConverter.setArray(array, variableScope.size() > 0 ? variableScope.get(variableScope.size() - 1) : "");
-                    }
+
                     // If any dimension is not a constant, emit RedefineArrayCommand
                     if (hasNonConstantDimension) {
                         in.ramanujan.pojo.ruleEngineInputUnitsExt.array.RedefineArrayCommand redefineCmd = new in.ramanujan.pojo.ruleEngineInputUnitsExt.array.RedefineArrayCommand();

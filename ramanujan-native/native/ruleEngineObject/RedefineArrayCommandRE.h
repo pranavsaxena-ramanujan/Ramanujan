@@ -2,6 +2,8 @@
 #define NATIVE_REDEFINEARRAYCOMMANDRE_H
 
 #include "RuleEngineInputUnits.hpp"
+#include "dataContainer/ArrayRE.h"
+#include "dataContainer/VariableRE.h"
 #include <vector>
 #include <string>
 
@@ -15,6 +17,13 @@ public:
 
     // Pointer to the ArrayValue* of the target ArrayRE
     ArrayValue **arrayValuePtr = nullptr;
+
+    void destroy() override {
+        if (arrayValuePtr) {
+            delete *arrayValuePtr; // Assuming ownership of the ArrayValue
+            arrayValuePtr = nullptr;
+        }
+    }
 
     void setFields(std::unordered_map<std::string, RuleEngineInputUnits*> *map) {
         dimensionVariableREs.clear();
