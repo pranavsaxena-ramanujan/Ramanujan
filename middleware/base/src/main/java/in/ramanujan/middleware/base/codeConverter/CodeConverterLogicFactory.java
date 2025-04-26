@@ -58,8 +58,13 @@ public class CodeConverterLogicFactory {
     }
 
     private Boolean isOperation(String codeChunk) {
-        for(OperatorType operatorType : OperatorType.values()) {
-            if(codeChunk.contains(operatorType.getOperatorCode())) {
+        if (codeChunk.charAt(0) == '-' && codeChunk.length() > 1 && Character.isDigit(codeChunk.charAt(1))) {
+            return false;
+        }
+        for (OperatorType operatorType : OperatorType.values()) {
+            String op = operatorType.getOperatorCode();
+            // Regex: operator not preceded by start, another operator, or ( or whitespace
+            if(codeChunk.contains(op)) {
                 return true;
             }
         }

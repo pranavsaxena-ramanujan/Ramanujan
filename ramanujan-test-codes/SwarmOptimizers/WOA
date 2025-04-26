@@ -325,7 +325,8 @@ def execForAnOptimizationFunc(var fnId: integer)
                     exp =  (b * l);
                     exec EXP(exp);
                     
-                    var cos = l*2*3.14;
+                    var code : double;
+                    cos = l*2*3.14;
                     exec COS(cos);
 
                     Positions[iterPosition][j] = distanceToLeader * exp * cos + Leader_pos[j];
