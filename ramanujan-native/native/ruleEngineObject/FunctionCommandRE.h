@@ -238,6 +238,17 @@ public:
     void process() override;
 };
 
+class SQRT : public BuiltInFunctionsImpl {
+public:
+    SQRT(FunctionCall *pCall1) : BuiltInFunctionsImpl(pCall1) {}
+    void process() override;
+};
+
+class POW : public BuiltInFunctionsImpl {
+public:
+    POW(FunctionCall *pCall1) : BuiltInFunctionsImpl(pCall1) {}
+    void process() override;
+};
 
 static FunctionCommandRE* GetFunctionCommandRE(FunctionCall* functionCommand, std::string& id, std::unordered_map<std::string, RuleEngineInputUnits *> *map)
 {
@@ -268,6 +279,10 @@ static FunctionCommandRE* GetFunctionCommandRE(FunctionCall* functionCommand, st
         return new class CEIL(functionCommand);
     } else if(id == "EXP") {
         return new class EXP(functionCommand);
+    } else if(id == "SQRT") {
+        return new class SQRT(functionCommand);
+    } else if(id == "POW") {
+        return new class POW(functionCommand);
     }
 
     return new FunctionCommandRE(functionCommand, (FunctionCallRE *) map->at(functionCommand->id));

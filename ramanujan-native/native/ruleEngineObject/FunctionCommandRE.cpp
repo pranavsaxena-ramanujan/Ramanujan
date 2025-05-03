@@ -322,3 +322,15 @@ void EXP::process() {
         *methodArgVariableAddr[0] = std::exp(*methodArgVariableAddr[0]);
     }
 }
+
+void SQRT::process() {
+    if(varCount == 1) {
+        *methodArgVariableAddr[0] = std::sqrt(*methodArgVariableAddr[0]);
+    }
+}
+
+void POW::process() {
+    if(varCount == 2) {
+        *methodArgVariableAddr[0] = std::pow(*methodArgVariableAddr[0], *methodArgVariableAddr[1]);
+    }
+}

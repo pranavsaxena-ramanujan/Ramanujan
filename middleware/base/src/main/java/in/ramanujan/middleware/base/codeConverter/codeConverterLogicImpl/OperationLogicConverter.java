@@ -144,13 +144,29 @@ public class OperationLogicConverter implements CodeConverterLogic {
     }
 
     // Improved: Only treat as operator if it's a single operator symbol, not a negative number or variable
-    public static boolean isOperator(String operator) {
+    public static boolean isOperator(String operator) throws CompilationException {
         // Exclude negative numbers or variables (e.g., -1, -x)
         if (operator == null || operator.isEmpty()) return false;
         // If it starts with a digit or letter after '-', it's not an operator
         if (operator.length() > 1 && operator.charAt(0) == '-') {
             char next = operator.charAt(1);
-            if (Character.isDigit(next) || Character.isAlphabetic(next) || next == '.') {
+            // Check all characters are digits or has only one '.'. If yes than its negative number and return false.
+            boolean isNegNumOperator = true;
+            int decimalCount = 0;
+            for(int i=1;i< operator.length();i++) {
+                if(!Character.isDigit(operator.charAt(i)) && operator.charAt(i) != '.') {
+                    if(operator.charAt(i) != '.')
+                    {
+                        decimalCount++;
+                    }
+                    isNegNumOperator = false;
+                }
+            }
+            if(decimalCount > 1)
+            {
+                throw new CompilationException(null, null, "invalid operand " + operator);
+            }
+            if(isNegNumOperator) {
                 return false;
             }
         }

@@ -132,6 +132,8 @@ public class CompileErrorChecker {
         add("CEIL");
         add("FLOOR");
         add("EXP");
+        add("SQRT");
+        add("POW");
     }};
 
     private void checkFunctionCalls(String code, List<Integer> newLines, List<Integer> tabs) throws CompilationException {

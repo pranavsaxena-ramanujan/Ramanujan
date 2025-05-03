@@ -58,8 +58,20 @@ public class CodeConverterLogicFactory {
     }
 
     private Boolean isOperation(String codeChunk) {
-        if (codeChunk.charAt(0) == '-' && codeChunk.length() > 1 && Character.isDigit(codeChunk.charAt(1))) {
-            return false;
+        if (codeChunk.charAt(0) == '-') {
+            int index = 1;
+            boolean isNegNumOperator = true;
+            while (index < codeChunk.length() ) {
+                char codeChar = codeChunk.charAt(index);
+                if(!Character.isDigit(codeChar) && codeChar != '.') {
+                    isNegNumOperator = false;
+                    break;
+                }
+                index++;
+            }
+            if(isNegNumOperator) {
+                return false;
+            }
         }
         for (OperatorType operatorType : OperatorType.values()) {
             String op = operatorType.getOperatorCode();
