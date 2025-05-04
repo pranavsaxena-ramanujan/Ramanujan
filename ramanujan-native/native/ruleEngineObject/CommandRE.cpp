@@ -25,6 +25,7 @@
 #include "processingDefinition/ConditionReProcessing.h"
 #include "processingDefinition/VariableReProcessing.h"
 #include "processingDefinition/FunctionReProcessing.h"
+#include "processingDefinition/RedefineArrayCommandReProcessing.h"
 
 #include "DefaultRuleEngineUnits.h"
 
@@ -66,6 +67,11 @@ void CommandRE::setFields(std::unordered_map<std::string, RuleEngineInputUnits *
         arrayCommandRE = nullptr;
     }
 
+    if(command -> redefineArrayCommand != nullptr) {
+        redefineArrayCommandRE = new RedefineArrayCommandRE(command->redefineArrayCommand->arrayId, command->redefineArrayCommand->newDimensions);
+        redefineArrayCommandRE->setFields(map);
+    }
+
     unit = nullptr;
     commandTypeProcessingDefinition = nullptr;
 
@@ -90,9 +96,9 @@ void CommandRE::setFields(std::unordered_map<std::string, RuleEngineInputUnits *
     }
 
     // Set the correct unit for RedefineArrayCommandRE after all other units, before DefaultRuleEngineUnits
-    if (command->redefineArrayCommand != nullptr) {
-        unit = new RedefineArrayCommandRE(command->redefineArrayCommand->arrayId, command->redefineArrayCommand->newDimensions);
-        // Optionally, set a specific processing definition if needed
+    if (redefineArrayCommandRE != nullptr) {
+        unit = redefineArrayCommandRE;
+        commandTypeProcessingDefinition = new RedefineArrayCommandReProcessing(redefineArrayCommandRE);
     }
 
     if(unit == nullptr) {

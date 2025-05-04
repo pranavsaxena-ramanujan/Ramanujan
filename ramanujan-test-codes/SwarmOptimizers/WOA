@@ -340,7 +340,7 @@ def execExactFunc(var fncId : integer, var x : array, var fitness: double, var d
     }
 }
 
-def execForAnOptimizationFunc(var fnId: integer)
+def execForAnOptimizationFunc(var fnId: integer, var finalConvergenceCurve: array)
 {
     var searchAgents: integer;
     searchAgents = 30;
@@ -363,9 +363,9 @@ def execForAnOptimizationFunc(var fnId: integer)
     exec RAND(Positions);
     var iterSearchAgents, iterDim: integer;
     iterSearchAgents = 0;
-    iterDim = 0;
     while (iterSearchAgents < searchAgents)
     {
+        iterDim = 0;
         while (iterDim < dim)
         {
             Positions[iterSearchAgents][iterDim] = Positions[iterSearchAgents][iterDim] * (ub - lb) + lb;
@@ -468,7 +468,7 @@ def execForAnOptimizationFunc(var fnId: integer)
                         var rand1 : double;
                         exec RAND(rand1);
                         var rand_leader_index: double;
-                        rand_leader_index = rand1 * searchAgents + 1;
+                        rand_leader_index = rand1 * searchAgents;
                         exec FLOOR(rand_leader_index);
                         var X_rand[dim] : array;
                         var k : double;
@@ -508,48 +508,69 @@ def execForAnOptimizationFunc(var fnId: integer)
         iter = iter + 1;
         Convergence_curve[iter] = Leader_score;
     }
+    var fnA : double;
+    fnA = fnId - 1;
+    var maxIterA : double;
+    maxIterA = maxIterations - 1;
+    finalConvergenceCurve[fnA] = Convergence_curve[maxIterA];
 }
 
+var n : double;
+n = 10;
+var finalConvergenceCurve[10] : array;
+
 threadStart(t0) {
-    exec execForAnOptimizationFunc(1);
+    exec execForAnOptimizationFunc(1, finalConvergenceCurve);
 }
 
 threadStart(t1) {
-    exec execForAnOptimizationFunc(2);
+    exec execForAnOptimizationFunc(2, finalConvergenceCurve);
 }
 
 threadStart(t2) {
-    exec execForAnOptimizationFunc(3);
+    exec execForAnOptimizationFunc(3, finalConvergenceCurve);
 }
 
 threadStart(t3) {
-    exec execForAnOptimizationFunc(4);
+    exec execForAnOptimizationFunc(4, finalConvergenceCurve);
 }
 
 threadStart(t4) {
-    exec execForAnOptimizationFunc(5);
+    exec execForAnOptimizationFunc(5, finalConvergenceCurve);
 }
 
 threadStart(t5) {
-    exec execForAnOptimizationFunc(6);
+    exec execForAnOptimizationFunc(6, finalConvergenceCurve);
 }
 
 threadStart(t6) {
-    exec execForAnOptimizationFunc(7);
+    exec execForAnOptimizationFunc(7, finalConvergenceCurve);
 }
 
 threadStart(t7) {
-    exec execForAnOptimizationFunc(8);
+    exec execForAnOptimizationFunc(8, finalConvergenceCurve);
 }
 
 threadStart(t8) {
-    exec execForAnOptimizationFunc(9);
+    exec execForAnOptimizationFunc(9, finalConvergenceCurve);
 }
 
 threadStart(t9) {
-    exec execForAnOptimizationFunc(10);
+    exec execForAnOptimizationFunc(10, finalConvergenceCurve);
 }
 
+var best0, best1, best2, best3, best4, best5, best6, best7, best8, best9 : double;
+
 threadOnEnd(t0,t1,t2,t3,t4,t5,t6,t7,t8,t9,1) {
+    best0 = finalConvergenceCurve[0];
+    best1 = finalConvergenceCurve[1];
+    best2 = finalConvergenceCurve[2];
+    best3 = finalConvergenceCurve[3];
+    best4 = finalConvergenceCurve[4];
+    best5 = finalConvergenceCurve[5];
+    best6 = finalConvergenceCurve[6];
+    best7 = finalConvergenceCurve[7];
+    best8 = finalConvergenceCurve[8];
+    best9 = finalConvergenceCurve[9];
 
 }

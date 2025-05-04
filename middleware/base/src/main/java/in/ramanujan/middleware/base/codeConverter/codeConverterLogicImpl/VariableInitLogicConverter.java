@@ -10,6 +10,7 @@ import in.ramanujan.pojo.RuleEngineInputUnits;
 import in.ramanujan.pojo.ruleEngineInputUnitsExt.Command;
 import in.ramanujan.pojo.ruleEngineInputUnitsExt.Variable;
 import in.ramanujan.pojo.ruleEngineInputUnitsExt.array.Array;
+import in.ramanujan.pojo.ruleEngineInputUnitsExt.array.RedefineArrayCommand;
 import in.ramanujan.utils.Constants;
 import org.springframework.stereotype.Component;
 
@@ -21,7 +22,10 @@ import java.util.UUID;
 public class VariableInitLogicConverter implements CodeConverterLogic {
     @Override
     public void populateCommand(Command command, RuleEngineInputUnits ruleEngineInputUnits) {
-
+        if(ruleEngineInputUnits instanceof RedefineArrayCommand)
+        {
+            command.setRedefineArrayCommand((RedefineArrayCommand) ruleEngineInputUnits);
+        }
     }
 
     @Override
@@ -69,8 +73,8 @@ public class VariableInitLogicConverter implements CodeConverterLogic {
 
                         array.setDimension(constantDims);
 
-                        ruleEngineInput.getArrays().add(array);
                     }
+                    ruleEngineInput.getArrays().add(array);
                     
                     codeConverter.setArray(array, variableScope.size() > 0 ? variableScope.get(variableScope.size() - 1) : "");
 
@@ -80,10 +84,7 @@ public class VariableInitLogicConverter implements CodeConverterLogic {
                         redefineCmd.setId(UUID.randomUUID().toString());
                         redefineCmd.setArrayId(array.getId());
                         redefineCmd.setNewDimensions(resolvedDims);
-                        in.ramanujan.pojo.ruleEngineInputUnitsExt.Command redefineCommand = new in.ramanujan.pojo.ruleEngineInputUnitsExt.Command();
-                        redefineCommand.setId("command_" + UUID.randomUUID().toString());
-                        redefineCommand.setRedefineArrayCommand(redefineCmd);
-                        ruleEngineInput.getCommands().add(redefineCommand);
+                        return redefineCmd;
                     }
                 }
                 return array;

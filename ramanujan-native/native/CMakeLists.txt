@@ -1,4 +1,3 @@
-
 cmake_minimum_required(VERSION 3.27)
 project(native)
 
@@ -112,6 +111,7 @@ set(SOURCE_FILES
         ruleEngineObject/processingDefinition/FunctionReProcessing.h
         ruleEngineObject/processingDefinition/ConditionReProcessing.h
         ruleEngineObject/processingDefinition/DefaultProcessing.h
+        ruleEngineObject/processingDefinition/RedefineArrayCommandReProcessing.h
         ruleEngineObject/DefaultRuleEngineUnits.h
         ruleEngineObject/dataContainer/DataContainerValue.h
         processing/DebugPoint.h
