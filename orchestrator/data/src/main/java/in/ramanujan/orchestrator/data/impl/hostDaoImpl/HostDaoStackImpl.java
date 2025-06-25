@@ -48,7 +48,7 @@ public class HostDaoStackImpl implements HostsDao {
     public synchronized Future<String> getMachine(AsyncTask asyncTask, Boolean resumeComputation) {
         if(hostStack.empty()) {
             logger.error(asyncTask.getUuid() + " no machine available for computation");
-            return Future.succeededFuture("No Machine available");
+            return Future.failedFuture("No Machine available");
         } else {
             String hostId = hostStack.pop();
             Future<String> future = Future.future();

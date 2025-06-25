@@ -3,6 +3,7 @@ package in.ramanujan.data;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import in.ramanujan.base.configuration.ConfigKey;
 import in.ramanujan.base.configuration.ConfigurationGetter;
+import in.ramanujan.base.pojo.MachineAssignmentTask;
 import io.vertx.core.Future;
 import io.vertx.core.Vertx;
 import io.vertx.core.json.JsonObject;
@@ -24,9 +25,14 @@ public class MiddlewareClient {
 
 
     private ConsumptionCallback consumptionCallback; // to be inited by middleware.
+    private MachineRetryCallback machineRetryCallback; // to be inited by orchestrator.
 
     public void setConsumptionCallback(ConsumptionCallback consumptionCallback) {
         this.consumptionCallback = consumptionCallback;
+    }
+
+    public void setMachineRetryCallback(MachineRetryCallback machineRetryCallback) {
+        this.machineRetryCallback = machineRetryCallback;
     }
 
 
@@ -66,6 +72,33 @@ public class MiddlewareClient {
             });
         } catch (Exception e) {
             logger.error("Error processing next element", e);
+            future.fail(e);
+        }
+
+        return future;
+    }
+
+    public Future<Boolean> retryMachineAssignment(MachineAssignmentTask task, Vertx vertx) {
+        Future<Boolean> future = Future.future();
+        try {
+            logger.info("Retrying machine assignment for asyncId: {}", task.getAsyncId());
+            if (machineRetryCallback == null) {
+                logger.error("Machine retry callback not initialized");
+                future.fail(new Exception("Machine retry callback not initialized"));
+                return future;
+            }
+            
+            machineRetryCallback.retryMachineAssignment(task, vertx).setHandler(handler -> {
+                if(handler.failed()) {
+                    logger.error("Failed to assign machine for asyncId: {}", task.getAsyncId(), handler.cause());
+                    future.fail(handler.cause());
+                    return;
+                }
+                logger.info("Machine assignment result for asyncId: {}: {}", task.getAsyncId(), handler.result());
+                future.complete(handler.result());
+            });
+        } catch (Exception e) {
+            logger.error("Error retrying machine assignment", e);
             future.fail(e);
         }
 

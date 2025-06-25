@@ -47,10 +47,18 @@ public class OrchestratorTaskStatusService {
                     return;
                 }
                 if(getHostInfo.result() == null)  {
-                    getMachine(asyncTask, future);
+                    future.complete(asyncTask);
                     return;
                 }
                 asyncTask.setHostAssigned(getHostInfo.result());
+                
+                // Check if host is assigned before checking heartbeat
+                if (asyncTask.getHostAssigned() == null) {
+                    logger.info(asyncTask.getUuid() + " has no host assigned, getting a machine");
+                    future.complete(asyncTask);
+                    return;
+                }
+                
                 heartBeatDao.getLastHeartBeat(asyncTask.getUuid(), asyncTask.getHostAssigned()).setHandler(heartBeatHandler -> {
                    if(heartBeatHandler.succeeded()) {
                        HeartBeat heartBeat = heartBeatHandler.result();

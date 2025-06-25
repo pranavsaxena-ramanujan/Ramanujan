@@ -1,6 +1,7 @@
 package in.ramanujan.middleware.rest.verticles;
 
 
+import in.ramanujan.data.MachineRetryCallback;
 import in.ramanujan.data.MiddlewareClient;
 import in.ramanujan.data.queingDaoImpl.QueueDaoImpl;
 import in.ramanujan.middleware.service.ProcessNextDagElementService;
@@ -9,6 +10,7 @@ import in.ramanujan.middleware.base.configuration.ConfigurationGetter;
 import in.ramanujan.middleware.base.spring.SpringConfig;
 import in.ramanujan.middleware.rest.CustomDeploymentOption;
 import in.ramanujan.orchestrator.rest.verticles.OrchestratorHttpVerticle;
+import in.ramanujan.orchestrator.service.MachineRetryManager;
 import in.ramanujan.rest.verticles.KafkaHttpVerticle;
 import in.ramanujan.rest.verticles.kafka.ConsumerVerticle;
 import io.vertx.core.AbstractVerticle;
@@ -47,6 +49,18 @@ public class MainVerticle extends AbstractVerticle {
         ProcessNextDagElementService processNextDagElementService = applicationContext.getBean(ProcessNextDagElementService.class);
         middlewareClient.setConsumptionCallback((asyncId, dagElementId, toBeDebugged, vertx) ->
                 processNextDagElementService.processNextElement(asyncId, dagElementId, vertx, toBeDebugged));
+
+
+        // Set up machine retry callback
+        try {
+            MachineRetryManager machineRetryManager = applicationContext.getBean(MachineRetryManager.class);
+            MachineRetryCallback callback = machineRetryManager.getCallback();
+            middlewareClient.setMachineRetryCallback(callback);
+            logger.info("Set up machine retry callback");
+        } catch (Exception e) {
+            logger.error("Error setting up machine retry callback", e);
+        }
+
         vertx.deployVerticle(applicationContext.getBean(ConsumerVerticle.class), option.getDeployOptions("ConsumerVerticle", 1));
 
 //        applicationContext.getBean(ConnectionCreator.class).init(vertx);

@@ -1,8 +1,11 @@
 package in.ramanujan.orchestrator.rest.verticles;
 
+import in.ramanujan.data.MiddlewareClient;
+import in.ramanujan.data.MachineRetryCallback;
 import in.ramanujan.monitoringutils.verticles.MonitoringVerticle;
 import in.ramanujan.orchestrator.base.configuration.ConfigurationGetter;
 import in.ramanujan.orchestrator.rest.spring.SpringConfig;
+import in.ramanujan.orchestrator.service.MachineRetryManager;
 import io.vertx.core.AbstractVerticle;
 import io.vertx.core.Future;
 import io.vertx.core.logging.Logger;

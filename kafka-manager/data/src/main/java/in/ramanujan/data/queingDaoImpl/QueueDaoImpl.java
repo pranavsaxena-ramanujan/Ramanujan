@@ -2,6 +2,8 @@ package in.ramanujan.data.queingDaoImpl;
 
 import in.ramanujan.base.pojo.CheckStatusQueueEvent;
 import in.ramanujan.base.pojo.CheckStatusQueueEventWithMetadata;
+import in.ramanujan.base.pojo.MachineAssignmentQueueEvent;
+import in.ramanujan.base.pojo.MachineAssignmentTaskWithMetadata;
 import in.ramanujan.data.QueueingDao;
 import io.vertx.core.Future;
 import org.springframework.stereotype.Component;
@@ -45,8 +47,18 @@ public class QueueDaoImpl implements QueueingDao {
     }
 
     @Override
+    public Future<Void> produceMachineAssignment(MachineAssignmentQueueEvent machineEvent) {
+        return queueDaoImpl.produceMachineAssignment(machineEvent);
+    }
+
+    @Override
     public Future<List<CheckStatusQueueEventWithMetadata>> consume() {
         return queueDaoImpl.consume();
+    }
+
+    @Override
+    public Future<List<MachineAssignmentTaskWithMetadata>> consumeMachineAssignment() {
+        return queueDaoImpl.consumeMachineAssignment();
     }
 
     @Override
@@ -55,7 +67,18 @@ public class QueueDaoImpl implements QueueingDao {
     }
 
     @Override
+    public Future<Void> subscribeMachineAssignment() {
+        return queueDaoImpl.subscribeMachineAssignment();
+    }
+
+    @Override
     public Future<Void> commit(Object metadata) {
         return queueDaoImpl.commit(metadata);
     }
+
+    @Override
+    public Future<Void> commitMachineAssignment(Object metadata) {
+        return queueDaoImpl.commitMachineAssignment(metadata);
+    }
+
 }

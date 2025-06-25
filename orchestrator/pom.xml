@@ -49,6 +49,26 @@
             <version>2.2.1.RELEASE</version>
         </dependency>
 
+        <!-- Add dependency on kafka-manager for pubsub functionality -->
+        <dependency>
+            <groupId>in.ramanujan.kafka</groupId>
+            <artifactId>kafka-manager</artifactId>
+            <version>1.0-SNAPSHOT</version>
+            <type>pom</type>
+        </dependency>
+
+        <!-- Add dependencies on specific kafka-manager modules -->
+        <dependency>
+            <groupId>in.ramanujan.kafka</groupId>
+            <artifactId>base</artifactId>
+            <version>1.0-SNAPSHOT</version>
+        </dependency>
+        <dependency>
+            <groupId>in.ramanujan.kafka</groupId>
+            <artifactId>data</artifactId>
+            <version>1.0-SNAPSHOT</version>
+        </dependency>
+
         <dependency>
             <groupId>io.vertx</groupId>
             <artifactId>vertx-web</artifactId>

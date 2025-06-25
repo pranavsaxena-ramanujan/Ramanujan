@@ -18,6 +18,9 @@ import in.ramanujan.base.configuration.ConfigurationGetter;
 import in.ramanujan.base.enums.Topics;
 import in.ramanujan.base.pojo.CheckStatusQueueEvent;
 import in.ramanujan.base.pojo.CheckStatusQueueEventWithMetadata;
+import in.ramanujan.base.pojo.MachineAssignmentQueueEvent;
+import in.ramanujan.base.pojo.MachineAssignmentTask;
+import in.ramanujan.base.pojo.MachineAssignmentTaskWithMetadata;
 import in.ramanujan.data.QueueingDao;
 import io.vertx.core.Future;
 import io.vertx.core.Vertx;
@@ -38,15 +41,20 @@ public class PubSubIMpl extends QueueDaoImpl {
 
     private final String projectId = "ramanujan-340512";
     private final String subscriptionId = "next_element_topic-sub";
-    private final String topic = Topics.next_element_topic.name();;
+    private final String topic = Topics.next_element_topic.name();
+    private final String machineAssignmentTopic = Topics.run_dag.name();
+    private final String machineAssignmentSubscriptionId = "run_dag-sub";
 
     private final ObjectMapper objectMapper = new ObjectMapper();
     Logger logger= LoggerFactory.getLogger(PubSubIMpl.class);
 
     private Publisher publisher;
+    private Publisher machineAssignmentPublisher;
 
     private String subscribeName;
+    private String machineAssignmentSubscribeName;
     private SubscriberStub subscriber;
+    private SubscriberStub machineAssignmentSubscriber;
     private final int numOfMessages = 100;
 
     private final Set<String> messageIdSeen = new HashSet<>();
@@ -71,6 +79,26 @@ public class PubSubIMpl extends QueueDaoImpl {
         subscribeName = ProjectSubscriptionName.format(projectId, subscriptionId);
     }
 
+    private void initMachineAssignmentSubscribeName() throws Exception {
+        SubscriberStubSettings.Builder builderWithTransportChannelProvider
+                = SubscriberStubSettings.newBuilder().setTransportChannelProvider(
+                SubscriberStubSettings.defaultGrpcTransportProviderBuilder()
+                        .setMaxInboundMessageSize(20 * 1024 * 1024) // 20MB (maximum message size).
+                        .build()
+        );
+
+        if(ConfigConstant.PROD.equalsIgnoreCase(ConfigurationGetter.getString(ConfigKey.ENV))) {
+            builderWithTransportChannelProvider.setCredentialsProvider(() -> {
+                return getCred();
+            });
+        }
+
+       SubscriberStubSettings subscriberStubSettings = builderWithTransportChannelProvider.build();
+
+        machineAssignmentSubscriber = GrpcSubscriberStub.create(subscriberStubSettings);
+        machineAssignmentSubscribeName = ProjectSubscriptionName.format(projectId, machineAssignmentSubscriptionId);
+    }
+
     private GoogleCredentials getCred() throws IOException {
         return GoogleCredentials.fromStream(new FileInputStream("/pubSubKey.json"))
                 .createScoped(Lists.newArrayList("https://www.googleapis.com/auth/cloud-platform"));
@@ -83,12 +111,34 @@ public class PubSubIMpl extends QueueDaoImpl {
             Publisher.Builder builder = Publisher.newBuilder(topicName);
             if(ConfigConstant.PROD.equalsIgnoreCase(ConfigurationGetter.getString(ConfigKey.ENV))) {
                 builder.setCredentialsProvider(() -> {
-                    return getCred();
+                    try {
+                        return getCred();
+                    } catch (IOException e) {
+                        throw new RuntimeException(e);
+                    }
                 });
             }
             publisher = builder.build();
         }
         return publisher;
+    }
+
+    private Publisher getMachineAssignmentPublisher() throws Exception {
+        if(machineAssignmentPublisher == null) {
+            TopicName topicName = TopicName.of(projectId, machineAssignmentTopic);
+            Publisher.Builder builder = Publisher.newBuilder(topicName);
+            if(ConfigConstant.PROD.equalsIgnoreCase(ConfigurationGetter.getString(ConfigKey.ENV))) {
+                builder.setCredentialsProvider(() -> {
+                    try {
+                        return getCred();
+                    } catch (IOException e) {
+                        throw new RuntimeException(e);
+                    }
+                });
+            }
+            machineAssignmentPublisher = builder.build();
+        }
+        return machineAssignmentPublisher;
     }
 
 
@@ -244,6 +294,152 @@ public class PubSubIMpl extends QueueDaoImpl {
                 blocking.complete();
             } catch (Exception e) {
                 logger.error("COMMIT FAILED", e);
+                blocking.fail(e);
+            }
+        }, false, handler -> {
+            future.complete();
+        });
+        return future;
+    }
+
+    @Override
+    public Future<Void> produceMachineAssignment(MachineAssignmentQueueEvent machineEvent) {
+        Future<Void> future = Future.future();
+        try {
+            ByteString data = ByteString.copyFromUtf8(JsonObject.mapFrom(machineEvent).toString());
+            PubsubMessage pubsubMessage = PubsubMessage.newBuilder().setData(data).build();
+
+            // Once published, returns a server-assigned message id (unique within the topic)
+            ApiFuture<String> messageIdFuture = getMachineAssignmentPublisher().publish(pubsubMessage);
+            Vertx.currentContext().executeBlocking(blocking -> {
+                try {
+                    String messageId = messageIdFuture.get();
+                    logger.info("Published message to run-dag topic with ID: " + messageId);
+                    blocking.complete();
+                } catch (Exception e) {
+                    blocking.fail(e);
+                }
+            }, false, handler -> {
+                if (handler.succeeded()) {
+                    future.complete();
+                } else {
+                    logger.error("Publishing to run-dag topic failed", handler.cause());
+                    future.fail(handler.cause());
+                }
+            });
+        } catch (Exception e) {
+            logger.error("Error in producing to run-dag topic", e);
+            future.fail(e);
+        }
+        return future;
+    }
+
+    @Override
+    public Future<List<MachineAssignmentTaskWithMetadata>> consumeMachineAssignment() {
+        Future<List<MachineAssignmentTaskWithMetadata>> future = Future.future();
+        Vertx.currentContext().executeBlocking(blocking -> {
+            try {
+                blocking.complete(getMachineAssignmentPullResponse());
+            } catch (Exception e) {
+                blocking.fail(e);
+            }
+        }, false, handler -> {
+            if(handler.succeeded()) {
+                try {
+                    PullResponse pullResponse = (PullResponse) handler.result();
+                    List<MachineAssignmentTaskWithMetadata> machineAssignmentTasks = new ArrayList<>();
+                    List<ReceivedMessage> receivedMessages = pullResponse.getReceivedMessagesList();
+                    if(receivedMessages.size() == 0) {
+                        future.complete(new ArrayList<>());
+                        return;
+                    }
+                    for(ReceivedMessage receivedMessage : receivedMessages) {
+                        String ackId = receivedMessage.getAckId();
+//                        String messageId = receivedMessage.getMessage().getMessageId();
+//                        if(messageIdSeen.contains(messageId)) {
+//                            continue;
+//                        }
+//                        messageIdSeen.add(messageId);
+
+                        try {
+                            ByteString data = receivedMessage.getMessage().getData();
+                            String dataStr = data.toStringUtf8();
+                            JsonObject jsonObject = new JsonObject(dataStr);
+                            MachineAssignmentQueueEvent machineAssignmentQueueEvent = jsonObject.mapTo(MachineAssignmentQueueEvent.class);
+                            MachineAssignmentTask task = machineAssignmentQueueEvent.getTask();
+                            if (task != null) {
+                                machineAssignmentTasks.add(new MachineAssignmentTaskWithMetadata(task, ackId));
+                            }
+                        } catch (Exception e) {
+                            logger.error("Error in parsing message", e);
+                        }
+                    }
+                    future.complete(machineAssignmentTasks);
+                } catch (Exception e) {
+                    logger.error("Error in consuming from run-dag topic", e);
+                    future.fail(e);
+                }
+            } else {
+                logger.error("Consumption from run-dag topic failed", handler.cause());
+                future.fail(handler.cause());
+            }
+        });
+        return future;
+    }
+
+    private PullResponse getMachineAssignmentPullResponse() {
+        PullRequest pullRequest =
+                PullRequest.newBuilder()
+                        .setMaxMessages(numOfMessages)
+                        .setSubscription(machineAssignmentSubscribeName)
+                        .build();
+
+        // Use pullCallable().futureCall to asynchronously perform this operation.
+        PullResponse pullResponse = machineAssignmentSubscriber.pullCallable().call(pullRequest);
+        return pullResponse;
+    }
+
+    @Override
+    public Future<Void> subscribeMachineAssignment() {
+        Future<Void> future = Future.future();
+        Vertx.currentContext().executeBlocking(blocking -> {
+            try {
+                initMachineAssignmentSubscribeName();
+                blocking.complete();
+            } catch (Exception e) {
+                blocking.fail(e);
+            }
+        }, false, handler -> {
+            if(handler.succeeded()) {
+                logger.info("Subscribed to run-dag topic");
+                future.complete();
+            } else {
+                logger.error("Error in subscribing to run-dag topic: ", handler.cause());
+                future.fail(handler.cause());
+            }
+        });
+        return future;
+    }
+
+    @Override
+    public Future<Void> commitMachineAssignment(Object metadata) {
+        Future<Void> future = Future.future();
+        List<String> ackIds = (List<String>) metadata;
+        logger.info("Machine assignment commit process to start");
+        Vertx.currentContext().executeBlocking(blocking -> {
+            try {
+                logger.info("Machine assignment commit in parallel thread process start");
+                AcknowledgeRequest acknowledgeRequest =
+                        AcknowledgeRequest.newBuilder()
+                                .setSubscription(machineAssignmentSubscribeName)
+                                .addAllAckIds(ackIds)
+                                .build();
+
+                // Use acknowledgeCallable().futureCall to asynchronously perform this operation.
+                machineAssignmentSubscriber.acknowledgeCallable().call(acknowledgeRequest);
+                blocking.complete();
+            } catch (Exception e) {
+                logger.error("Error in acknowledging: ", e);
                 blocking.fail(e);
             }
         }, false, handler -> {
