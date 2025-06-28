@@ -88,7 +88,7 @@ public class QueryExecutor {
             config.setUsername(dbConfig.getUsername());
             config.setPassword(dbConfig.getPassword());
 
-            int maxPool = 500;//10 * Runtime.getRuntime().availableProcessors();
+            int maxPool = 100 * Runtime.getRuntime().availableProcessors();
             config.setMaximumPoolSize(maxPool);
             config.setConnectionTimeout(5000);
             dataSource = new HikariDataSource(config);

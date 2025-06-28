@@ -173,7 +173,7 @@ public class ProcessNextDagElementService {
     private Future<Void> handleNoNextDagElement(String asyncId) {
         Future<Void> future = Future.future();
         dagElementDao.isAsyncTaskDone(asyncId).setHandler(isAsyncTaskDoneHandler -> {
-            if(isAsyncTaskDoneHandler.result()) {
+            if(isAsyncTaskDoneHandler.result() <= 1) {
                 //terminate the asyncTask
                 asyncTaskDao.update(asyncId, new HashMap<String, Object>() {
                     {
