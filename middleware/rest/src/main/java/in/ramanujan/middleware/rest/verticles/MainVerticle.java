@@ -45,8 +45,23 @@ public class MainVerticle extends AbstractVerticle {
         //vertx.deployVerticle(applicationContext.getBean(KafkaHttpVerticle.class), option.getDeployOptions("kafkHttpVerticle", 250));
         MiddlewareClient middlewareClient = applicationContext.getBean(MiddlewareClient.class);
         ProcessNextDagElementService processNextDagElementService = applicationContext.getBean(ProcessNextDagElementService.class);
-        middlewareClient.setConsumptionCallback((asyncId, dagElementId, toBeDebugged, vertx) ->
-                processNextDagElementService.processNextElement(asyncId, dagElementId, vertx, toBeDebugged));
+        middlewareClient.setConsumptionCallback(new MiddlewareClient.ConsumptionCallback() {
+
+            @Override
+            public Future<Void> processNextElement(String asyncId, String dagElementId, Boolean toBeDebugged, Vertx vertx) throws Exception {
+                Future<Void> future = Future.future();
+                processNextDagElementService.processNextElement(asyncId, dagElementId, vertx, toBeDebugged).setHandler(handler -> {
+                    if(handler.succeeded()) {
+                        future.complete();
+                    } else {
+                        logger.error("Failed to process next element for asyncId: {}, dagElementId: {}, toBeDebugged: {}", asyncId, dagElementId, toBeDebugged, handler.cause());
+                        future.fail(handler.cause());
+                    }
+                });
+                return future;
+            }
+
+        });
         vertx.deployVerticle(applicationContext.getBean(ConsumerVerticle.class), option.getDeployOptions("ConsumerVerticle", 1));
 
 //        applicationContext.getBean(ConnectionCreator.class).init(vertx);

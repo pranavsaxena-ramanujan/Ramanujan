@@ -358,7 +358,7 @@ public class DagElementSqlDbImpl implements DagElementDao {
 
             queryExecutor.execute(orchestratorMiddlewareMapping, Keys.MIDDLEWARE_ASYNC_ID, QueryType.SELECT).setHandler(handler -> {
                if(handler.succeeded()) {
-                   future.complete(handler.result().size() == 0);
+                   future.complete(handler.result().size() <= 1);
                } else {
                    future.fail(handler.cause());
                }

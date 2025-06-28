@@ -210,17 +210,22 @@ public class RunService {
     public Future<Void> runDagElementId(String asyncId, String dagElementId, Vertx vertx, Boolean toBeDebugged) {
         Future<Void> future = Future.future();
         storageDao.getDagElement(dagElementId).setHandler(handler -> {
-            BasicDagElement basicDagElement = handler.result();
-            //TODO: write the logic
-            refreshVariablesAndProvideOrchestratorAsyncId(asyncId, basicDagElement).setHandler(refreshVariablesHandler -> {
-                if (refreshVariablesHandler.succeeded()) {
-                    final String orchestratorAsyncId = refreshVariablesHandler.result();
-                    logger.info("Going to run for " + asyncId + "; dagElementId " + dagElementId);
-                    forceRunOnOrchestrator(asyncId, dagElementId, vertx, toBeDebugged, basicDagElement, orchestratorAsyncId, future, 5);
-                } else {
-                    future.fail(refreshVariablesHandler.cause());
-                }
-            });
+            if(handler.succeeded()) {
+                BasicDagElement basicDagElement = handler.result();
+                //TODO: write the logic
+                refreshVariablesAndProvideOrchestratorAsyncId(asyncId, basicDagElement).setHandler(refreshVariablesHandler -> {
+                    if (refreshVariablesHandler.succeeded()) {
+                        final String orchestratorAsyncId = refreshVariablesHandler.result();
+                        logger.info("Going to run for " + asyncId + "; dagElementId " + dagElementId);
+                        forceRunOnOrchestrator(asyncId, dagElementId, vertx, toBeDebugged, basicDagElement, orchestratorAsyncId, future, 5);
+                    } else {
+                        future.fail(refreshVariablesHandler.cause());
+                    }
+                });
+            } else {
+                logger.error("Failed to get dag element id: " + dagElementId, handler.cause());
+                future.fail(handler.cause());
+            }
         });
         return future;
     }
