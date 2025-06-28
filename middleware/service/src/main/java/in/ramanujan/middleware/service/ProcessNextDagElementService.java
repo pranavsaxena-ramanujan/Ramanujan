@@ -130,14 +130,18 @@ public class ProcessNextDagElementService {
                                             if(getNextDagElements.result().size() == 0) {
                                                 handleNoNextDagElement(asyncId).setHandler(noNextDagElementHandler -> {
                                                     countConcurrentRequest.decrementAndGet();
-                                                    future.complete();
+                                                    orchestratorAsyncTaskDao.removeOrchestratorAsyncId(asyncId, dagElementId).setHandler(removeHandler -> {
+                                                        future.complete();
+                                                    });
                                                 });
                                             } else {
                                                 callNextElements(getNextDagElements.result(), asyncId, dagElementId, vertx, toBeDebugged)
                                                         .setHandler(nextElementCallHandler -> {
                                                     countConcurrentRequest.decrementAndGet();
                                                     if(nextElementCallHandler.succeeded()) {
-                                                        future.complete();
+                                                        orchestratorAsyncTaskDao.removeOrchestratorAsyncId(asyncId, dagElementId).setHandler(removeHandler -> {
+                                                            future.complete();
+                                                        });
                                                     } else {
                                                         logger.error("Failed to call next elements", nextElementCallHandler.cause());
                                                         future.fail(nextElementCallHandler.cause());
