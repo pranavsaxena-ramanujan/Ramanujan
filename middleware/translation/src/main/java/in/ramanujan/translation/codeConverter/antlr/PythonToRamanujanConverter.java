@@ -270,95 +270,254 @@ public class PythonToRamanujanConverter extends Python3ParserBaseListener {
     /**
      * ANTLR listener method called when entering an expression statement in the Python AST.
      * <p>
-     * This method handles variable assignments of the form "x = value". It validates that
-     * function calls are not used in assignments (which is not supported), creates or retrieves
-     * the target variable, parses the assigned value, and generates the appropriate command.
+     * This method handles variable assignments of the form "x = value" and array assignments
+     * of the form "arr[index] = value". It validates that function calls are not used in
+     * assignments (which is not supported), creates or retrieves the target variable/array,
+     * parses the assigned value, and generates the appropriate command.
      * <p>
-     * Supported assignment examples:
+     * IMPORTANT: Arrays MUST be declared using the specific n-dimensional list comprehension syntax:
      * <pre>
-     *     x = 5        # Simple integer assignment
-     *     y = 3.14     # Float assignment
-     *     name = "Bob" # String assignment
+     *     # 1D array declaration (REQUIRED format):
+     *     arr = [0 for _ in range(x)]
+     *
+     *     # 2D array declaration (REQUIRED format):
+     *     matrix = [[0] * y for _ in range(x)]
+     *
+     *     # 3D array declaration (REQUIRED format):
+     *     cube = [[[0] * z for _ in range(y)] for _ in range(x)]
+     *
+     *     # General n-dimensional format:
+     *     arr = [[[...[[0] * dim_n for _ in range(dim_n-1)] ...] for _ in range(dim_2)] for _ in range(dim_1)]
      * </pre>
      *
-     * Unsupported (throws CompilationException):
+     * Supported assignment examples:
      * <pre>
-     *     x = func()   # Function call in assignment
+     *     x = 5                              # Simple integer assignment
+     *     y = 3.14                           # Float assignment
+     *     name = "Bob"                       # String assignment
+     *     arr[0] = 10                        # Array element assignment
+     *     matrix[i][j] = 5                   # Multi-dimensional array assignment
+     *     arr = [0 for _ in range(10)]       # 1D array declaration (ONLY allowed format)
+     *     matrix = [[0] * 5 for _ in range(3)] # 2D array declaration (ONLY allowed format)
+     * </pre>
+     *
+     * Unsupported array declarations (throws CompilationException):
+     * <pre>
+     *     arr = [1, 2, 3, 4, 5]              # Simple list literal - NOT ALLOWED
+     *     matrix = [[1, 2], [3, 4]]          # Nested list literal - NOT ALLOWED
+     *     arr = []                           # Empty list - NOT ALLOWED
+     * </pre>
+     *
+     * Unsupported assignments (throws CompilationException):
+     * <pre>
+     *     x = func()                         # Function call in assignment
+     *     arr[func()] = 5                    # Function call in array index
      * </pre>
      *
      * @param ctx The ANTLR parse tree context for the expression statement
-     * @throws RuntimeException If a function call is detected in the assignment
+     * @throws RuntimeException If a function call is detected in the assignment or if array declaration format is invalid
      */
     @Override
     public void enterExpr_stmt(Python3Parser.Expr_stmtContext ctx) {
-        // Handle variable assignment: x = value
+        // Handle variable assignment: x = value or arr[index] = value
         if (ctx.getChildCount() >= 3 && "=".equals(ctx.getChild(1).getText())) {
-            String varName = ctx.getChild(0).getText();
+            String leftSide = ctx.getChild(0).getText();
             String rightSide = ctx.getChild(2).getText();
             
             // Check if right side contains a function call - this is not allowed
             if (containsFunctionCall(ctx.getChild(2))) {
-                throw new RuntimeException("CompilationException: Function calls in assignments like '" + varName + " = " + rightSide + "' are not supported. Use pass-by-reference: '" + rightSide.replaceAll("\\(.*\\)", "(" + varName + ")") + "' instead.");
+                throw new RuntimeException("CompilationException: Function calls in assignments like '" + leftSide + " = " + rightSide + "' are not supported. Use pass-by-reference: '" + rightSide.replaceAll("\\(.*\\)", "(" + leftSide + ")") + "' instead.");
             }
 
-            // Get or create the variable in current scope
-            Variable variable = getOrCreateVariable(varName);
-            
-            // Check if right side is a simple number/value
-            try {
-                Object value = parseValue(rightSide);
-                variable.setValue(value);
-                createAssignmentCommand(variable, null);
-                
-                // Add debug output if debug creator is available
-                if (debugLevelCodeCreator != null) {
-                    debugLevelCodeCreator.concat(varName + " = " + rightSide + ";");
-                }
-            } catch (NumberFormatException e) {
-                // Right side is an expression - we'll need to handle this more complexly
-                // For now, create a simple assignment command
-                createAssignmentCommand(variable, null);
+            // Check if left side contains function calls in array indices
+            if (containsFunctionCall(ctx.getChild(0))) {
+                throw new RuntimeException("CompilationException: Function calls in array indices like '" + leftSide + "' are not supported.");
+            }
+
+            // Determine if this is an array assignment or regular variable assignment
+            if (isArrayAccess(leftSide)) {
+                handleArrayAssignment(leftSide, rightSide, ctx);
+            } else if (isArrayDeclaration(rightSide)) {
+                // Handle array declaration with strict format validation
+                handleArrayDeclaration(leftSide, rightSide, ctx);
+            } else {
+                handleVariableAssignment(leftSide, rightSide, ctx);
+            }
+        }
+    }
+
+    /**
+     * Handles regular variable assignments (non-array).
+     * <p>
+     * This method processes simple variable assignments like "x = 5" or "name = 'John'".
+     * It creates or retrieves the variable, parses the value, and generates the assignment command.
+     *
+     * @param varName   The name of the variable being assigned to
+     * @param rightSide The value being assigned (right side of =)
+     * @param ctx       The parse tree context for debugging
+     */
+    private void handleVariableAssignment(String varName, String rightSide, Python3Parser.Expr_stmtContext ctx) {
+        // Get or create the variable in current scope
+        Variable variable = getOrCreateVariable(varName);
+
+        // Parse and set the value
+        try {
+            Object value = parseValue(rightSide);
+            variable.setValue(value);
+            createAssignmentCommand(variable, "assign");
+
+            // Add debug output if debug creator is available
+            if (debugLevelCodeCreator != null) {
+                debugLevelCodeCreator.concat(varName + " = " + rightSide + ";");
+                debugLevelCodeCreator.nextLine();
+            }
+        } catch (NumberFormatException e) {
+            // Right side is an expression - create assignment with expression handling
+            createAssignmentCommand(variable, "assign_expression");
+
+            if (debugLevelCodeCreator != null) {
+                debugLevelCodeCreator.concat(varName + " = " + rightSide + "; // expression assignment");
+                debugLevelCodeCreator.nextLine();
             }
         }
     }
     
     /**
-     * Recursively checks if a parse tree node contains a function call.
+     * Handles array element assignments.
      * <p>
-     * This method traverses the parse tree to detect function calls, which are identified
-     * by atom_expr nodes that have trailer children starting with '('. This is used to
-     * enforce the rule that function calls cannot appear in assignment statements.
+     * This method processes array assignments like "arr[0] = 5" or "matrix[i][j] = value".
+     * It extracts the array name and indices, validates that indices are simple (no operations),
+     * creates or retrieves the array, and generates the appropriate array assignment command.
      * <p>
-     * Example patterns detected:
+     * IMPORTANT: Array indices MUST be simple values, variables, or array elements only:
      * <pre>
-     *     func()           # Simple function call
-     *     obj.method()     # Method call
-     *     func(x, y)       # Function call with arguments
+     *     # Allowed array indices:
+     *     arr[0] = 5          # Literal integer index
+     *     arr[i] = 10         # Variable index
+     *     arr[other[j]] = 15  # Array element as index
+     *     matrix[x][y] = 20   # Multiple simple indices
      * </pre>
      *
-     * @param node The parse tree node to examine for function calls
-     * @return true if the node or any of its children contains a function call, false otherwise
+     * Unsupported array indices (throws CompilationException):
+     * <pre>
+     *     arr[x + 1] = 5      # Expression with operation - NOT ALLOWED
+     *     arr[i * 2] = 10     # Expression with operation - NOT ALLOWED
+     *     arr[func()] = 15    # Function call - NOT ALLOWED
+     *     arr[x - y] = 20     # Expression with operation - NOT ALLOWED
+     * </pre>
+     *
+     * @param leftSide  The left side of the assignment (e.g., "arr[0]", "matrix[i][j]")
+     * @param rightSide The value being assigned
+     * @param ctx       The parse tree context for debugging
+     * @throws RuntimeException If array indices contain operations or function calls
      */
-    private boolean containsFunctionCall(org.antlr.v4.runtime.tree.ParseTree node) {
-        // Check if this node is an atom_expr with a function call trailer
-        if (node instanceof Python3Parser.Atom_exprContext) {
-            Python3Parser.Atom_exprContext atomExpr = (Python3Parser.Atom_exprContext) node;
-            // Check each trailer for function call pattern (starts with '(')
-            for (Python3Parser.TrailerContext trailer : atomExpr.trailer()) {
-                if (trailer.getChildCount() >= 2 && "(".equals(trailer.getChild(0).getText())) {
-                    return true; // Found a function call
-                }
+    private void handleArrayAssignment(String leftSide, String rightSide, Python3Parser.Expr_stmtContext ctx) {
+        // Extract array name and indices
+        String arrayName = extractArrayName(leftSide);
+        List<String> indices = extractArrayIndices(leftSide);
+
+        // Validate that all indices are simple (no operations or function calls)
+        validateArrayIndices(indices, leftSide);
+
+        // Get or create the array
+        Array array = getOrCreateArray(arrayName);
+
+        // Validate indices count against array dimensions
+        if (array.getDimension() != null && indices.size() > array.getDimension().size()) {
+            throw new RuntimeException("CompilationException: Too many indices for array '" + arrayName +
+                "'. Expected " + array.getDimension().size() + " dimensions, got " + indices.size());
+        }
+
+        // Parse the assigned value
+        try {
+            Object value = parseValue(rightSide);
+            // Create array assignment command
+            createArrayAssignmentCommand(array, indices, "assign");
+
+            // Add debug output
+            if (debugLevelCodeCreator != null) {
+                debugLevelCodeCreator.concat(leftSide + " = " + rightSide + ";");
+                debugLevelCodeCreator.nextLine();
+            }
+        } catch (NumberFormatException e) {
+            // Right side is an expression
+            createArrayAssignmentCommand(array, indices, "assign_expression");
+
+            if (debugLevelCodeCreator != null) {
+                debugLevelCodeCreator.concat(leftSide + " = " + rightSide + "; // array expression assignment");
+                debugLevelCodeCreator.nextLine();
+            }
+        }
+    }
+
+    /**
+     * Handles array initialization from list literals.
+     * <p>
+     * This method processes array initialization like "arr = [1, 2, 3, 4, 5]".
+     * It parses the list content, determines the array size, and creates the array
+     * with appropriate dimensions and initial values.
+     *
+     * @param varName     The name of the array variable being created
+     * @param listContent The list content (e.g., "[1, 2, 3, 4, 5]")
+     * @param ctx         The parse tree context for debugging
+     */
+    private void handleArrayInitialization(String varName, String listContent, Python3Parser.Expr_stmtContext ctx) {
+        // Remove brackets and split by comma
+        String content = listContent.substring(1, listContent.length() - 1).trim();
+
+        if (content.isEmpty()) {
+            // Empty array - create with default size
+            Array array = createArray(varName, "integer", Arrays.asList(10));
+            if (debugLevelCodeCreator != null) {
+                debugLevelCodeCreator.concat("var " + varName + "[10]:array;");
+                debugLevelCodeCreator.nextLine();
+            }
+            return;
+        }
+
+        // Split elements and determine array size
+        String[] elements = content.split(",");
+        List<Integer> dimensions = Arrays.asList(elements.length);
+
+        // Determine data type from first element
+        String dataType = "integer"; // default
+        try {
+            parseValue(elements[0].trim());
+            // Check if it's a decimal number
+            if (elements[0].trim().contains(".")) {
+                dataType = "real";
+            }
+        } catch (NumberFormatException e) {
+            // Assume string type
+            dataType = "string";
+        }
+
+        // Create the array
+        Array array = createArray(varName, dataType, dimensions);
+
+        // Generate individual assignment commands for each element
+        for (int i = 0; i < elements.length; i++) {
+            String element = elements[i].trim();
+            try {
+                Object value = parseValue(element);
+                List<String> indices = Arrays.asList(String.valueOf(i));
+                createArrayAssignmentCommand(array, indices, "assign");
+            } catch (NumberFormatException e) {
+                // Handle as expression
+                List<String> indices = Arrays.asList(String.valueOf(i));
+                createArrayAssignmentCommand(array, indices, "assign_expression");
             }
         }
 
-        // Recursively check all children nodes
-        for (int i = 0; i < node.getChildCount(); i++) {
-            if (containsFunctionCall(node.getChild(i))) {
-                return true;
+        // Add debug output
+        if (debugLevelCodeCreator != null) {
+            debugLevelCodeCreator.concat("var " + varName + "[" + elements.length + "]:array;");
+            debugLevelCodeCreator.nextLine();
+            for (int i = 0; i < elements.length; i++) {
+                debugLevelCodeCreator.concat("{" + varName + "[" + i + "]} = {" + elements[i].trim() + "};");
+                debugLevelCodeCreator.nextLine();
             }
         }
-
-        return false;
     }
 
     /**
@@ -1060,5 +1219,483 @@ public class PythonToRamanujanConverter extends Python3ParserBaseListener {
         // Throw compilation exception for return statements
         throw new RuntimeException("CompilationException: 'return' statements are not supported. Functions should use pass-by-reference parameters instead.");
     }
+
+    /**
+     * Recursively checks if a parse tree node contains a function call.
+     * <p>
+     * This method traverses the parse tree to detect function calls, which are identified
+     * by atom_expr nodes that have trailer children starting with '('. This is used to
+     * enforce the rule that function calls cannot appear in assignment statements.
+     * <p>
+     * Example patterns detected:
+     * <pre>
+     *     func()           # Simple function call
+     *     obj.method()     # Method call
+     *     func(x, y)       # Function call with arguments
+     * </pre>
+     *
+     * @param node The parse tree node to examine for function calls
+     * @return true if the node or any of its children contains a function call, false otherwise
+     */
+    private boolean containsFunctionCall(org.antlr.v4.runtime.tree.ParseTree node) {
+        // Check if this node is an atom_expr with a function call trailer
+        if (node instanceof Python3Parser.Atom_exprContext) {
+            Python3Parser.Atom_exprContext atomExpr = (Python3Parser.Atom_exprContext) node;
+            // Check each trailer for function call pattern (starts with '(')
+            for (Python3Parser.TrailerContext trailer : atomExpr.trailer()) {
+                if (trailer.getChildCount() >= 2 && "(".equals(trailer.getChild(0).getText())) {
+                    return true; // Found a function call
+                }
+            }
+        }
+
+        // Recursively check all children nodes
+        for (int i = 0; i < node.getChildCount(); i++) {
+            if (containsFunctionCall(node.getChild(i))) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /**
+     * Creates a new Array object with the specified name, data type, and dimensions.
+     * <p>
+     * This method generates a new Array with a unique ID and registers it in both the
+     * array map and the rule engine input for later processing.
+     * <p>
+     * Example usage:
+     * <pre>
+     *     Array arr = createArray("myArray", "integer", Arrays.asList(10, 5));
+     *     // Creates a 10x5 integer array
+     * </pre>
+     *
+     * @param name       The name of the array variable
+     * @param dataType   The data type of array elements (e.g., "integer", "real")
+     * @param dimensions List of array dimensions
+     * @return The created Array object
+     */
+    private Array createArray(String name, String dataType, List<Integer> dimensions) {
+        Array array = new Array();
+        String scopePrefix = !variableScope.isEmpty() ? variableScope.get(variableScope.size() - 1) : "";
+
+        array.setId(scopePrefix + UUID.randomUUID().toString());
+        array.setName(name);
+        array.setDataType(dataType);
+        array.setDimension(dimensions);
+
+        // Register array in maps and rule engine input
+        String scopedName = scopePrefix + name;
+        arrayMap.put(scopedName, array);
+        ruleEngineInput.getArrays().add(array);
+
+        return array;
+    }
+
+    /**
+     * Gets or creates an array variable with the specified name.
+     * <p>
+     * This method first checks if an array with the given name exists in the current scope.
+     * If not found, it creates a new array with default dimensions and integer data type.
+     * <p>
+     * Example usage:
+     * <pre>
+     *     Array arr = getOrCreateArray("data");
+     *     // Gets existing array or creates new one with default settings
+     * </pre>
+     *
+     * @param name The name of the array to get or create
+     * @return The existing or newly created Array object
+     */
+    private Array getOrCreateArray(String name) {
+        String scopePrefix = !variableScope.isEmpty() ? variableScope.get(variableScope.size() - 1) : "";
+        String scopedName = scopePrefix + name;
+        Array array = arrayMap.get(scopedName);
+
+        if (array == null) {
+            // Auto-create array with default dimensions if not found
+            List<Integer> defaultDimensions = Collections.singletonList(10); // Default 1D array with 10 elements
+            array = createArray(name, "integer", defaultDimensions);
+        }
+
+        return array;
+    }
+
+    /**
+     * Creates a command for array element assignment operations.
+     * <p>
+     * This method generates a Command object specifically for array assignments,
+     * including the array ID, indices, and operation type.
+     * <p>
+     * Example usage:
+     * <pre>
+     *     Command cmd = createArrayAssignmentCommand(array, Arrays.asList("0", "1"), "assign");
+     *     // Creates command for arr[0][1] = value assignment
+     * </pre>
+     *
+     * @param array      The Array object being assigned to
+     * @param indices    List of index expressions for multi-dimensional access
+     * @param operation  The operation type (e.g., "assign", "add_assign")
+     * @return The created Command object for the array assignment
+     */
+    private Command createArrayAssignmentCommand(Array array, List<String> indices, String operation) {
+        Command command = new Command();
+        command.setId(UUID.randomUUID().toString());
+        command.setArrayId(array.getId());
+
+        // Set array indices for multi-dimensional access
+        if (indices != null && !indices.isEmpty()) {
+            // Store indices as comma-separated string for now
+            // TODO: Enhance Command class to support structured index representation
+            command.setArrayIndices(String.join(",", indices));
+        }
+
+        if (operation != null) {
+            command.setOperation(operation);
+        }
+
+        ruleEngineInput.getCommands().add(command);
+        commands.add(command);
+
+        return command;
+    }
+
+    /**
+     * Checks if a variable name represents an array access pattern.
+     * <p>
+     * This method detects array access syntax like "arr[0]", "matrix[i][j]", etc.
+     * <p>
+     * Example usage:
+     * <pre>
+     *     boolean isArray = isArrayAccess("data[5]");      // Returns true
+     *     boolean isVar = isArrayAccess("simpleVar");      // Returns false
+     * </pre>
+     *
+     * @param varName The variable name to check for array access pattern
+     * @return true if the name contains array access brackets, false otherwise
+     */
+    private boolean isArrayAccess(String varName) {
+        return varName.contains("[") && varName.contains("]");
+    }
+
+    /**
+     * Extracts the base array name from an array access expression.
+     * <p>
+     * This method parses array access syntax to get the root array name.
+     * <p>
+     * Example usage:
+     * <pre>
+     *     String arrayName = extractArrayName("data[5][2]"); // Returns "data"
+     *     String arrayName2 = extractArrayName("matrix[i]"); // Returns "matrix"
+     * </pre>
+     *
+     * @param arrayAccess The full array access expression
+     * @return The base array name without indices
+     */
+    private String extractArrayName(String arrayAccess) {
+        int bracketIndex = arrayAccess.indexOf('[');
+        return bracketIndex > 0 ? arrayAccess.substring(0, bracketIndex) : arrayAccess;
+    }
+
+    /**
+     * Extracts array indices from an array access expression.
+     * <p>
+     * This method parses multi-dimensional array access to extract all index expressions.
+     * <p>
+     * Example usage:
+     * <pre>
+     *     List&lt;String&gt; indices = extractArrayIndices("data[5][i+1]");
+     *     // Returns ["5", "i+1"]
+     * </pre>
+     *
+     * @param arrayAccess The full array access expression
+     * @return List of index expressions, empty list if no indices found
+     */
+    private List<String> extractArrayIndices(String arrayAccess) {
+        List<String> indices = new ArrayList<>();
+        int start = arrayAccess.indexOf('[');
+
+        while (start != -1) {
+            int end = arrayAccess.indexOf(']', start);
+            if (end != -1) {
+                String index = arrayAccess.substring(start + 1, end).trim();
+                indices.add(index);
+                start = arrayAccess.indexOf('[', end);
+            } else {
+                break;
+            }
+        }
+
+        return indices;
+    }
+
+    /**
+     * Checks if a string represents a potential array declaration (starts with '[').
+     * <p>
+     * This is a preliminary check to identify expressions that might be array declarations.
+     * Further validation is performed by validateArrayDeclarationFormat().
+     * <p>
+     * Example usage:
+     * <pre>
+     *     boolean isArray = isArrayDeclaration("[0 for _ in range(10)]"); // Returns true
+     *     boolean isVar = isArrayDeclaration("42");                       // Returns false
+     * </pre>
+     *
+     * @param rightSide The right side of an assignment expression
+     * @return true if the expression starts with '[', indicating potential array declaration
+     */
+    private boolean isArrayDeclaration(String rightSide) {
+        return rightSide.trim().startsWith("[") && rightSide.trim().endsWith("]");
+    }
+
+    /**
+     * Handles array declarations with strict format validation.
+     * <p>
+     * This method enforces the ONLY acceptable array declaration syntax in this language:
+     * n-dimensional list comprehensions. All other forms of array declaration are rejected.
+     * <p>
+     * REQUIRED formats (ONLY these are allowed):
+     * <pre>
+     *     # 1D: arr = [0 for _ in range(x)]
+     *     # 2D: matrix = [[0] * y for _ in range(x)]
+     *     # 3D: cube = [[[0] * z for _ in range(y)] for _ in range(x)]
+     *     # nD: arr = [[[...[[0] * dim_n for _ in range(dim_n-1)] ...] for _ in range(dim_2)] for _ in range(dim_1)]
+     * </pre>
+     *
+     * @param varName   The name of the array variable being declared
+     * @param rightSide The array declaration expression
+     * @param ctx       The parse tree context for debugging
+     * @throws RuntimeException If the array declaration format is invalid
+     */
+    private void handleArrayDeclaration(String varName, String rightSide, Python3Parser.Expr_stmtContext ctx) {
+        // Validate that the array declaration follows the required n-dimensional list comprehension format
+        ArrayDeclarationInfo declarationInfo = validateArrayDeclarationFormat(rightSide);
+
+        if (declarationInfo == null) {
+            throw new RuntimeException("CompilationException: Invalid array declaration format '" + rightSide + "'. " +
+                "Arrays MUST be declared using n-dimensional list comprehension syntax:\n" +
+                "1D: arr = [0 for _ in range(x)]\n" +
+                "2D: matrix = [[0] * y for _ in range(x)]\n" +
+                "3D: cube = [[[0] * z for _ in range(y)] for _ in range(x)]\n" +
+                "Simple list literals like [1,2,3] or [[1,2],[3,4]] are NOT allowed.");
+        }
+
+        // Create the array with validated dimensions
+        Array array = createArray(varName, declarationInfo.dataType, declarationInfo.dimensions);
+
+        // Add debug output
+        if (debugLevelCodeCreator != null) {
+            StringBuilder dimStr = new StringBuilder();
+            for (int i = 0; i < declarationInfo.dimensions.size(); i++) {
+                if (i > 0) dimStr.append("][");
+                dimStr.append(declarationInfo.dimensions.get(i));
+            }
+            debugLevelCodeCreator.concat("var " + varName + "[" + dimStr + "]:array; // " +
+                declarationInfo.dimensions.size() + "D array declaration");
+            debugLevelCodeCreator.nextLine();
+        }
+    }
+
+    /**
+     * Validates array declaration format and extracts dimension information.
+     * <p>
+     * This method enforces the strict array declaration syntax by pattern matching
+     * against the required n-dimensional list comprehension formats. It extracts
+     * dimension sizes and determines the data type from the initial value.
+     * <p>
+     * Valid patterns recognized:
+     * <pre>
+     *     [value for _ in range(dim)]                           # 1D
+     *     [[value] * dim2 for _ in range(dim1)]                 # 2D
+     *     [[[value] * dim3 for _ in range(dim2)] for _ in range(dim1)]  # 3D
+     *     # And so on for higher dimensions...
+     * </pre>
+     *
+     * @param declaration The array declaration string to validate
+     * @return ArrayDeclarationInfo containing dimensions and data type, or null if invalid
+     */
+    private ArrayDeclarationInfo validateArrayDeclarationFormat(String declaration) {
+        declaration = declaration.trim();
+
+        // Remove outer brackets
+        if (!declaration.startsWith("[") || !declaration.endsWith("]")) {
+            return null;
+        }
+
+        String content = declaration.substring(1, declaration.length() - 1).trim();
+
+        // Check for 1D array: [value for _ in range(dim)]
+        if (content.matches(".*\\s+for\\s+_\\s+in\\s+range\\s*\\(.*\\).*")) {
+            return validate1DArrayFormat(content);
+        }
+
+        // Check for 2D+ array: [[...] * dim for _ in range(dim)] pattern
+        if (content.startsWith("[") && content.contains(" for _ in range(")) {
+            return validateMultiDimensionalArrayFormat(content);
+        }
+
+        // If it doesn't match the required patterns, it's invalid
+        return null;
+    }
+
+    /**
+     * Validates 1D array declaration format.
+     * <p>
+     * Expected format: [value for _ in range(dimension)]
+     *
+     * @param content The content inside the outer brackets
+     * @return ArrayDeclarationInfo for 1D array, or null if invalid
+     */
+    private ArrayDeclarationInfo validate1DArrayFormat(String content) {
+        // Pattern: value for _ in range(dimension)
+        String[] parts = content.split("\\s+for\\s+_\\s+in\\s+range\\s*\\(");
+        if (parts.length != 2) {
+            return null;
+        }
+
+        String valueStr = parts[0].trim();
+        String rangePart = parts[1].trim();
+
+        // Extract dimension from range(dimension)
+        if (!rangePart.endsWith(")")) {
+            return null;
+        }
+
+        String dimensionStr = rangePart.substring(0, rangePart.length() - 1).trim();
+
+        try {
+            // Try to parse dimension as integer
+            int dimension = Integer.parseInt(dimensionStr);
+            if (dimension <= 0) {
+                return null; // Invalid dimension
+            }
+
+            // Determine data type from initial value
+            String dataType = determineDataType(valueStr);
+
+            return new ArrayDeclarationInfo(Collections.singletonList(dimension), dataType);
+        } catch (NumberFormatException e) {
+            // Dimension is a variable - this could be supported but for now we require constants
+            // Could be enhanced to support variable dimensions
+            return null;
+        }
+    }
+
+    /**
+     * Validates multi-dimensional array declaration format.
+     * <p>
+     * Expected formats:
+     * 2D: [[value] * dim2 for _ in range(dim1)]
+     * 3D: [[[value] * dim3 for _ in range(dim2)] for _ in range(dim1)]
+     * etc.
+     *
+     * @param content The content inside the outer brackets
+     * @return ArrayDeclarationInfo for multi-dimensional array, or null if invalid
+     */
+    private ArrayDeclarationInfo validateMultiDimensionalArrayFormat(String content) {
+        List<Integer> dimensions = new ArrayList<>();
+        String currentContent = content;
+        String dataType = "integer"; // default
+
+        // Process nested structure from outside to inside
+        while (currentContent.startsWith("[") && currentContent.contains(" for _ in range(")) {
+            // Find the matching "] for _ in range(" pattern
+            int forIndex = currentContent.lastIndexOf(" for _ in range(");
+            if (forIndex == -1) break;
+
+            // Extract the range part
+            int rangeStart = currentContent.indexOf("(", forIndex);
+            int rangeEnd = currentContent.indexOf(")", rangeStart);
+            if (rangeStart == -1 || rangeEnd == -1) {
+                return null;
+            }
+
+            String dimensionStr = currentContent.substring(rangeStart + 1, rangeEnd).trim();
+            try {
+                int dimension = Integer.parseInt(dimensionStr);
+                if (dimension <= 0) {
+                    return null;
+                }
+                dimensions.add(0, dimension); // Add to front since we're processing outside-in
+            } catch (NumberFormatException e) {
+                return null; // Variable dimensions not supported yet
+            }
+
+            // Extract the inner part before " for _ in range("
+            String beforeFor = currentContent.substring(0, forIndex).trim();
+            if (!beforeFor.startsWith("[")) {
+                return null;
+            }
+
+            currentContent = beforeFor.substring(1).trim(); // Remove the opening bracket
+
+            // Check if this level has a multiplication pattern: [...] * dim
+            if (currentContent.contains("] * ")) {
+                String[] mulParts = currentContent.split("\\]\\s*\\*\\s*");
+                if (mulParts.length == 2) {
+                    try {
+                        int innerDim = Integer.parseInt(mulParts[1].trim());
+                        if (innerDim <= 0) {
+                            return null;
+                        }
+                        dimensions.add(innerDim); // Add inner dimension
+                        currentContent = mulParts[0].trim() + "]"; // Continue with the inner part
+                    } catch (NumberFormatException e) {
+                        return null;
+                    }
+                }
+            }
+        }
+
+        // Extract the final value to determine data type
+        if (currentContent.startsWith("[") && currentContent.endsWith("]")) {
+            String finalValue = currentContent.substring(1, currentContent.length() - 1).trim();
+            dataType = determineDataType(finalValue);
+        }
+
+        return dimensions.size() >= 2 ? new ArrayDeclarationInfo(dimensions, dataType) : null;
+    }
+
+    /**
+     * Determines the data type from an initial value string.
+     * <p>
+     * This method analyzes the initial value to determine the appropriate data type
+     * for the array elements.
+     *
+     * @param valueStr The initial value string
+     * @return The determined data type ("integer", "real", or "string")
+     */
+    private String determineDataType(String valueStr) {
+        valueStr = valueStr.trim();
+
+        try {
+            Integer.parseInt(valueStr);
+            return "integer";
+        } catch (NumberFormatException e1) {
+            try {
+                Double.parseDouble(valueStr);
+                return "real";
+            } catch (NumberFormatException e2) {
+                return "string";
+            }
+        }
+    }
+
+    /**
+     * Helper class to hold array declaration information.
+     */
+    private static class ArrayDeclarationInfo {
+        final List<Integer> dimensions;
+        final String dataType;
+
+        ArrayDeclarationInfo(List<Integer> dimensions, String dataType) {
+            this.dimensions = dimensions;
+            this.dataType = dataType;
+        }
+    }
 }
+
+
+
 
