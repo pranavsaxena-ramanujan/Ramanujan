@@ -1,13 +1,17 @@
 package in.ramanujan.translation.codeConverter.antlr;
 
-import in.ramanujan.enums.DataType;
+import in.ramanujan.enums.OperatorType;
 import in.ramanujan.pojo.RuleEngineInput;
 import in.ramanujan.pojo.ruleEngineInputUnitsExt.*;
 import in.ramanujan.pojo.ruleEngineInputUnitsExt.array.Array;
+import in.ramanujan.pojo.ruleEngineInputUnitsExt.array.ArrayCommand;
+import in.ramanujan.translation.codeConverter.exception.CompilationException;
 import in.ramanujan.translation.codeConverter.grammar.DebugLevelCodeCreator;
 import org.antlr.v4.runtime.tree.TerminalNode;
 
 import java.util.*;
+
+import static in.ramanujan.translation.codeConverter.utils.CodeConversionUtils.*;
 
 /**
  * Python3 to Ramanujan intermediate code converter using ANTLR listener pattern.
@@ -51,6 +55,8 @@ public class PythonToRamanujanConverter extends Python3ParserBaseListener {
 
     // Track function names to IDs for function calls - enables function resolution
     private final Map<String, String> functionNameToIdMap = new HashMap<>();
+    // Map to track commands for function calls before declaration
+    private final Map<String, List<Command>> pendingFunctionCommands = new HashMap<>();
 
     /**
      * Constructs a new PythonToRamanujanConverter with the required dependencies.
@@ -150,39 +156,35 @@ public class PythonToRamanujanConverter extends Python3ParserBaseListener {
      * @return The existing or newly created Variable object.
      */
     private Variable getOrCreateVariable(String name) {
-        // Compute the scoped variable name based on the current scope
-        String scopedName = variableScope.size() > 0 ? variableScope.get(variableScope.size() - 1) + name : name;
-        Variable variable = variableMap.get(scopedName);
-        
+
+        Variable variable = getVariable(variableMap, name, variableScope);
         if (variable == null) {
             // Auto-create variable with integer type (default) if not found
             variable = createVariable(name, "integer", 0);
         }
-        
+
         return variable;
     }
     
     /**
-     * Creates a command representing a variable assignment operation.
-     * <p>
-     * This method generates a new Command object, assigns it a unique ID, and associates it with the given variable and operation ID.
-     * <p>
-     * Example usage:
-     * <pre>
-     *     Command cmd = createAssignmentCommand(variable, "assign");
-     * </pre>
+     * Creates a new assignment command for a variable with the specified right operand.
      *
-     * @param variable    The Variable object to assign.
-     * @param operationId The operation ID representing the assignment type (e.g., "assign").
-     * @return The created Command object representing the assignment.
+     * @param variable The Variable object to assign a value to
+     * @param assignmentRightOperand commandId for the right operand. It can either have constant, or variable, or arrayCommand.
+     * @return  The created Command object representing the assignment operation
      */
-    private Command createAssignmentCommand(Variable variable, String operationId) {
+    private Command createAssignmentCommandForVariable(Variable variable, String assignmentRightOperand) {
         Command command = new Command();
         command.setId(UUID.randomUUID().toString());
-        command.setVariableId(variable.getId());
-        if (operationId != null) {
-            command.setOperation(operationId);
-        }
+
+        Operation operation = new Operation();
+        operation.setId(UUID.randomUUID().toString());
+        operation.setOperatorType(OperatorType.ASSIGN.getOperatorCode());
+        operation.setOperand1(variable.getName());
+        operation.setOperand2(assignmentRightOperand);
+        ruleEngineInput.getOperations().add(operation);
+
+        command.setOperation(operation.getId());
         
         ruleEngineInput.getCommands().add(command);
         commands.add(command);
@@ -337,9 +339,6 @@ public class PythonToRamanujanConverter extends Python3ParserBaseListener {
             // Determine if this is an array assignment or regular variable assignment
             if (isArrayAccess(leftSide)) {
                 handleArrayAssignment(leftSide, rightSide, ctx);
-            } else if (isArrayDeclaration(rightSide)) {
-                // Handle array declaration with strict format validation
-                handleArrayDeclaration(leftSide, rightSide, ctx);
             } else {
                 handleVariableAssignment(leftSide, rightSide, ctx);
             }
@@ -360,25 +359,14 @@ public class PythonToRamanujanConverter extends Python3ParserBaseListener {
         // Get or create the variable in current scope
         Variable variable = getOrCreateVariable(varName);
 
-        // Parse and set the value
-        try {
-            Object value = parseValue(rightSide);
-            variable.setValue(value);
-            createAssignmentCommand(variable, "assign");
+        Command value = getAssignRightOperand(rightSide);
 
-            // Add debug output if debug creator is available
-            if (debugLevelCodeCreator != null) {
-                debugLevelCodeCreator.concat(varName + " = " + rightSide + ";");
-                debugLevelCodeCreator.nextLine();
-            }
-        } catch (NumberFormatException e) {
-            // Right side is an expression - create assignment with expression handling
-            createAssignmentCommand(variable, "assign_expression");
+        createAssignmentCommandForVariable(variable, value.getId());
 
-            if (debugLevelCodeCreator != null) {
-                debugLevelCodeCreator.concat(varName + " = " + rightSide + "; // expression assignment");
-                debugLevelCodeCreator.nextLine();
-            }
+        // Add debug output if debug creator is available
+        if (debugLevelCodeCreator != null) {
+            debugLevelCodeCreator.concat(varName + " = " + rightSide + ";");
+            debugLevelCodeCreator.nextLine();
         }
     }
     
@@ -420,7 +408,12 @@ public class PythonToRamanujanConverter extends Python3ParserBaseListener {
         validateArrayIndices(indices, leftSide);
 
         // Get or create the array
-        Array array = getOrCreateArray(arrayName);
+        Array array = getArray(arrayMap, arrayName, variableScope);
+
+        if (array == null) {
+            throw new RuntimeException("CompilationException: Array '" + arrayName + "' not declared. " +
+                    "Use the required n-dimensional list comprehension syntax to declare arrays.");
+        }
 
         // Validate indices count against array dimensions
         if (array.getDimension() != null && indices.size() > array.getDimension().size()) {
@@ -429,93 +422,31 @@ public class PythonToRamanujanConverter extends Python3ParserBaseListener {
         }
 
         // Parse the assigned value
-        try {
-            Object value = parseValue(rightSide);
-            // Create array assignment command
-            createArrayAssignmentCommand(array, indices, "assign");
+        Command valueSetCommand = getAssignRightOperand(rightSide);
+        // Create array assignment command
+        createArrayAssignmentCommand(array, indices, valueSetCommand.getId());
 
-            // Add debug output
-            if (debugLevelCodeCreator != null) {
-                debugLevelCodeCreator.concat(leftSide + " = " + rightSide + ";");
-                debugLevelCodeCreator.nextLine();
-            }
-        } catch (NumberFormatException e) {
-            // Right side is an expression
-            createArrayAssignmentCommand(array, indices, "assign_expression");
-
-            if (debugLevelCodeCreator != null) {
-                debugLevelCodeCreator.concat(leftSide + " = " + rightSide + "; // array expression assignment");
-                debugLevelCodeCreator.nextLine();
-            }
+        // Add debug output
+        if (debugLevelCodeCreator != null) {
+            debugLevelCodeCreator.concat(leftSide + " = " + rightSide + ";");
+            debugLevelCodeCreator.nextLine();
         }
     }
 
     /**
-     * Handles array initialization from list literals.
-     * <p>
-     * This method processes array initialization like "arr = [1, 2, 3, 4, 5]".
-     * It parses the list content, determines the array size, and creates the array
-     * with appropriate dimensions and initial values.
-     *
-     * @param varName     The name of the array variable being created
-     * @param listContent The list content (e.g., "[1, 2, 3, 4, 5]")
-     * @param ctx         The parse tree context for debugging
+     * Validates that array indices are simple (no function calls or operations in string form).
      */
-    private void handleArrayInitialization(String varName, String listContent, Python3Parser.Expr_stmtContext ctx) {
-        // Remove brackets and split by comma
-        String content = listContent.substring(1, listContent.length() - 1).trim();
-
-        if (content.isEmpty()) {
-            // Empty array - create with default size
-            Array array = createArray(varName, "integer", Arrays.asList(10));
-            if (debugLevelCodeCreator != null) {
-                debugLevelCodeCreator.concat("var " + varName + "[10]:array;");
-                debugLevelCodeCreator.nextLine();
+    private void validateArrayIndices(List<String> indices, String leftSide) {
+        for (String index : indices) {
+            // Disallow function call syntax in index
+            if (index.contains("(") || index.contains(")")) {
+                throw new RuntimeException("CompilationException: Invalid array index '" + index +
+                    "' in assignment '" + leftSide + "'. Function calls are not allowed in indices.");
             }
-            return;
-        }
-
-        // Split elements and determine array size
-        String[] elements = content.split(",");
-        List<Integer> dimensions = Arrays.asList(elements.length);
-
-        // Determine data type from first element
-        String dataType = "integer"; // default
-        try {
-            parseValue(elements[0].trim());
-            // Check if it's a decimal number
-            if (elements[0].trim().contains(".")) {
-                dataType = "real";
-            }
-        } catch (NumberFormatException e) {
-            // Assume string type
-            dataType = "string";
-        }
-
-        // Create the array
-        Array array = createArray(varName, dataType, dimensions);
-
-        // Generate individual assignment commands for each element
-        for (int i = 0; i < elements.length; i++) {
-            String element = elements[i].trim();
-            try {
-                Object value = parseValue(element);
-                List<String> indices = Arrays.asList(String.valueOf(i));
-                createArrayAssignmentCommand(array, indices, "assign");
-            } catch (NumberFormatException e) {
-                // Handle as expression
-                List<String> indices = Arrays.asList(String.valueOf(i));
-                createArrayAssignmentCommand(array, indices, "assign_expression");
-            }
-        }
-
-        // Add debug output
-        if (debugLevelCodeCreator != null) {
-            debugLevelCodeCreator.concat("var " + varName + "[" + elements.length + "]:array;");
-            debugLevelCodeCreator.nextLine();
-            for (int i = 0; i < elements.length; i++) {
-                debugLevelCodeCreator.concat("{" + varName + "[" + i + "]} = {" + elements[i].trim() + "};");
-                debugLevelCodeCreator.nextLine();
+            // Disallow arithmetic or logical operators in index string
+            if (index.matches(".*[+*/%&|<>!-].*")) {
+                throw new RuntimeException("CompilationException: Invalid array index '" + index +
+                    "' in assignment '" + leftSide + "'. Only simple indices are allowed.");
             }
         }
     }
@@ -873,6 +804,16 @@ public class PythonToRamanujanConverter extends Python3ParserBaseListener {
             // Map function name to its ID for later resolution during function calls
             functionNameToIdMap.put(funcName, functionCall.getId());
 
+            if (pendingFunctionCommands.containsKey(funcName)) {
+                List<Command> pendingCommands = pendingFunctionCommands.get(funcName);
+                for (Command cmd : pendingCommands) {
+                    if (cmd.getFunctionCall() != null) {
+                        cmd.getFunctionCall().setId(functionCall.getId());
+                    }
+                }
+                pendingFunctionCommands.remove(funcName);
+            }
+
             // Add debug output for function definition start
             if (debugLevelCodeCreator != null) {
                 debugLevelCodeCreator.concat("def " + funcName + "() {");
@@ -922,7 +863,7 @@ public class PythonToRamanujanConverter extends Python3ParserBaseListener {
 
             // Set the starting command ID for function entry
             if (commands.size() > startingCommandIndex) {
-                functionCall.setCommandId(commands.get(startingCommandIndex).getId());
+                functionCall.setFirstCommandId(commands.get(startingCommandIndex).getId());
             }
         }
 
@@ -981,10 +922,7 @@ public class PythonToRamanujanConverter extends Python3ParserBaseListener {
                         String functionId = functionNameToIdMap.get(functionName);
                         if (functionId != null) {
                             // This links to a previously defined function
-                            functionCall.setFunctionId(functionId);
-                        } else {
-                            // Unknown function - might be external or built-in
-                            functionCall.setFunctionId(functionName); // Use name as fallback
+                            functionCall.setId(functionId);
                         }
 
                         // Parse and resolve arguments
@@ -1011,6 +949,10 @@ public class PythonToRamanujanConverter extends Python3ParserBaseListener {
                         ruleEngineInput.getCommands().add(command);
                         commands.add(command);
                         ruleEngineInput.getFunctionCalls().add(functionCall);
+
+                        if (functionId == null) {
+                            pendingFunctionCommands.computeIfAbsent(functionName, k -> new ArrayList<>()).add(command);
+                        }
 
                         // Add debug output for function call
                         if (debugLevelCodeCreator != null) {
@@ -1051,14 +993,14 @@ public class PythonToRamanujanConverter extends Python3ParserBaseListener {
      */
     private String resolveArgument(String argText) {
         // Try to find it as a variable first
-        Variable variable = getOrCreateVariable(argText);
+        Variable variable = getVariable(variableMap, argText, variableScope);
         if (variable != null) {
             return variable.getId();
         }
 
         // If it's a literal, return as-is
         try {
-            parseValue(argText);
+            getAssignRightOperand(argText);
             return argText; // It's a valid literal
         } catch (NumberFormatException e) {
             // Not a simple literal, return as variable reference
@@ -1067,46 +1009,74 @@ public class PythonToRamanujanConverter extends Python3ParserBaseListener {
     }
 
     /**
-     * Parses a string value into the appropriate Java object type.
-     * <p>
-     * This method attempts to parse string representations of values into their
-     * corresponding Java types. It tries integer first, then double, and finally
-     * treats the value as a string (removing quotes if present).
-     * <p>
-     * Parsing priority:
-     * 1. Integer (e.g., "42" -> Integer(42))
-     * 2. Double (e.g., "3.14" -> Double(3.14))
-     * 3. String (e.g., "\"hello\"" -> "hello", "'world'" -> "world")
-     * <p>
-     * Example usage:
-     * <pre>
-     *     Object val1 = parseValue("42");        // Returns Integer(42)
-     *     Object val2 = parseValue("3.14");      // Returns Double(3.14)
-     *     Object val3 = parseValue("\"hello\""); // Returns String("hello")
-     * </pre>
-     *
-     * @param valueStr The string representation of the value to parse
-     * @return The parsed value as Integer, Double, or String
-     * @throws NumberFormatException If the value cannot be parsed as a number and is not a valid string
+     * Parses the right side of an assignment statement to determine its type and create the appropriate command.
      */
-    private Object parseValue(String valueStr) throws NumberFormatException {
-        valueStr = valueStr.trim();
-        
-        // Try integer parsing first
+    private Command getAssignRightOperand(String rightSideOfAssignment) throws NumberFormatException {
+        rightSideOfAssignment = rightSideOfAssignment.trim();
+
+        /*
+        * Parse it into double. If yes create Constant object
+        * Else, it can be either a variable or an array.
+        * If it is a variable, create a Variable object.
+        * If it is an array, create an ArrayCommand object.
+        *
+        * Now, whatever object is created, set it in a new Command object. Add the command in command list, and also
+        * add in ruleEngineInput.commands
+        */
+
         try {
-            return Integer.parseInt(valueStr);
+            // Try parsing as Integer first
+            double val = Double.parseDouble(rightSideOfAssignment);
+            Constant constant = new Constant();
+            constant.setId(UUID.randomUUID().toString());
+            constant.setValue(val);
+            ruleEngineInput.getConstants().add(constant);
+            Command command = new Command();
+            command.setId(UUID.randomUUID().toString());
+            command.setConstant(constant.getId());
+            commands.add(command);
+            ruleEngineInput.getCommands().add(command);
+            return command;
         } catch (NumberFormatException e1) {
-            // Try double parsing
-            try {
-                return Double.parseDouble(valueStr);
-            } catch (NumberFormatException e2) {
-                // Return as string (remove quotes if present)
-                if (valueStr.startsWith("\"") && valueStr.endsWith("\"")) {
-                    return valueStr.substring(1, valueStr.length() - 1);
-                } else if (valueStr.startsWith("'") && valueStr.endsWith("'")) {
-                    return valueStr.substring(1, valueStr.length() - 1);
+            // Check if it variable:
+            Variable variable = getVariable(variableMap, rightSideOfAssignment, variableScope);
+            if (variable != null) {
+                // It's a variable, create a command for it
+                Command command = new Command();
+                command.setId(UUID.randomUUID().toString());
+                command.setVariableId(variable.getId());
+                commands.add(command);
+                ruleEngineInput.getCommands().add(command);
+                return command;
+            } else {
+                // it should be an array now. If now, its compilation exception.
+                String arrayName = extractArrayName(rightSideOfAssignment);
+                List<String> arrayIndexes = extractArrayIndices(rightSideOfAssignment);
+                List<String> indexCommandIds = new ArrayList<>();
+                for(String arrayIndex : arrayIndexes) {
+                    try {
+                        indexCommandIds.add(useVariable(ruleEngineInput, arrayIndex, new Command(), variableMap, arrayMap, variableScope));
+                    } catch (CompilationException ex)
+                    {
+                        throw new NumberFormatException("CompilationException: Invalid array index '" + arrayIndex +
+                                "' in assignment value '" + rightSideOfAssignment + "'. Expected a number, variable, or array.");
+                    }
                 }
-                return valueStr;
+                Array array = getArray(arrayMap, rightSideOfAssignment, variableScope);
+                if (array == null) {
+                    throw new NumberFormatException("CompilationException: Invalid assignment value '" + rightSideOfAssignment + "'. Expected a number, variable, or array.");
+                }
+
+                Command command = new Command();
+                command.setId(UUID.randomUUID().toString());
+                commands.add(command);
+                ruleEngineInput.getCommands().add(command);
+
+                ArrayCommand arrayCommand = new ArrayCommand();
+                arrayCommand.setArrayId(array.getId());
+                arrayCommand.setIndex(arrayIndexes);
+                command.setArrayCommand(arrayCommand);
+                return command;
             }
         }
     }
@@ -1294,35 +1264,6 @@ public class PythonToRamanujanConverter extends Python3ParserBaseListener {
     }
 
     /**
-     * Gets or creates an array variable with the specified name.
-     * <p>
-     * This method first checks if an array with the given name exists in the current scope.
-     * If not found, it creates a new array with default dimensions and integer data type.
-     * <p>
-     * Example usage:
-     * <pre>
-     *     Array arr = getOrCreateArray("data");
-     *     // Gets existing array or creates new one with default settings
-     * </pre>
-     *
-     * @param name The name of the array to get or create
-     * @return The existing or newly created Array object
-     */
-    private Array getOrCreateArray(String name) {
-        String scopePrefix = !variableScope.isEmpty() ? variableScope.get(variableScope.size() - 1) : "";
-        String scopedName = scopePrefix + name;
-        Array array = arrayMap.get(scopedName);
-
-        if (array == null) {
-            // Auto-create array with default dimensions if not found
-            List<Integer> defaultDimensions = Collections.singletonList(10); // Default 1D array with 10 elements
-            array = createArray(name, "integer", defaultDimensions);
-        }
-
-        return array;
-    }
-
-    /**
      * Creates a command for array element assignment operations.
      * <p>
      * This method generates a Command object specifically for array assignments,
@@ -1336,24 +1277,33 @@ public class PythonToRamanujanConverter extends Python3ParserBaseListener {
      *
      * @param array      The Array object being assigned to
      * @param indices    List of index expressions for multi-dimensional access
-     * @param operation  The operation type (e.g., "assign", "add_assign")
+     * @param setValueCommandId  The command ID for the value being set
      * @return The created Command object for the array assignment
      */
-    private Command createArrayAssignmentCommand(Array array, List<String> indices, String operation) {
+    private Command createArrayAssignmentCommand(Array array, List<String> indices, String setValueCommandId) {
         Command command = new Command();
         command.setId(UUID.randomUUID().toString());
-        command.setArrayId(array.getId());
+        ArrayCommand arrayCommand = new ArrayCommand();
+        arrayCommand.setArrayId(array.getId());
+
 
         // Set array indices for multi-dimensional access
         if (indices != null && !indices.isEmpty()) {
-            // Store indices as comma-separated string for now
-            // TODO: Enhance Command class to support structured index representation
-            command.setArrayIndices(String.join(",", indices));
+            arrayCommand.setIndex(indices);
         }
 
-        if (operation != null) {
-            command.setOperation(operation);
-        }
+        Command leftCommand = new Command();
+        leftCommand.setId(UUID.randomUUID().toString());
+        leftCommand.setArrayCommand(arrayCommand);
+        ruleEngineInput.getCommands().add(leftCommand);
+
+        Operation operation = new Operation();
+        operation.setId(UUID.randomUUID().toString());
+        operation.setOperatorType(OperatorType.ASSIGN.getOperatorCode());
+        operation.setOperand1(leftCommand.getId());
+        operation.setOperand2(setValueCommandId);
+        ruleEngineInput.getOperations().add(operation);
+        command.setOperation(operation.getId());
 
         ruleEngineInput.getCommands().add(command);
         commands.add(command);
@@ -1447,54 +1397,6 @@ public class PythonToRamanujanConverter extends Python3ParserBaseListener {
      */
     private boolean isArrayDeclaration(String rightSide) {
         return rightSide.trim().startsWith("[") && rightSide.trim().endsWith("]");
-    }
-
-    /**
-     * Handles array declarations with strict format validation.
-     * <p>
-     * This method enforces the ONLY acceptable array declaration syntax in this language:
-     * n-dimensional list comprehensions. All other forms of array declaration are rejected.
-     * <p>
-     * REQUIRED formats (ONLY these are allowed):
-     * <pre>
-     *     # 1D: arr = [0 for _ in range(x)]
-     *     # 2D: matrix = [[0] * y for _ in range(x)]
-     *     # 3D: cube = [[[0] * z for _ in range(y)] for _ in range(x)]
-     *     # nD: arr = [[[...[[0] * dim_n for _ in range(dim_n-1)] ...] for _ in range(dim_2)] for _ in range(dim_1)]
-     * </pre>
-     *
-     * @param varName   The name of the array variable being declared
-     * @param rightSide The array declaration expression
-     * @param ctx       The parse tree context for debugging
-     * @throws RuntimeException If the array declaration format is invalid
-     */
-    private void handleArrayDeclaration(String varName, String rightSide, Python3Parser.Expr_stmtContext ctx) {
-        // Validate that the array declaration follows the required n-dimensional list comprehension format
-        ArrayDeclarationInfo declarationInfo = validateArrayDeclarationFormat(rightSide);
-
-        if (declarationInfo == null) {
-            throw new RuntimeException("CompilationException: Invalid array declaration format '" + rightSide + "'. " +
-                "Arrays MUST be declared using n-dimensional list comprehension syntax:\n" +
-                "1D: arr = [0 for _ in range(x)]\n" +
-                "2D: matrix = [[0] * y for _ in range(x)]\n" +
-                "3D: cube = [[[0] * z for _ in range(y)] for _ in range(x)]\n" +
-                "Simple list literals like [1,2,3] or [[1,2],[3,4]] are NOT allowed.");
-        }
-
-        // Create the array with validated dimensions
-        Array array = createArray(varName, declarationInfo.dataType, declarationInfo.dimensions);
-
-        // Add debug output
-        if (debugLevelCodeCreator != null) {
-            StringBuilder dimStr = new StringBuilder();
-            for (int i = 0; i < declarationInfo.dimensions.size(); i++) {
-                if (i > 0) dimStr.append("][");
-                dimStr.append(declarationInfo.dimensions.get(i));
-            }
-            debugLevelCodeCreator.concat("var " + varName + "[" + dimStr + "]:array; // " +
-                declarationInfo.dimensions.size() + "D array declaration");
-            debugLevelCodeCreator.nextLine();
-        }
     }
 
     /**
@@ -1695,7 +1597,5 @@ public class PythonToRamanujanConverter extends Python3ParserBaseListener {
         }
     }
 }
-
-
 
 
