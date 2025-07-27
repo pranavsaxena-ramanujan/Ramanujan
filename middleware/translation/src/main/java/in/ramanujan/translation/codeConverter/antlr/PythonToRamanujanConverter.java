@@ -340,7 +340,7 @@ public class PythonToRamanujanConverter extends Python3ParserBaseListener {
             if (isArrayAccess(leftSide)) {
                 handleArrayAssignment(leftSide, rightSide, ctx);
             } else {
-                handleVariableAssignment(leftSide, rightSide, ctx);
+                handleVariableAssignmentOrArrayDeclarationStatement(leftSide, rightSide, ctx);
             }
         }
     }
@@ -349,13 +349,20 @@ public class PythonToRamanujanConverter extends Python3ParserBaseListener {
      * Handles regular variable assignments (non-array).
      * <p>
      * This method processes simple variable assignments like "x = 5" or "name = 'John'".
-     * It creates or retrieves the variable, parses the value, and generates the assignment command.
+     * It also handles array declarations using the required list comprehension syntax.
+     * It creates or retrieves the variable/array, parses the value, and generates the assignment command.
      *
      * @param varName   The name of the variable being assigned to
      * @param rightSide The value being assigned (right side of =)
      * @param ctx       The parse tree context for debugging
      */
-    private void handleVariableAssignment(String varName, String rightSide, Python3Parser.Expr_stmtContext ctx) {
+    private void handleVariableAssignmentOrArrayDeclarationStatement(String varName, String rightSide, Python3Parser.Expr_stmtContext ctx) {
+        // Check if this is an array declaration
+        if (isArrayDeclaration(rightSide)) {
+            handleArrayDeclaration(varName, rightSide, ctx);
+            return;
+        }
+
         // Get or create the variable in current scope
         Variable variable = getOrCreateVariable(varName);
 
@@ -429,6 +436,44 @@ public class PythonToRamanujanConverter extends Python3ParserBaseListener {
         // Add debug output
         if (debugLevelCodeCreator != null) {
             debugLevelCodeCreator.concat(leftSide + " = " + rightSide + ";");
+            debugLevelCodeCreator.nextLine();
+        }
+    }
+
+    /**
+     * Handles array declarations using the n-dimensional list comprehension syntax.
+     * <p>
+     * This method validates the array declaration format and creates a new Array object
+     * with the specified dimensions. It only supports the strict list comprehension formats
+     * required by the Ramanujan system.
+     * <p>
+     * Supported formats:
+     * <pre>
+     *     arr = [0 for _ in range(10)]                     # 1D array
+     *     matrix = [[0] * 5 for _ in range(3)]             # 2D array
+     *     cube = [[[0] * 5 for _ in range(4)] for _ in range(3)]  # 3D array
+     * </pre>
+     *
+     * @param arrayName The name of the array variable being declared
+     * @param declaration The array declaration expression
+     * @param ctx The parse tree context for debugging
+     * @throws RuntimeException If the declaration format is invalid
+     */
+    private void handleArrayDeclaration(String arrayName, String declaration, Python3Parser.Expr_stmtContext ctx) {
+        ArrayDeclarationInfo info = validateArrayDeclarationFormat(declaration);
+        
+        if (info == null) {
+            throw new RuntimeException("CompilationException: Invalid array declaration format for '" + arrayName + 
+                " = " + declaration + "'. Use the required n-dimensional list comprehension syntax: " +
+                "arr = [value for _ in range(dim)] for 1D, [[value] * dim2 for _ in range(dim1)] for 2D, etc.");
+        }
+
+        // Create the array with validated dimensions and data type
+        createArray(arrayName, info.dataType, info.dimensions);
+
+        // Add debug output
+        if (debugLevelCodeCreator != null) {
+            debugLevelCodeCreator.concat(arrayName + " = " + declaration + ";");
             debugLevelCodeCreator.nextLine();
         }
     }
@@ -1062,7 +1107,7 @@ public class PythonToRamanujanConverter extends Python3ParserBaseListener {
                                 "' in assignment value '" + rightSideOfAssignment + "'. Expected a number, variable, or array.");
                     }
                 }
-                Array array = getArray(arrayMap, rightSideOfAssignment, variableScope);
+                Array array = getArray(arrayMap, arrayName, variableScope);
                 if (array == null) {
                     throw new NumberFormatException("CompilationException: Invalid assignment value '" + rightSideOfAssignment + "'. Expected a number, variable, or array.");
                 }
@@ -1470,7 +1515,7 @@ public class PythonToRamanujanConverter extends Python3ParserBaseListener {
             // Try to parse dimension as integer
             int dimension = Integer.parseInt(dimensionStr);
             if (dimension <= 0) {
-                return null; // Invalid dimension
+                throw new RuntimeException("CompilationException: Invalid array dimension '" + dimension + "'. Must be a positive integer.");
             }
 
             // Determine data type from initial value
@@ -1480,7 +1525,8 @@ public class PythonToRamanujanConverter extends Python3ParserBaseListener {
         } catch (NumberFormatException e) {
             // Dimension is a variable - this could be supported but for now we require constants
             // Could be enhanced to support variable dimensions
-            return null;
+            // TODO: Handle variable dimensions in future
+            throw new RuntimeException("CompilationException: Invalid array dimension '" + dimensionStr + "'. Must be a positive integer constant.");
         }
     }
 
@@ -1521,7 +1567,8 @@ public class PythonToRamanujanConverter extends Python3ParserBaseListener {
                 }
                 dimensions.add(0, dimension); // Add to front since we're processing outside-in
             } catch (NumberFormatException e) {
-                return null; // Variable dimensions not supported yet
+                // TODO: Handle variable dimensions in future
+                throw new RuntimeException("CompilationException: Invalid array dimension '" + dimensionStr + "'. Must be a positive integer.");
             }
 
             // Extract the inner part before " for _ in range("
