@@ -5,6 +5,7 @@ import in.ramanujan.pojo.RuleEngineInput;
 import in.ramanujan.pojo.ruleEngineInputUnitsExt.*;
 import in.ramanujan.pojo.ruleEngineInputUnitsExt.array.Array;
 import in.ramanujan.pojo.ruleEngineInputUnitsExt.array.ArrayCommand;
+import in.ramanujan.pojo.ruleEngineInputUnitsExt.array.RedefineArrayCommand;
 import in.ramanujan.translation.codeConverter.exception.CompilationException;
 import in.ramanujan.translation.codeConverter.grammar.DebugLevelCodeCreator;
 import org.antlr.v4.runtime.tree.TerminalNode;
@@ -18,10 +19,16 @@ import static in.ramanujan.translation.codeConverter.utils.CodeConversionUtils.*
  * <p>
  * This class extends Python3ParserBaseListener and converts Python AST nodes to the intermediate
  * representation that the Ramanujan rule engine understands. It handles Python constructs like
- * variable assignments, control flow (if/while), function definitions and calls.
+ * variable assignments, control flow (if/while), function definitions and calls, and array
+ * declarations with both constant and variable dimensions.
  * <p>
  * The converter maintains state using stacks to handle nested constructs properly and maps
  * Python syntax to corresponding Ramanujan rule engine objects.
+ * <p>
+ * Array Declaration Support:
+ * - Constant dimensions: arr = [0 for _ in range(10)]
+ * - Variable dimensions: arr = [0 for _ in range(n)] (where n is a previously declared variable)
+ * - Multi-dimensional arrays with mixed constant/variable dimensions supported
  * <p>
  * Example usage:
  * <pre>
@@ -279,18 +286,33 @@ public class PythonToRamanujanConverter extends Python3ParserBaseListener {
      * <p>
      * IMPORTANT: Arrays MUST be declared using the specific n-dimensional list comprehension syntax:
      * <pre>
-     *     # 1D array declaration (REQUIRED format):
-     *     arr = [0 for _ in range(x)]
+     *     # 1D array declaration with constant dimension (REQUIRED format):
+     *     arr = [0 for _ in range(10)]
      *
-     *     # 2D array declaration (REQUIRED format):
-     *     matrix = [[0] * y for _ in range(x)]
+     *     # 1D array declaration with variable dimension (NEW - SUPPORTED format):
+     *     n = 5
+     *     arr = [0 for _ in range(n)]
      *
-     *     # 3D array declaration (REQUIRED format):
-     *     cube = [[[0] * z for _ in range(y)] for _ in range(x)]
+     *     # 2D array declaration with constant dimensions (REQUIRED format):
+     *     matrix = [[0] * 5 for _ in range(3)]
      *
-     *     # General n-dimensional format:
+     *     # 2D array declaration with variable dimensions (NEW - SUPPORTED format):
+     *     rows = 3
+     *     cols = 5
+     *     matrix = [[0] * cols for _ in range(rows)]
+     *
+     *     # 3D array declaration with mixed constant/variable dimensions (NEW - SUPPORTED format):
+     *     depth = 4
+     *     cube = [[[0] * 5 for _ in range(depth)] for _ in range(3)]
+     *
+     *     # General n-dimensional format with variable dimensions:
      *     arr = [[[...[[0] * dim_n for _ in range(dim_n-1)] ...] for _ in range(dim_2)] for _ in range(dim_1)]
      * </pre>
+     *
+     * Variable Dimension Requirements:
+     * - Variables used as dimensions MUST be declared before the array declaration
+     * - Variable dimensions are resolved to their variable IDs and handled via RedefineArrayCommand
+     * - Mixed constant and variable dimensions are supported in multi-dimensional arrays
      *
      * Supported assignment examples:
      * <pre>
@@ -299,8 +321,10 @@ public class PythonToRamanujanConverter extends Python3ParserBaseListener {
      *     name = "Bob"                       # String assignment
      *     arr[0] = 10                        # Array element assignment
      *     matrix[i][j] = 5                   # Multi-dimensional array assignment
-     *     arr = [0 for _ in range(10)]       # 1D array declaration (ONLY allowed format)
-     *     matrix = [[0] * 5 for _ in range(3)] # 2D array declaration (ONLY allowed format)
+     *     arr = [0 for _ in range(10)]       # 1D array declaration with constant dimension
+     *     arr = [0 for _ in range(n)]        # 1D array declaration with variable dimension
+     *     matrix = [[0] * 5 for _ in range(3)] # 2D array declaration with constant dimensions
+     *     matrix = [[0] * m for _ in range(n)] # 2D array declaration with variable dimensions
      * </pre>
      *
      * Unsupported array declarations (throws CompilationException):
@@ -314,10 +338,11 @@ public class PythonToRamanujanConverter extends Python3ParserBaseListener {
      * <pre>
      *     x = func()                         # Function call in assignment
      *     arr[func()] = 5                    # Function call in array index
+     *     arr = [0 for _ in range(undeclared_var)]  # Undeclared variable dimension
      * </pre>
      *
      * @param ctx The ANTLR parse tree context for the expression statement
-     * @throws RuntimeException If a function call is detected in the assignment or if array declaration format is invalid
+     * @throws RuntimeException If a function call is detected in the assignment, if array declaration format is invalid, or if variable dimensions are not found in scope
      */
     @Override
     public void enterExpr_stmt(Python3Parser.Expr_stmtContext ctx) {
@@ -444,14 +469,16 @@ public class PythonToRamanujanConverter extends Python3ParserBaseListener {
      * Handles array declarations using the n-dimensional list comprehension syntax.
      * <p>
      * This method validates the array declaration format and creates a new Array object
-     * with the specified dimensions. It only supports the strict list comprehension formats
-     * required by the Ramanujan system.
+     * with the specified dimensions. It supports both constant and variable dimensions.
+     * When variable dimensions are detected, it creates a RedefineArrayCommand.
      * <p>
      * Supported formats:
      * <pre>
-     *     arr = [0 for _ in range(10)]                     # 1D array
-     *     matrix = [[0] * 5 for _ in range(3)]             # 2D array
-     *     cube = [[[0] * 5 for _ in range(4)] for _ in range(3)]  # 3D array
+     *     arr = [0 for _ in range(10)]                     # 1D array with constant dimension
+     *     arr = [0 for _ in range(n)]                      # 1D array with variable dimension
+     *     matrix = [[0] * 5 for _ in range(3)]             # 2D array with constant dimensions
+     *     matrix = [[0] * m for _ in range(n)]             # 2D array with variable dimensions
+     *     cube = [[[0] * 5 for _ in range(4)] for _ in range(3)]  # 3D array with constant dimensions
      * </pre>
      *
      * @param arrayName The name of the array variable being declared
@@ -469,7 +496,42 @@ public class PythonToRamanujanConverter extends Python3ParserBaseListener {
         }
 
         // Create the array with validated dimensions and data type
-        createArray(arrayName, info.dataType, info.dimensions);
+        Array array = createArray(arrayName, info.dataType, info.dimensions);
+
+        // If any dimension is variable, create a RedefineArrayCommand
+        if (info.hasVariableDimensions) {
+            RedefineArrayCommand redefineCmd = new RedefineArrayCommand();
+            redefineCmd.setId(UUID.randomUUID().toString());
+            redefineCmd.setArrayId(array.getId());
+            
+            // Convert dimension expressions to command IDs where needed
+            List<String> resolvedDimensions = new ArrayList<>();
+            for (String dimExpr : info.dimensionExpressions) {
+                try {
+                    // If it's a constant, keep it as is
+                    Integer.parseInt(dimExpr);
+                    resolvedDimensions.add(dimExpr);
+                } catch (NumberFormatException e) {
+                    // It's a variable, resolve to variable ID
+                    Variable dimVar = getVariable(variableMap, dimExpr, variableScope);
+                    if (dimVar != null) {
+                        resolvedDimensions.add(dimVar.getId());
+                    } else {
+                        throw new RuntimeException("CompilationException: Variable dimension '" + dimExpr + "' not found in scope.");
+                    }
+                }
+            }
+            
+            redefineCmd.setNewDimensions(resolvedDimensions);
+            
+            // Create command for redefine array operation
+            Command command = new Command();
+            command.setId(UUID.randomUUID().toString());
+            command.setRedefineArrayCommand(redefineCmd);
+            
+            ruleEngineInput.getCommands().add(command);
+            commands.add(command);
+        }
 
         // Add debug output
         if (debugLevelCodeCreator != null) {
@@ -1521,12 +1583,19 @@ public class PythonToRamanujanConverter extends Python3ParserBaseListener {
             // Determine data type from initial value
             String dataType = determineDataType(valueStr);
 
-            return new ArrayDeclarationInfo(Collections.singletonList(dimension), dataType);
+            return new ArrayDeclarationInfo(Collections.singletonList(dimension), dataType, Collections.singletonList(dimensionStr), false);
         } catch (NumberFormatException e) {
-            // Dimension is a variable - this could be supported but for now we require constants
-            // Could be enhanced to support variable dimensions
-            // TODO: Handle variable dimensions in future
-            throw new RuntimeException("CompilationException: Invalid array dimension '" + dimensionStr + "'. Must be a positive integer constant.");
+            // Dimension is a variable - support variable dimensions
+            // Determine data type from initial value
+            String dataType = determineDataType(valueStr);
+            
+            // Check if variable exists in scope
+            Variable dimVar = getVariable(variableMap, dimensionStr, variableScope);
+            if (dimVar == null) {
+                throw new RuntimeException("CompilationException: Variable dimension '" + dimensionStr + "' not found in scope.");
+            }
+
+            return new ArrayDeclarationInfo(Collections.singletonList(1), dataType, Collections.singletonList(dimensionStr), true);
         }
     }
 
@@ -1534,8 +1603,8 @@ public class PythonToRamanujanConverter extends Python3ParserBaseListener {
      * Validates multi-dimensional array declaration format.
      * <p>
      * Expected formats:
-     * 2D: [[value] * dim2 for _ in range(dim1)]
-     * 3D: [[[value] * dim3 for _ in range(dim2)] for _ in range(dim1)]
+     * 2D: [[value] * dim2 for _ in range(dim1)]  → dimensions [dim1, dim2]
+     * 3D: [[[value] * dim3 for _ in range(dim2)] for _ in range(dim1)]  → dimensions [dim1, dim2, dim3]
      * etc.
      *
      * @param content The content inside the outer brackets
@@ -1543,12 +1612,16 @@ public class PythonToRamanujanConverter extends Python3ParserBaseListener {
      */
     private ArrayDeclarationInfo validateMultiDimensionalArrayFormat(String content) {
         List<Integer> dimensions = new ArrayList<>();
+        List<String> dimensionExpressions = new ArrayList<>();
+        List<String> tempDimensions = new ArrayList<>(); // Collect dimensions in reverse order
         String currentContent = content;
         String dataType = "integer"; // default
+        boolean hasVariableDimensions = false;
 
-        // Process nested structure from outside to inside
+        // Process nested structure from outside to inside, collecting dimensions
+        // For [[[0] * z for _ in range(y)] for _ in range(x)], we want dimensions [x, y, z]
         while (currentContent.startsWith("[") && currentContent.contains(" for _ in range(")) {
-            // Find the matching "] for _ in range(" pattern
+            // Find the last (outermost) "] for _ in range(" pattern
             int forIndex = currentContent.lastIndexOf(" for _ in range(");
             if (forIndex == -1) break;
 
@@ -1560,16 +1633,8 @@ public class PythonToRamanujanConverter extends Python3ParserBaseListener {
             }
 
             String dimensionStr = currentContent.substring(rangeStart + 1, rangeEnd).trim();
-            try {
-                int dimension = Integer.parseInt(dimensionStr);
-                if (dimension <= 0) {
-                    return null;
-                }
-                dimensions.add(0, dimension); // Add to front since we're processing outside-in
-            } catch (NumberFormatException e) {
-                // TODO: Handle variable dimensions in future
-                throw new RuntimeException("CompilationException: Invalid array dimension '" + dimensionStr + "'. Must be a positive integer.");
-            }
+            // Collect dimension expressions (we'll reverse them later)
+            tempDimensions.add(dimensionStr);
 
             // Extract the inner part before " for _ in range("
             String beforeFor = currentContent.substring(0, forIndex).trim();
@@ -1578,22 +1643,38 @@ public class PythonToRamanujanConverter extends Python3ParserBaseListener {
             }
 
             currentContent = beforeFor.substring(1).trim(); // Remove the opening bracket
+        }
 
-            // Check if this level has a multiplication pattern: [...] * dim
-            if (currentContent.contains("] * ")) {
-                String[] mulParts = currentContent.split("\\]\\s*\\*\\s*");
-                if (mulParts.length == 2) {
-                    try {
-                        int innerDim = Integer.parseInt(mulParts[1].trim());
-                        if (innerDim <= 0) {
-                            return null;
-                        }
-                        dimensions.add(innerDim); // Add inner dimension
-                        currentContent = mulParts[0].trim() + "]"; // Continue with the inner part
-                    } catch (NumberFormatException e) {
-                        return null;
-                    }
+        // Now check for multiplication pattern: [...] * dim at the innermost level
+        if (currentContent.contains("] * ")) {
+            String[] mulParts = currentContent.split("\\]\\s*\\*\\s*");
+            if (mulParts.length == 2) {
+                String innerDimStr = mulParts[1].trim();
+                // Add inner dimension to the temp list
+                tempDimensions.add(innerDimStr);
+                currentContent = mulParts[0].trim() + "]"; // Continue with the inner part
+            }
+        }
+
+        // Now process the tempDimensions in the order we collected them (don't reverse!)
+        // This gives us the correct order: outer dimensions first, inner dimensions last
+        for (String dimStr : tempDimensions) {
+            try {
+                int dimension = Integer.parseInt(dimStr);
+                if (dimension <= 0) {
+                    return null;
                 }
+                dimensions.add(dimension);
+                dimensionExpressions.add(dimStr);
+            } catch (NumberFormatException e) {
+                // Handle variable dimensions
+                Variable dimVar = getVariable(variableMap, dimStr, variableScope);
+                if (dimVar == null) {
+                    throw new RuntimeException("CompilationException: Variable dimension '" + dimStr + "' not found in scope.");
+                }
+                hasVariableDimensions = true;
+                dimensions.add(1); // placeholder
+                dimensionExpressions.add(dimStr);
             }
         }
 
@@ -1603,7 +1684,7 @@ public class PythonToRamanujanConverter extends Python3ParserBaseListener {
             dataType = determineDataType(finalValue);
         }
 
-        return dimensions.size() >= 2 ? new ArrayDeclarationInfo(dimensions, dataType) : null;
+        return dimensions.size() >= 2 ? new ArrayDeclarationInfo(dimensions, dataType, dimensionExpressions, hasVariableDimensions) : null;
     }
 
     /**
@@ -1637,10 +1718,14 @@ public class PythonToRamanujanConverter extends Python3ParserBaseListener {
     private static class ArrayDeclarationInfo {
         final List<Integer> dimensions;
         final String dataType;
+        final List<String> dimensionExpressions;
+        final boolean hasVariableDimensions;
 
-        ArrayDeclarationInfo(List<Integer> dimensions, String dataType) {
+        ArrayDeclarationInfo(List<Integer> dimensions, String dataType, List<String> dimensionExpressions, boolean hasVariableDimensions) {
             this.dimensions = dimensions;
             this.dataType = dataType;
+            this.dimensionExpressions = dimensionExpressions;
+            this.hasVariableDimensions = hasVariableDimensions;
         }
     }
 }
