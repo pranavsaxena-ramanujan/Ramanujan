@@ -49,7 +49,7 @@ public class CodeConverter {
 
     public CodeConverter(CodeConverterLogicFactory codeConverterLogicFactory, StringUtils stringUtils,
                          List<CsvInformation> csvInformations) {
-        this(codeConverterLogicFactory, stringUtils);
+        this();
         if(csvInformations != null) {
             this.csvDataMap = new HashMap<>();
             for(CsvInformation csvInformation : csvInformations) {
@@ -58,7 +58,7 @@ public class CodeConverter {
         }
     }
 
-    public CodeConverter(CodeConverterLogicFactory codeConverterLogicFactory, StringUtils stringUtils) {
+    public CodeConverter() {
         variableMap = new HashMap<>();
         arrayMap = new HashMap<>();
     }
@@ -80,8 +80,8 @@ public class CodeConverter {
     }
 
     public List<Command> interpret(String code, RuleEngineInput ruleEngineInput, List<String> variableScope,
-                                   DebugLevelCodeCreator debugLevelCodeCreator, Map<Integer, RuleEngineInputUnits> functionFrameVariableMap,
-                                   Integer[] frameVariableCounterId) throws CompilationException {
+                                   DebugLevelCodeCreator debugLevelCodeCreator, Map<Integer, RuleEngineInputUnits> functionFrameVariableMap/*TO BE REMOVED-NOT USED*/,
+                                   Integer[] frameVariableCounterId)/*TO BE REMOVED-NOT USED*/ throws CompilationException {
         List<String> codeChunks = getCodeChunks(code);
         Command previousCommand = null;
         List<Command> commandInThisCodeChunk = new ArrayList<>();

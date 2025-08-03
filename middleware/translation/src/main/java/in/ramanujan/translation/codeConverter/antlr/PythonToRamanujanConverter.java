@@ -2,10 +2,13 @@ package in.ramanujan.translation.codeConverter.antlr;
 
 import in.ramanujan.enums.OperatorType;
 import in.ramanujan.pojo.RuleEngineInput;
+import in.ramanujan.pojo.RuleEngineInputUnits;
 import in.ramanujan.pojo.ruleEngineInputUnitsExt.*;
 import in.ramanujan.pojo.ruleEngineInputUnitsExt.array.Array;
 import in.ramanujan.pojo.ruleEngineInputUnitsExt.array.ArrayCommand;
 import in.ramanujan.pojo.ruleEngineInputUnitsExt.array.RedefineArrayCommand;
+import in.ramanujan.translation.codeConverter.CodeConverter;
+import in.ramanujan.translation.codeConverter.codeConverterLogicImpl.OperationLogicConverter;
 import in.ramanujan.translation.codeConverter.exception.CompilationException;
 import in.ramanujan.translation.codeConverter.grammar.DebugLevelCodeCreator;
 import org.antlr.v4.runtime.tree.TerminalNode;
@@ -274,58 +277,64 @@ public class PythonToRamanujanConverter extends Python3ParserBaseListener {
             default: return pythonOp;          // Return original if no mapping found
         }
     }
-    
-    
+
+    private String leftEquateSide = "";
+    private String rightEquateSide = "";
+
+
     /**
      * ANTLR listener method called when entering an expression statement in the Python AST.
      * <p>
-     * This method handles variable assignments of the form "x = value" and array assignments
-     * of the form "arr[index] = value". It validates that function calls are not used in
-     * assignments (which is not supported), creates or retrieves the target variable/array,
-     * parses the assigned value, and generates the appropriate command.
+     * This method handles three distinct categories of assignment statements:
+     * 1. **Array Declaration**: `arr = [array comprehension]` - Creates new arrays
+     * 2. **Array Element Assignment**: `arr[index] = value` - Assigns values to existing array elements
+     * 3. **Variable Assignment**: `var = value` - Assigns values to variables
      * <p>
-     * IMPORTANT: Arrays MUST be declared using the specific n-dimensional list comprehension syntax:
+     * It validates that function calls are not used in assignments (which is not supported),
+     * creates or retrieves the target variable/array, parses the assigned value, and generates
+     * the appropriate command based on the assignment type.
+     * <p>
+     * **Category 1: Array Declaration** - Arrays MUST be declared using n-dimensional list comprehension syntax:
      * <pre>
-     *     # 1D array declaration with constant dimension (REQUIRED format):
+     *     # 1D array declaration with constant dimension:
      *     arr = [0 for _ in range(10)]
      *
-     *     # 1D array declaration with variable dimension (NEW - SUPPORTED format):
+     *     # 1D array declaration with variable dimension:
      *     n = 5
      *     arr = [0 for _ in range(n)]
      *
-     *     # 2D array declaration with constant dimensions (REQUIRED format):
+     *     # 2D array declaration with constant dimensions:
      *     matrix = [[0] * 5 for _ in range(3)]
      *
-     *     # 2D array declaration with variable dimensions (NEW - SUPPORTED format):
+     *     # 2D array declaration with variable dimensions:
      *     rows = 3
      *     cols = 5
      *     matrix = [[0] * cols for _ in range(rows)]
      *
-     *     # 3D array declaration with mixed constant/variable dimensions (NEW - SUPPORTED format):
+     *     # 3D array declaration with mixed constant/variable dimensions:
      *     depth = 4
      *     cube = [[[0] * 5 for _ in range(depth)] for _ in range(3)]
-     *
-     *     # General n-dimensional format with variable dimensions:
-     *     arr = [[[...[[0] * dim_n for _ in range(dim_n-1)] ...] for _ in range(dim_2)] for _ in range(dim_1)]
      * </pre>
      *
-     * Variable Dimension Requirements:
-     * - Variables used as dimensions MUST be declared before the array declaration
-     * - Variable dimensions are resolved to their variable IDs and handled via RedefineArrayCommand
-     * - Mixed constant and variable dimensions are supported in multi-dimensional arrays
+     * **Category 2: Array Element Assignment** - Assigns values to existing array elements:
+     * <pre>
+     *     arr[0] = 10                        # 1D array element assignment
+     *     matrix[i][j] = 5                   # Multi-dimensional array assignment
+     *     cube[x][y][z] = 20                 # 3D array assignment
+     * </pre>
      *
-     * Supported assignment examples:
+     * **Category 3: Variable Assignment** - Simple variable assignments:
      * <pre>
      *     x = 5                              # Simple integer assignment
      *     y = 3.14                           # Float assignment
      *     name = "Bob"                       # String assignment
-     *     arr[0] = 10                        # Array element assignment
-     *     matrix[i][j] = 5                   # Multi-dimensional array assignment
-     *     arr = [0 for _ in range(10)]       # 1D array declaration with constant dimension
-     *     arr = [0 for _ in range(n)]        # 1D array declaration with variable dimension
-     *     matrix = [[0] * 5 for _ in range(3)] # 2D array declaration with constant dimensions
-     *     matrix = [[0] * m for _ in range(n)] # 2D array declaration with variable dimensions
+     *     result = other_variable            # Variable-to-variable assignment
      * </pre>
+     *
+     * Variable Dimension Requirements (for array declarations):
+     * - Variables used as dimensions MUST be declared before the array declaration
+     * - Variable dimensions are resolved to their variable IDs and handled via RedefineArrayCommand
+     * - Mixed constant and variable dimensions are supported in multi-dimensional arrays
      *
      * Unsupported array declarations (throws CompilationException):
      * <pre>
@@ -346,7 +355,7 @@ public class PythonToRamanujanConverter extends Python3ParserBaseListener {
      */
     @Override
     public void enterExpr_stmt(Python3Parser.Expr_stmtContext ctx) {
-        // Handle variable assignment: x = value or arr[index] = value
+        // Handle assignment statements: x = value, arr[index] = value, or arr = [comprehension]
         if (ctx.getChildCount() >= 3 && "=".equals(ctx.getChild(1).getText())) {
             String leftSide = ctx.getChild(0).getText();
             String rightSide = ctx.getChild(2).getText();
@@ -361,33 +370,44 @@ public class PythonToRamanujanConverter extends Python3ParserBaseListener {
                 throw new RuntimeException("CompilationException: Function calls in array indices like '" + leftSide + "' are not supported.");
             }
 
-            // Determine if this is an array assignment or regular variable assignment
-            if (isArrayAccess(leftSide)) {
+            // Explicitly categorize the assignment into three distinct cases:
+            
+            // Case 1: Array Declaration - rightSide is an array comprehension
+            // Examples: arr = [0 for _ in range(10)], matrix = [[0] * 5 for _ in range(3)]
+            if (isArrayDeclaration(rightSide)) {
+                handleArrayDeclaration(leftSide, rightSide, ctx);
+            }
+            // Case 2: Array Element Assignment - leftSide has array access syntax
+            // Examples: arr[0] = 5, matrix[i][j] = value
+            else if (isArrayAccess(leftSide)) {
                 handleArrayAssignment(leftSide, rightSide, ctx);
-            } else {
-                handleVariableAssignmentOrArrayDeclarationStatement(leftSide, rightSide, ctx);
+            }
+            // Case 3: Variable Assignment - simple variable assignment
+            // Examples: x = 5, name = "Bob", result = variable
+            else {
+                handleVariableAssignment(leftSide, rightSide, ctx);
             }
         }
     }
 
     /**
-     * Handles regular variable assignments (non-array).
+     * Handles simple variable assignments (non-array, non-array-declaration).
      * <p>
      * This method processes simple variable assignments like "x = 5" or "name = 'John'".
-     * It also handles array declarations using the required list comprehension syntax.
-     * It creates or retrieves the variable/array, parses the value, and generates the assignment command.
+     * It creates or retrieves the variable, parses the value, and generates the assignment command.
+     * <p>
+     * Supported assignment examples:
+     * <pre>
+     *     x = 5                              # Simple integer assignment
+     *     y = 3.14                           # Float assignment
+     *     result = other_variable            # Variable-to-variable assignment
+     * </pre>
      *
      * @param varName   The name of the variable being assigned to
      * @param rightSide The value being assigned (right side of =)
      * @param ctx       The parse tree context for debugging
      */
-    private void handleVariableAssignmentOrArrayDeclarationStatement(String varName, String rightSide, Python3Parser.Expr_stmtContext ctx) {
-        // Check if this is an array declaration
-        if (isArrayDeclaration(rightSide)) {
-            handleArrayDeclaration(varName, rightSide, ctx);
-            return;
-        }
-
+    private void handleVariableAssignment(String varName, String rightSide, Python3Parser.Expr_stmtContext ctx) {
         // Get or create the variable in current scope
         Variable variable = getOrCreateVariable(varName);
 
@@ -1105,87 +1125,129 @@ public class PythonToRamanujanConverter extends Python3ParserBaseListener {
             return variable.getId();
         }
 
-        // If it's a literal, return as-is
-        try {
-            getAssignRightOperand(argText);
-            return argText; // It's a valid literal
-        } catch (NumberFormatException e) {
-            // Not a simple literal, return as variable reference
-            return argText;
+       // It should be an array, if not then, its compilation error
+        Array array = getArray(arrayMap, argText, variableScope);
+        if (array != null) {
+            return array.getId();
         }
+
+        try {
+            Double doubleValue = Double.parseDouble(argText);
+            Constant constant = new Constant();
+            constant.setId(UUID.randomUUID().toString());
+            constant.setValue(doubleValue);
+            ruleEngineInput.getConstants().add(constant);
+            return constant.getId();
+        } catch (NumberFormatException e) {
+            throw new RuntimeException("CompilationException: Invalid argument '" + argText + "'. " +
+                "Arguments must be variables, arrays, or double value.");
+        }
+    }
+
+    private class CodeConverterPythonForOperationResolution extends CodeConverter
+    {
+        @Override
+        public List<Command> interpret(String code, RuleEngineInput ruleEngineInput, List<String> variableScope,
+                                       DebugLevelCodeCreator debugLevelCodeCreator, Map<Integer, RuleEngineInputUnits> functionFrameVariableMap,
+                                       Integer[] frameVariableCounterId) throws CompilationException {
+            // If code is an array value retrieval, handle it as an array access. If its variable, handle it as a variable access.
+            // else, if its parsable by Double, then handle it as a constant value.
+
+            code = code.trim();
+            if (isArrayAccess(code)) {
+                // Handle array access
+                String arrayName = extractArrayName(code);
+                List<String> indices = extractArrayIndices(code);
+                Array array = getArray(arrayMap, arrayName, variableScope);
+
+                if (array == null) {
+                    throw new RuntimeException("CompilationException: Array '" + arrayName + "' not declared. " +
+                        "Use the required n-dimensional list comprehension syntax to declare arrays.");
+                }
+
+                if (array.getDimension() != null && indices.size() > array.getDimension().size()) {
+                    throw new RuntimeException("CompilationException: Too many indices for array '" + arrayName +
+                        "'. Expected " + array.getDimension().size() + " dimensions, got " + indices.size());
+                }
+
+                return createArrayAccessCommand(array, indices);
+            } else {
+                // Handle variable or constant
+                Variable variable = getVariable(variableMap, code, variableScope);
+                if (variable != null) {
+                    Command command = new Command();
+                    command.setId(UUID.randomUUID().toString());
+                    command.setVariableId(variable.getId());
+                    ruleEngineInput.getCommands().add(command);
+                    return Collections.singletonList(command);
+                } else {
+                    try {
+                        Double doubleValue = Double.parseDouble(code);
+                        Constant constant = new Constant();
+                        constant.setId(UUID.randomUUID().toString());
+                        constant.setValue(doubleValue);
+                        ruleEngineInput.getConstants().add(constant);
+
+                        Command command = new Command();
+                        command.setId(UUID.randomUUID().toString());
+                        command.setConstant(constant.getId());
+                        ruleEngineInput.getCommands().add(command);
+
+                        return Collections.singletonList(command);
+                    } catch (NumberFormatException e) {
+                        throw new RuntimeException("CompilationException: Invalid code '" + code + "'. " +
+                            "Must be a variable, array access, or double value.");
+                    }
+                }
+            }
+        }
+    }
+
+    private List<Command> createArrayAccessCommand(Array array, List<String> indices) {
+        // Create a command for accessing an array element
+        Command command = new Command();
+        command.setId(UUID.randomUUID().toString());
+
+        // Validate and set indices
+        validateArrayIndices(indices, array.getName());
+
+        ArrayCommand arrayCommand = new ArrayCommand();
+        arrayCommand.setArrayId(array.getId());
+        arrayCommand.setIndex(indices);
+        command.setArrayCommand(arrayCommand);
+
+        // Register the command in rule engine input
+        ruleEngineInput.getCommands().add(command);
+        commands.add(command);
+
+        return Collections.singletonList(command);
     }
 
     /**
      * Parses the right side of an assignment statement to determine its type and create the appropriate command.
      */
-    private Command getAssignRightOperand(String rightSideOfAssignment) throws NumberFormatException {
+    private Command getAssignRightOperand(String rightSideOfAssignment) throws RuntimeException {
         rightSideOfAssignment = rightSideOfAssignment.trim();
 
-        /*
-        * Parse it into double. If yes create Constant object
-        * Else, it can be either a variable or an array.
-        * If it is a variable, create a Variable object.
-        * If it is an array, create an ArrayCommand object.
-        *
-        * Now, whatever object is created, set it in a new Command object. Add the command in command list, and also
-        * add in ruleEngineInput.commands
-        */
-
+        OperationLogicConverter operationLogicConverter = new OperationLogicConverter();
+        Operation operation = null;
         try {
-            // Try parsing as Integer first
-            double val = Double.parseDouble(rightSideOfAssignment);
-            Constant constant = new Constant();
-            constant.setId(UUID.randomUUID().toString());
-            constant.setValue(val);
-            ruleEngineInput.getConstants().add(constant);
-            Command command = new Command();
-            command.setId(UUID.randomUUID().toString());
-            command.setConstant(constant.getId());
-            commands.add(command);
-            ruleEngineInput.getCommands().add(command);
-            return command;
-        } catch (NumberFormatException e1) {
-            // Check if it variable:
-            Variable variable = getVariable(variableMap, rightSideOfAssignment, variableScope);
-            if (variable != null) {
-                // It's a variable, create a command for it
-                Command command = new Command();
-                command.setId(UUID.randomUUID().toString());
-                command.setVariableId(variable.getId());
-                commands.add(command);
-                ruleEngineInput.getCommands().add(command);
-                return command;
-            } else {
-                // it should be an array now. If now, its compilation exception.
-                String arrayName = extractArrayName(rightSideOfAssignment);
-                List<String> arrayIndexes = extractArrayIndices(rightSideOfAssignment);
-                List<String> indexCommandIds = new ArrayList<>();
-                for(String arrayIndex : arrayIndexes) {
-                    try {
-                        indexCommandIds.add(useVariable(ruleEngineInput, arrayIndex, new Command(), variableMap, arrayMap, variableScope));
-                    } catch (CompilationException ex)
-                    {
-                        throw new NumberFormatException("CompilationException: Invalid array index '" + arrayIndex +
-                                "' in assignment value '" + rightSideOfAssignment + "'. Expected a number, variable, or array.");
-                    }
-                }
-                Array array = getArray(arrayMap, arrayName, variableScope);
-                if (array == null) {
-                    throw new NumberFormatException("CompilationException: Invalid assignment value '" + rightSideOfAssignment + "'. Expected a number, variable, or array.");
-                }
-
-                Command command = new Command();
-                command.setId(UUID.randomUUID().toString());
-                commands.add(command);
-                ruleEngineInput.getCommands().add(command);
-
-                ArrayCommand arrayCommand = new ArrayCommand();
-                arrayCommand.setArrayId(array.getId());
-                arrayCommand.setIndex(arrayIndexes);
-                command.setArrayCommand(arrayCommand);
-                return command;
-            }
+            operation = (Operation) operationLogicConverter.convertCode(rightSideOfAssignment, ruleEngineInput, new CodeConverterPythonForOperationResolution(),
+                    variableScope, debugLevelCodeCreator, new HashMap<>(), new Integer[1]);
+        } catch (CompilationException e) {
+            throw new RuntimeException(e);
         }
+        Command command = new Command();
+        command.setId(UUID.randomUUID().toString());
+
+        // Set the operation in the command
+        command.setOperation(operation.getId());
+
+        // Register the command in rule engine input
+        ruleEngineInput.getCommands().add(command);
+        commands.add(command);
+
+        return command;
     }
     
     /**
