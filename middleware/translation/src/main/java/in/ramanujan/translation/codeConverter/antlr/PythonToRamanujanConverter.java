@@ -52,6 +52,19 @@ public class PythonToRamanujanConverter extends Python3ParserBaseListener {
     private final Map<String, Array> arrayMap;
     private final List<Command> commands;
     
+    // Separate list to track function commands - will be added to ruleEngineInput at the end
+    private final List<Command> functionCommands;
+    
+    // Track previous commands for linking nextId - separate tracking for root and function contexts
+    private Command previousRootCommand = null;
+    private Command previousFunctionCommand = null;
+    
+    // Track commands that need their nextId set after control flow blocks complete
+    private final Stack<Command> pendingNextIdCommands = new Stack<>();
+    
+    // Track commands that are ready to be linked after control flow blocks end
+    private final Stack<Command> readyToLinkCommands = new Stack<>();
+    
     // Use stacks to support nested while blocks - enables proper handling of nested loops
     private final Stack<While> whileBlockStack = new Stack<>();
     private final Stack<Integer> whileStartIndexStack = new Stack<>();
@@ -106,6 +119,7 @@ public class PythonToRamanujanConverter extends Python3ParserBaseListener {
         this.variableMap = variableMap;
         this.arrayMap = arrayMap;
         this.commands = new ArrayList<>();
+        this.functionCommands = new ArrayList<>();
     }
     
     /**
@@ -120,7 +134,120 @@ public class PythonToRamanujanConverter extends Python3ParserBaseListener {
      * @return List of Command objects representing the translation output.
      */
     public List<Command> getCommands() {
+        // Finalize commands by adding function commands at the end
+        finalizeCombinedCommands();
         return commands;
+    }
+    
+    /**
+     * Checks if we're currently inside a function definition.
+     * @return true if currently parsing inside a function, false otherwise
+     */
+    private boolean isInsideFunction() {
+        return !funcBlockStack.isEmpty();
+    }
+    
+    /**
+     * Gets the current command list size based on context.
+     * @return size of functionCommands if inside function, commands otherwise
+     */
+    private int getCurrentCommandListSize() {
+        return isInsideFunction() ? functionCommands.size() : commands.size();
+    }
+    
+    /**
+     * Gets the command at the specified index from the appropriate list based on context.
+     * @param index The index of the command to retrieve
+     * @return The command at the specified index
+     */
+    private Command getCommandAtIndex(int index) {
+        if (isInsideFunction()) {
+            return functionCommands.get(index);
+        } else {
+            return commands.get(index);
+        }
+    }
+    
+    /**
+     * Adds a command to the appropriate list based on current context.
+     * Root-level commands go to the main commands list.
+     * Function commands go to the functionCommands list.
+     * Also handles linking commands via nextId.
+     * @param command The command to add
+     */
+    private void addCommand(Command command) {
+        if (isInsideFunction()) {
+            // Link to previous function command if exists
+            if (previousFunctionCommand != null) {
+                previousFunctionCommand.setNextId(command.getId());
+            }
+            functionCommands.add(command);
+            previousFunctionCommand = command;
+        } else {
+            // Link to previous root command if exists
+            if (previousRootCommand != null) {
+                previousRootCommand.setNextId(command.getId());
+            }
+            commands.add(command);
+            previousRootCommand = command;
+        }
+        // Always add to ruleEngineInput for processing
+        ruleEngineInput.getCommands().add(command);
+        
+        // Handle any pending nextId commands from control flow blocks
+        // Always check for ready-to-link commands first
+        linkPendingNextIdCommands(command);
+    }
+    
+    /**
+     * Sets up command linking for control flow structures.
+     * The previous command should point to the next command after the control flow block completes.
+     */
+    private void prepareControlFlowCommandLinking() {
+        Command previousCommand = isInsideFunction() ? previousFunctionCommand : previousRootCommand;
+        if (previousCommand != null) {
+            pendingNextIdCommands.push(previousCommand);
+        }
+    }
+    
+    /**
+     * Links pending commands to the first command after control flow blocks.
+     */
+    private void linkPendingNextIdCommands(Command nextCommand) {
+        // First check if there are commands ready to be linked after a block ended
+        if (!readyToLinkCommands.isEmpty()) {
+            Command readyCommand = readyToLinkCommands.pop();
+            readyCommand.setNextId(nextCommand.getId());
+        }
+    }
+    
+    /**
+     * Finalizes the combined commands list by ensuring root-level commands appear first,
+     * followed by function commands.
+     */
+    private void finalizeCombinedCommands() {
+        // Clear any existing commands in the main list
+        commands.clear();
+        
+        // Re-add commands in the correct order: root-level first, then function commands
+        List<Command> allCommands = new ArrayList<>(ruleEngineInput.getCommands());
+        
+        for (Command command : allCommands) {
+            if (functionCommands.contains(command)) {
+                // This is a function command, add it later
+                continue;
+            } else {
+                // This is a root-level command, add it first
+                commands.add(command);
+            }
+        }
+        
+        // Now add all function commands at the end
+        commands.addAll(functionCommands);
+        
+        // Update ruleEngineInput to reflect the final order
+        ruleEngineInput.getCommands().clear();
+        ruleEngineInput.getCommands().addAll(commands);
     }
     
     /**
@@ -193,14 +320,19 @@ public class PythonToRamanujanConverter extends Python3ParserBaseListener {
         Operation operation = new Operation();
         operation.setId(UUID.randomUUID().toString());
         operation.setOperatorType(OperatorType.ASSIGN.getOperatorCode());
-        operation.setOperand1(variable.getName());
+
+        Command varCommand = new Command();
+        varCommand.setId(UUID.randomUUID().toString());
+        varCommand.setVariableId(variable.getId());
+        addCommand(varCommand);
+
+        operation.setOperand1(varCommand.getId());
         operation.setOperand2(assignmentRightOperand);
         ruleEngineInput.getOperations().add(operation);
 
         command.setOperation(operation.getId());
         
-        ruleEngineInput.getCommands().add(command);
-        commands.add(command);
+        addCommand(command);
         
         return command;
     }
@@ -552,8 +684,7 @@ public class PythonToRamanujanConverter extends Python3ParserBaseListener {
             command.setId(UUID.randomUUID().toString());
             command.setRedefineArrayCommand(redefineCmd);
             
-            ruleEngineInput.getCommands().add(command);
-            commands.add(command);
+            addCommand(command);
         }
 
         // Add debug output
@@ -600,6 +731,10 @@ public class PythonToRamanujanConverter extends Python3ParserBaseListener {
     public void enterWhile_stmt(Python3Parser.While_stmtContext ctx) {
         // Handle while loops: while condition:
         if (ctx.getChildCount() >= 3) {
+            // Prepare control flow command linking - commands before this while block should 
+            // point to commands after the while block, not to commands inside the block
+            prepareControlFlowCommandLinking();
+            
             // Extract the condition text from the second child (after 'while')
             String conditionText = extractConditionText(ctx.getChild(1));
 
@@ -614,7 +749,7 @@ public class PythonToRamanujanConverter extends Python3ParserBaseListener {
             }
 
             // Store the current command count to track the starting command
-            int startingCommandIndex = commands.size();
+            int startingCommandIndex = getCurrentCommandListSize();
 
             // Add debug output for while loop start
             if (debugLevelCodeCreator != null) {
@@ -647,9 +782,15 @@ public class PythonToRamanujanConverter extends Python3ParserBaseListener {
             int startingCommandIndex = whileStartIndexStack.pop();
 
             // Set the starting command ID if any commands were created within this while block
-            if (commands.size() > startingCommandIndex) {
-                whileBlock.setWhileCommandId(commands.get(startingCommandIndex).getId());
+            if (getCurrentCommandListSize() > startingCommandIndex) {
+                whileBlock.setWhileCommandId(getCommandAtIndex(startingCommandIndex).getId());
             }
+        }
+
+        // Move pending command to ready-to-link queue when the while block ends
+        if (!pendingNextIdCommands.isEmpty()) {
+            Command pendingCommand = pendingNextIdCommands.pop();
+            readyToLinkCommands.push(pendingCommand);
         }
 
         // Add debug output for while loop end
@@ -695,6 +836,10 @@ public class PythonToRamanujanConverter extends Python3ParserBaseListener {
 
         // Handle if statements: if condition: block ('else' ':' block)?
         if (ctx.getChildCount() >= 3) {
+            // Prepare control flow command linking - commands before this if block should 
+            // point to commands after the if-else block, not to commands inside the block
+            prepareControlFlowCommandLinking();
+            
             // Extract condition from the second child (after 'if')
             String conditionText = extractConditionText(ctx.getChild(1));
 
@@ -709,7 +854,7 @@ public class PythonToRamanujanConverter extends Python3ParserBaseListener {
             }
 
             // Store the current command count to track the starting command for if block
-            int startingCommandIndex = commands.size();
+            int startingCommandIndex = getCurrentCommandListSize();
 
             // Push the current if block and index onto the stack for nested if support
             ifBlockStack.push(ifBlock);
@@ -762,14 +907,20 @@ public class PythonToRamanujanConverter extends Python3ParserBaseListener {
             int elseStartingCommandIndex = elseStartIndexStack.pop();
 
             // Set the command ID for the if block
-            if (commands.size() > ifStartingCommandIndex) {
-                ifBlock.setIfCommand(commands.get(ifStartingCommandIndex).getId());
+            if (getCurrentCommandListSize() > ifStartingCommandIndex) {
+                ifBlock.setIfCommand(getCommandAtIndex(ifStartingCommandIndex).getId());
             }
 
             // Set the else command ID if there was an else block
-            if (elseStartingCommandIndex != -1 && elseStartingCommandIndex < commands.size()) {
-                ifBlock.setElseCommandId(commands.get(elseStartingCommandIndex).getId());
+            if (elseStartingCommandIndex != -1 && elseStartingCommandIndex < getCurrentCommandListSize()) {
+                ifBlock.setElseCommandId(getCommandAtIndex(elseStartingCommandIndex).getId());
             }
+        }
+
+        // Move pending command to ready-to-link queue when the if block ends
+        if (!pendingNextIdCommands.isEmpty()) {
+            Command pendingCommand = pendingNextIdCommands.pop();
+            readyToLinkCommands.push(pendingCommand);
         }
 
         // Add appropriate debug output based on whether there's an else clause
@@ -822,7 +973,7 @@ public class PythonToRamanujanConverter extends Python3ParserBaseListener {
             if (isElseBlock && !elseStartIndexStack.isEmpty()) {
                 // Update the else start index in the stack (replace the placeholder -1)
                 elseStartIndexStack.pop();
-                elseStartIndexStack.push(commands.size());
+                elseStartIndexStack.push(getCurrentCommandListSize());
             }
         }
         // Check if this block is part of an else clause in a while statement
@@ -920,13 +1071,16 @@ public class PythonToRamanujanConverter extends Python3ParserBaseListener {
             FunctionCall functionCall = new FunctionCall();
             functionCall.setId(UUID.randomUUID().toString());
 
-            // Track starting command index for function body
-            int startingCommandIndex = commands.size();
+            // Track starting command index for function body - function commands will be added to functionCommands
+            int startingCommandIndex = functionCommands.size();
             funcBlockStack.push(functionCall);
             funcStartIndexStack.push(startingCommandIndex);
 
             // Add new scope for function - parameters will be processed by enterTfpdef
             variableScope.add(functionCall.getId());
+            
+            // Reset function command tracking for this new function scope
+            previousFunctionCommand = null;
 
             // Register the function in the rule engine input
             ruleEngineInput.getFunctionCalls().add(functionCall);
@@ -991,9 +1145,9 @@ public class PythonToRamanujanConverter extends Python3ParserBaseListener {
             FunctionCall functionCall = funcBlockStack.pop();
             int startingCommandIndex = funcStartIndexStack.pop();
 
-            // Set the starting command ID for function entry
-            if (commands.size() > startingCommandIndex) {
-                functionCall.setFirstCommandId(commands.get(startingCommandIndex).getId());
+            // Set the starting command ID for function entry - use functionCommands since commands inside functions go there
+            if (functionCommands.size() > startingCommandIndex) {
+                functionCall.setFirstCommandId(functionCommands.get(startingCommandIndex).getId());
             }
         }
 
@@ -1001,6 +1155,9 @@ public class PythonToRamanujanConverter extends Python3ParserBaseListener {
         if (variableScope.size() > 0) {
             variableScope.remove(variableScope.size() - 1);
         }
+        
+        // Reset function command tracking when exiting function scope
+        previousFunctionCommand = null;
 
         // Add debug output for function definition end
         if (debugLevelCodeCreator != null) {
@@ -1076,8 +1233,7 @@ public class PythonToRamanujanConverter extends Python3ParserBaseListener {
                         command.setFunctionCall(functionCall);
 
                         // Register the command and function call in rule engine input
-                        ruleEngineInput.getCommands().add(command);
-                        commands.add(command);
+                        addCommand(command);
                         ruleEngineInput.getFunctionCalls().add(functionCall);
 
                         if (functionId == null) {
@@ -1182,7 +1338,7 @@ public class PythonToRamanujanConverter extends Python3ParserBaseListener {
                     Command command = new Command();
                     command.setId(UUID.randomUUID().toString());
                     command.setVariableId(variable.getId());
-                    ruleEngineInput.getCommands().add(command);
+                    addCommand(command);
                     return Collections.singletonList(command);
                 } else {
                     try {
@@ -1195,7 +1351,7 @@ public class PythonToRamanujanConverter extends Python3ParserBaseListener {
                         Command command = new Command();
                         command.setId(UUID.randomUUID().toString());
                         command.setConstant(constant.getId());
-                        ruleEngineInput.getCommands().add(command);
+                        addCommand(command);
 
                         return Collections.singletonList(command);
                     } catch (NumberFormatException e) {
@@ -1221,8 +1377,7 @@ public class PythonToRamanujanConverter extends Python3ParserBaseListener {
         command.setArrayCommand(arrayCommand);
 
         // Register the command in rule engine input
-        ruleEngineInput.getCommands().add(command);
-        commands.add(command);
+        addCommand(command);
 
         return Collections.singletonList(command);
     }
@@ -1240,7 +1395,7 @@ public class PythonToRamanujanConverter extends Python3ParserBaseListener {
             command.setId(UUID.randomUUID().toString());
             // Set the variable in the command
             command.setVariableId(variable.getId());
-            ruleEngineInput.getCommands().add(command);
+            addCommand(command);
             return command;
         }
 
@@ -1270,7 +1425,7 @@ public class PythonToRamanujanConverter extends Python3ParserBaseListener {
             command.setId(UUID.randomUUID().toString());
             // Set the constant in the command
             command.setConstant(constant.getId());
-            ruleEngineInput.getCommands().add(command);
+            addCommand(command);
 
             return command;
         } catch (NumberFormatException ignored) {
@@ -1291,7 +1446,7 @@ public class PythonToRamanujanConverter extends Python3ParserBaseListener {
             command.setId(UUID.randomUUID().toString());
             // Set the condition in the command
             command.setConditionId(condition.getId());
-            ruleEngineInput.getCommands().add(command);
+            addCommand(command);
 
             return command;
         }
@@ -1311,7 +1466,7 @@ public class PythonToRamanujanConverter extends Python3ParserBaseListener {
         command.setOperation(operation.getId());
 
         // Register the command in rule engine input
-        ruleEngineInput.getCommands().add(command);
+        addCommand(command);
 
         return command;
     }
@@ -1530,7 +1685,7 @@ public class PythonToRamanujanConverter extends Python3ParserBaseListener {
         Command leftCommand = new Command();
         leftCommand.setId(UUID.randomUUID().toString());
         leftCommand.setArrayCommand(arrayCommand);
-        ruleEngineInput.getCommands().add(leftCommand);
+        addCommand(leftCommand);
 
         Operation operation = new Operation();
         operation.setId(UUID.randomUUID().toString());
@@ -1540,8 +1695,7 @@ public class PythonToRamanujanConverter extends Python3ParserBaseListener {
         ruleEngineInput.getOperations().add(operation);
         command.setOperation(operation.getId());
 
-        ruleEngineInput.getCommands().add(command);
-        commands.add(command);
+        addCommand(command);
 
         return command;
     }
