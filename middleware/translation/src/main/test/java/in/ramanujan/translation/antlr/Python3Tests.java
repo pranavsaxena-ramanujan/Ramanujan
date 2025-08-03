@@ -170,8 +170,8 @@ public class Python3Tests {
      */
     @Test
     public void testSimpleFunctions() throws Exception {
-        String pythonCode = "def add_values(a, b, result):\n" +
-            "    result = a + b\n\n" +
+        String pythonCode = "def add_values(a, b, result):" +
+            "    result = a + b\n" +
             "x = 10\n" +
             "y = 20\n" +
             "sum_result = 0\n" +

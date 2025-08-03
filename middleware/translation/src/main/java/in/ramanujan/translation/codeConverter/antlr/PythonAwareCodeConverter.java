@@ -24,7 +24,7 @@ public class PythonAwareCodeConverter extends CodeConverter {
     private boolean usePythonSyntax = false;
     
     public PythonAwareCodeConverter(CodeConverterLogicFactory codeConverterLogicFactory, StringUtils stringUtils) {
-        super(codeConverterLogicFactory, stringUtils);
+        super();
     }
     
     /**

@@ -8,6 +8,7 @@ import in.ramanujan.pojo.ruleEngineInputUnitsExt.array.Array;
 import in.ramanujan.pojo.ruleEngineInputUnitsExt.array.ArrayCommand;
 import in.ramanujan.pojo.ruleEngineInputUnitsExt.array.RedefineArrayCommand;
 import in.ramanujan.translation.codeConverter.CodeConverter;
+import in.ramanujan.translation.codeConverter.codeConverterLogicImpl.ConditionLogicConverter;
 import in.ramanujan.translation.codeConverter.codeConverterLogicImpl.OperationLogicConverter;
 import in.ramanujan.translation.codeConverter.exception.CompilationException;
 import in.ramanujan.translation.codeConverter.grammar.DebugLevelCodeCreator;
@@ -15,6 +16,7 @@ import org.antlr.v4.runtime.tree.TerminalNode;
 
 import java.util.*;
 
+import static in.ramanujan.translation.codeConverter.CodeConverterLogicFactory.isConditionOperation;
 import static in.ramanujan.translation.codeConverter.utils.CodeConversionUtils.*;
 
 /**
@@ -100,6 +102,7 @@ public class PythonToRamanujanConverter extends Python3ParserBaseListener {
         this.ruleEngineInput = ruleEngineInput;
         this.debugLevelCodeCreator = debugLevelCodeCreator;
         this.variableScope = variableScope;
+        this.variableScope.add(""); // Initialize with empty scope for root level
         this.variableMap = variableMap;
         this.arrayMap = arrayMap;
         this.commands = new ArrayList<>();
@@ -411,7 +414,7 @@ public class PythonToRamanujanConverter extends Python3ParserBaseListener {
         // Get or create the variable in current scope
         Variable variable = getOrCreateVariable(varName);
 
-        Command value = getAssignRightOperand(rightSide);
+        Command value = evaluateExpr(rightSide);
 
         createAssignmentCommandForVariable(variable, value.getId());
 
@@ -474,7 +477,7 @@ public class PythonToRamanujanConverter extends Python3ParserBaseListener {
         }
 
         // Parse the assigned value
-        Command valueSetCommand = getAssignRightOperand(rightSide);
+        Command valueSetCommand = evaluateExpr(rightSide);
         // Create array assignment command
         createArrayAssignmentCommand(array, indices, valueSetCommand.getId());
 
@@ -1128,6 +1131,7 @@ public class PythonToRamanujanConverter extends Python3ParserBaseListener {
        // It should be an array, if not then, its compilation error
         Array array = getArray(arrayMap, argText, variableScope);
         if (array != null) {
+            //we are passing array as refence as of now.
             return array.getId();
         }
 
@@ -1226,13 +1230,76 @@ public class PythonToRamanujanConverter extends Python3ParserBaseListener {
     /**
      * Parses the right side of an assignment statement to determine its type and create the appropriate command.
      */
-    private Command getAssignRightOperand(String rightSideOfAssignment) throws RuntimeException {
-        rightSideOfAssignment = rightSideOfAssignment.trim();
+    private Command evaluateExpr(String expr) throws RuntimeException {
+        expr = expr.trim();
+
+        // Check if the expression is a variable
+        Variable variable = getVariable(variableMap, expr, variableScope);
+        if (variable != null) {
+            Command command = new Command();
+            command.setId(UUID.randomUUID().toString());
+            // Set the variable in the command
+            command.setVariableId(variable.getId());
+            ruleEngineInput.getCommands().add(command);
+            return command;
+        }
+
+        // Check if the expression is an array access
+        String arrayName = extractArrayName(expr);
+        List<String> indices = extractArrayIndices(expr);
+        Array array = getArray(arrayMap, arrayName, variableScope);
+
+        if (array != null) {
+            if (array.getDimension() != null && indices.size() > array.getDimension().size()) {
+                throw new RuntimeException("CompilationException: Too many indices for array '" + arrayName +
+                        "'. Expected " + array.getDimension().size() + " dimensions, got " + indices.size());
+            }
+
+            return createArrayAccessCommand(array, indices).get(0);
+        }
+
+        try {
+            // Try to parse the expression as a constant value
+            Double doubleValue = Double.parseDouble(expr);
+            Constant constant = new Constant();
+            constant.setId(UUID.randomUUID().toString());
+            constant.setValue(doubleValue);
+            ruleEngineInput.getConstants().add(constant);
+
+            Command command = new Command();
+            command.setId(UUID.randomUUID().toString());
+            // Set the constant in the command
+            command.setConstant(constant.getId());
+            ruleEngineInput.getCommands().add(command);
+
+            return command;
+        } catch (NumberFormatException ignored) {
+            // Not a variable or array, continue to check for conditions or operations
+        }
+
+        if (isConditionOperation(expr)) {
+            Condition condition = null;
+            ConditionLogicConverter conditionLogicConverter = new ConditionLogicConverter();
+            try {
+                condition = (Condition) conditionLogicConverter.convertCode(expr, ruleEngineInput, new CodeConverterPythonForOperationResolution(),
+                        variableScope, debugLevelCodeCreator, new HashMap<>(), new Integer[1]);
+            } catch (CompilationException e) {
+                throw new RuntimeException(e);
+            }
+
+            Command command = new Command();
+            command.setId(UUID.randomUUID().toString());
+            // Set the condition in the command
+            command.setConditionId(condition.getId());
+            ruleEngineInput.getCommands().add(command);
+
+            return command;
+        }
 
         OperationLogicConverter operationLogicConverter = new OperationLogicConverter();
         Operation operation = null;
         try {
-            operation = (Operation) operationLogicConverter.convertCode(rightSideOfAssignment, ruleEngineInput, new CodeConverterPythonForOperationResolution(),
+            operation = (Operation) operationLogicConverter.convertCode(expr, ruleEngineInput, new CodeConverterPythonForOperationResolution(),
                     variableScope, debugLevelCodeCreator, new HashMap<>(), new Integer[1]);
         } catch (CompilationException e) {
             throw new RuntimeException(e);
@@ -1245,7 +1312,6 @@ public class PythonToRamanujanConverter extends Python3ParserBaseListener {
 
         // Register the command in rule engine input
         ruleEngineInput.getCommands().add(command);
-        commands.add(command);
 
         return command;
     }
