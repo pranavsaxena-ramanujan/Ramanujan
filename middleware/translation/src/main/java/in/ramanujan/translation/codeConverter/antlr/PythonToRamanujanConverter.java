@@ -176,27 +176,44 @@ public class PythonToRamanujanConverter extends Python3ParserBaseListener {
      * @param command The command to add
      */
     private void addCommand(Command command) {
+        addCommand(command, true);
+    }
+    
+    /**
+     * Adds a command to the appropriate list based on current context with control over nextId linking.
+     * Root-level commands go to the main commands list.
+     * Function commands go to the functionCommands list.
+     * @param command The command to add
+     * @param participateInChaining Whether this command should participate in nextId chaining
+     */
+    private void addCommand(Command command, boolean participateInChaining) {
         if (isInsideFunction()) {
-            // Link to previous function command if exists
-            if (previousFunctionCommand != null) {
+            // Link to previous function command if exists and this command participates in chaining
+            if (participateInChaining && previousFunctionCommand != null) {
                 previousFunctionCommand.setNextId(command.getId());
             }
             functionCommands.add(command);
-            previousFunctionCommand = command;
+            if (participateInChaining) {
+                previousFunctionCommand = command;
+            }
         } else {
-            // Link to previous root command if exists
-            if (previousRootCommand != null) {
+            // Link to previous root command if exists and this command participates in chaining
+            if (participateInChaining && previousRootCommand != null) {
                 previousRootCommand.setNextId(command.getId());
             }
             commands.add(command);
-            previousRootCommand = command;
+            if (participateInChaining) {
+                previousRootCommand = command;
+            }
         }
         // Always add to ruleEngineInput for processing
         ruleEngineInput.getCommands().add(command);
         
         // Handle any pending nextId commands from control flow blocks
-        // Always check for ready-to-link commands first
-        linkPendingNextIdCommands(command);
+        // Only check for ready-to-link commands if this command participates in chaining
+        if (participateInChaining) {
+            linkPendingNextIdCommands(command);
+        }
     }
     
     /**
@@ -324,7 +341,8 @@ public class PythonToRamanujanConverter extends Python3ParserBaseListener {
         Command varCommand = new Command();
         varCommand.setId(UUID.randomUUID().toString());
         varCommand.setVariableId(variable.getId());
-        addCommand(varCommand);
+        // Add intermediate command without participating in nextId chaining
+        addCommand(varCommand, false);
 
         operation.setOperand1(varCommand.getId());
         operation.setOperand2(assignmentRightOperand);
@@ -332,7 +350,8 @@ public class PythonToRamanujanConverter extends Python3ParserBaseListener {
 
         command.setOperation(operation.getId());
         
-        addCommand(command);
+        // Add final assignment command with nextId chaining
+        addCommand(command, true);
         
         return command;
     }
@@ -1338,7 +1357,8 @@ public class PythonToRamanujanConverter extends Python3ParserBaseListener {
                     Command command = new Command();
                     command.setId(UUID.randomUUID().toString());
                     command.setVariableId(variable.getId());
-                    addCommand(command);
+                    // Add command without participating in nextId chaining (intermediate for operation resolution)
+                    addCommand(command, false);
                     return Collections.singletonList(command);
                 } else {
                     try {
@@ -1351,7 +1371,8 @@ public class PythonToRamanujanConverter extends Python3ParserBaseListener {
                         Command command = new Command();
                         command.setId(UUID.randomUUID().toString());
                         command.setConstant(constant.getId());
-                        addCommand(command);
+                        // Add command without participating in nextId chaining (intermediate for operation resolution)
+                        addCommand(command, false);
 
                         return Collections.singletonList(command);
                     } catch (NumberFormatException e) {
@@ -1376,8 +1397,8 @@ public class PythonToRamanujanConverter extends Python3ParserBaseListener {
         arrayCommand.setIndex(indices);
         command.setArrayCommand(arrayCommand);
 
-        // Register the command in rule engine input
-        addCommand(command);
+        // Register the command in rule engine input (intermediate command for evaluation)
+        addCommand(command, false);
 
         return Collections.singletonList(command);
     }
@@ -1395,7 +1416,8 @@ public class PythonToRamanujanConverter extends Python3ParserBaseListener {
             command.setId(UUID.randomUUID().toString());
             // Set the variable in the command
             command.setVariableId(variable.getId());
-            addCommand(command);
+            // Add command without participating in nextId chaining (intermediate command for evaluation)
+            addCommand(command, false);
             return command;
         }
 
@@ -1425,7 +1447,8 @@ public class PythonToRamanujanConverter extends Python3ParserBaseListener {
             command.setId(UUID.randomUUID().toString());
             // Set the constant in the command
             command.setConstant(constant.getId());
-            addCommand(command);
+            // Add command without participating in nextId chaining (intermediate command for evaluation)
+            addCommand(command, false);
 
             return command;
         } catch (NumberFormatException ignored) {
@@ -1446,7 +1469,8 @@ public class PythonToRamanujanConverter extends Python3ParserBaseListener {
             command.setId(UUID.randomUUID().toString());
             // Set the condition in the command
             command.setConditionId(condition.getId());
-            addCommand(command);
+            // Add command without participating in nextId chaining (intermediate command for evaluation)
+            addCommand(command, false);
 
             return command;
         }
@@ -1465,8 +1489,8 @@ public class PythonToRamanujanConverter extends Python3ParserBaseListener {
         // Set the operation in the command
         command.setOperation(operation.getId());
 
-        // Register the command in rule engine input
-        addCommand(command);
+        // Register the command in rule engine input (intermediate command for evaluation)
+        addCommand(command, false);
 
         return command;
     }
@@ -1685,7 +1709,8 @@ public class PythonToRamanujanConverter extends Python3ParserBaseListener {
         Command leftCommand = new Command();
         leftCommand.setId(UUID.randomUUID().toString());
         leftCommand.setArrayCommand(arrayCommand);
-        addCommand(leftCommand);
+        // Add intermediate command without participating in nextId chaining
+        addCommand(leftCommand, false);
 
         Operation operation = new Operation();
         operation.setId(UUID.randomUUID().toString());
@@ -1695,7 +1720,8 @@ public class PythonToRamanujanConverter extends Python3ParserBaseListener {
         ruleEngineInput.getOperations().add(operation);
         command.setOperation(operation.getId());
 
-        addCommand(command);
+        // Add final assignment command with nextId chaining
+        addCommand(command, true);
 
         return command;
     }
