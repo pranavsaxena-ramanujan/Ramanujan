@@ -136,7 +136,7 @@ public class PythonToRamanujanConverter extends Python3ParserBaseListener {
     public List<Command> getCommands() {
         // Finalize commands by adding function commands at the end
         finalizeCombinedCommands();
-        return commands;
+        return ruleEngineInput.getCommands();
     }
     
     /**
@@ -261,10 +261,31 @@ public class PythonToRamanujanConverter extends Python3ParserBaseListener {
         
         // Now add all function commands at the end
         commands.addAll(functionCommands);
+
+        // iterate through commands, and put the command first which has operationId != null, keep the order of rest of the commands same
+        List<Command> reorderedCommands = new ArrayList<>();
+        int firstOpIdx = -1;
+        for (int i = 0; i < commands.size(); i++) {
+            if (commands.get(i).getOperation() != null) {
+                firstOpIdx = i;
+                break;
+            }
+        }
+        if (firstOpIdx != -1) {
+            reorderedCommands.add(commands.get(firstOpIdx));
+            if (firstOpIdx > 0) {
+                reorderedCommands.addAll(commands.subList(0, firstOpIdx));
+            }
+            if (firstOpIdx + 1 < commands.size()) {
+                reorderedCommands.addAll(commands.subList(firstOpIdx + 1, commands.size()));
+            }
+        } else {
+            reorderedCommands.addAll(commands);
+        }
         
         // Update ruleEngineInput to reflect the final order
         ruleEngineInput.getCommands().clear();
-        ruleEngineInput.getCommands().addAll(commands);
+        ruleEngineInput.getCommands().addAll(reorderedCommands);
     }
     
     /**
