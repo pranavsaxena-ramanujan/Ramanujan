@@ -11,6 +11,7 @@
 #include "dataContainer/array/ArrayValue.h"
 #include "dataContainer/ArrayRE.h"
 #include "dataContainer/VariableRE.h"
+#include "dataContainer/DataContainerValue.h"
 #include "FunctionCallRE.h"
 #include<unordered_map>
 #include <list>
@@ -57,17 +58,23 @@ protected:
     // ==================== Parameter Count Information (Protected for Built-ins) ====================
     
     /**
-     * Number of variable arguments (non-array) passed to the function.
-     * This count is derived during setFields() by examining argument types.
+     * Total number of arguments passed to the function.
+     * This includes both variables and arrays - unified counting approach.
      * Used for loop bounds in parameter setup and restoration phases.
+     * Protected so built-in function classes can use it for argument validation.
+     */
+    int argSize = 0;
+    
+    /**
+     * Legacy variable count - kept for built-in function compatibility.
+     * Number of variable arguments (non-array) passed to the function.
      * Protected so built-in function classes can use it for argument validation.
      */
     int varCount = 0;
     
     /**
+     * Legacy array count - kept for built-in function compatibility.
      * Number of array arguments passed to the function.
-     * This count is derived during setFields() by examining argument types.
-     * Used for loop bounds in array parameter setup and restoration phases.
      * Protected so built-in function classes can use it for argument validation.
      */
     int arrCount = 0;
@@ -89,13 +96,6 @@ private:
     // ==================== Function Execution Information ====================
     
     /**
-     * Total number of arguments passed to the function.
-     * Set from functionCommandInfo->argumentsSize during initialization.
-     * Used for validation and loop bounds in argument processing.
-     */
-    int argSize = 0;
-    
-    /**
      * First command to execute in the function body.
      * This is the entry point for function execution and represents the head
      * of the command chain that forms the function's body.
@@ -103,190 +103,176 @@ private:
      */
     CommandRE* firstCommand;
 
-    // ==================== Total Variable/Array Counts ====================
+    // ==================== Unified Parameter Management using DataContainerValue ====================
     
     /**
-     * Total number of variables declared within the function (including parameters).
-     * This includes both function parameters and local variables declared inside the function.
-     * Used for memory allocation and restoration loop bounds.
-     * Calculated during setFields() by examining functionInfoRE->allVariablesInMethod.
-     */
-    int totalVarCount = 0;
-    
-    /**
-     * Total number of arrays declared within the function (including parameters).
-     * This includes both function array parameters and local arrays declared inside the function.
-     * Used for memory allocation and restoration loop bounds.
-     * Calculated during setFields() by examining functionInfoRE->allVariablesInMethod.
-     */
-    int totalArrCount = 0;
-
-    // ==================== Parameter Mapping - Variable Arguments ====================
-    
-    /**
-     * Array of pointers to parameter variable addresses in the called function.
-     * Each element points to the memory location of a parameter variable in the function definition.
-     * Size: varCount
+     * Array of DataContainerValue pointers for parameters in the called function.
+     * Each element points to a parameter container (variable or array) in the function definition.
+     * Size: argSize
      * 
      * Usage:
      * - During parameter setup: receives values from calling context
      * - During restoration: restored to original values for proper stack management
      * 
-     * Example: If function is func(a, b), methodCalledOriginalPlaceHolderAddrs[0] points to 'a'
+     * This replaces separate methodCalledOriginalPlaceHolderAddrs and methodCalledArrayPlaceHolderAddrs
      */
-    double** methodCalledOriginalPlaceHolderAddrs = nullptr;
+    DataContainerValue** methodCalledContainers = nullptr;
     
     /**
-     * Array of pointers to argument variable addresses in the calling function.
-     * Each element points to the memory location of variables being passed as arguments.
-     * Size: varCount
+     * Array of DataContainerValue pointers for arguments in the calling function.
+     * Each element points to an argument container (variable or array) being passed.
+     * Size: argSize
      * 
      * Usage:
      * - Source of values during parameter setup
      * - Destination for restoration during cleanup
      * 
-     * Example: If called as func(x, y), methodCallingOriginalPlaceHolderAddrs[0] points to 'x'
+     * This replaces separate methodCallingOriginalPlaceHolderAddrs and methodCallingArrayPlaceHolderAddrs
      */
-    double** methodCallingOriginalPlaceHolderAddrs = nullptr;
+    DataContainerValue** methodCallingContainers = nullptr;
 
-    // ==================== Parameter Mapping - Array Arguments ====================
+    // ==================== Local Container Management ====================
     
     /**
-     * Array of pointers to array parameter addresses in the called function.
-     * Each element points to the ArrayValue** of array parameters in the function definition.
-     * Size: arrCount
-     * 
-     * Usage:
-     * - During parameter setup: these array parameters receive references from calling arrays
-     * - During restoration: restored to original array references
-     * 
-     * Memory Structure: ArrayValue*** -> ArrayValue** -> ArrayValue* -> actual array data
+     * Total number of containers (variables + arrays) declared within the function.
+     * This includes both function parameters and local containers declared inside the function.
+     * Used for memory allocation and restoration loop bounds.
+     * Calculated during setFields() by examining functionInfoRE->allVariablesInMethod.
      */
-    ArrayValue*** methodCalledArrayPlaceHolderAddrs = nullptr;
-
-    /**
-     * Array of pointers to argument array addresses in the calling function.
-     * Each element points to the ArrayValue** of arrays being passed as arguments.
-     * Size: arrCount
-     * 
-     * Usage:
-     * - Source of array references during parameter setup
-     * - Target for array reference restoration during cleanup
-     * 
-     * Purpose: Enables array parameter passing by reference semantics
-     */
-    ArrayValue*** methodCallingArrayPlaceHolderAddrs = nullptr;
-
-    // ==================== Local Variable Management ====================
+    int totalContainerCount = 0;
     
     /**
-     * Array to store current values of all variables in the function scope.
-     * Used for saving variable state before function execution and restoring after completion.
-     * Size: totalVarCount
+     * Array of DataContainerValue pointers for all containers within the function.
+     * Includes both parameters and local containers declared in the function.
+     * Size: totalContainerCount
+     * 
+     * Structure:
+     * - Index 0 to argSize-1: Function parameter container addresses
+     * - Index argSize to totalContainerCount-1: Local container addresses
+     * 
+     * Usage:
+     * - Allows direct access to any container in function scope
+     * - Used during restoration to reset containers to saved values
+     */
+    DataContainerValue** methodAllContainers = nullptr;
+    
+    /**
+     * Array to store current values of all containers in the function scope.
+     * Used for saving container state before function execution and restoring after completion.
+     * Size: totalContainerCount
      * 
      * Purpose:
-     * - Index 0 to varCount-1: Parameter variable values
-     * - Index varCount to totalVarCount-1: Local variable values
+     * - Index 0 to argSize-1: Parameter container values
+     * - Index argSize to totalContainerCount-1: Local container values
      * 
      * Usage Timeline:
      * 1. Phase 1: Save current values before function execution
      * 2. Phase 5: Restore saved values after function completion
      * 
-     * Critical for recursive function support - prevents variable corruption
+     * Critical for recursive function support - prevents container corruption
      */
-    double* methodArgVariableCurrentVal = nullptr;
-    
-    /**
-     * Array of pointers to all variable addresses within the function.
-     * Includes both parameters and local variables declared in the function.
-     * Size: totalVarCount
-     * 
-     * Structure:
-     * - Index 0 to varCount-1: Function parameter variable addresses
-     * - Index varCount to totalVarCount-1: Local variable addresses
-     * 
-     * Usage:
-     * - Allows direct access to any variable in function scope
-     * - Used during restoration to reset variables to saved values
-     */
-    double** methodArgVariableAddr = nullptr;
-
-    // ==================== Local Array Management ====================
-    
-    /**
-     * Array to store current array pointers for all arrays in the function scope.
-     * Used for saving array state before function execution and restoring after completion.
-     * Size: totalArrCount
-     * 
-     * Purpose:
-     * - Index 0 to arrCount-1: Parameter array pointers
-     * - Index arrCount to totalArrCount-1: Local array pointers
-     * 
-     * Memory Management:
-     * - For parameters: saves existing array references
-     * - For local arrays: saves current pointers (often nullptr) before allocation
-     * 
-     * Critical for proper cleanup and preventing memory leaks
-     */
-    double** methodArgArrayCurrentVal = nullptr;
-    
-    /**
-     * Array of pointers to all array addresses within the function.
-     * Points to the actual ArrayValue* pointers for both parameters and local arrays.
-     * Size: totalArrCount
-     * 
-     * Memory Structure: double*** -> double** -> double* (actual array data)
-     * 
-     * Usage:
-     * - Direct access to array pointers in function scope
-     * - Memory allocation for local arrays (new double[size])
-     * - Memory deallocation during cleanup (delete[])
-     */
-    double*** methodArgArrayAddr = nullptr;
-    
-    /**
-     * Array storing the total size of each array in the function.
-     * Used for proper memory allocation of local arrays during function execution.
-     * Size: totalArrCount
-     * 
-     * Purpose:
-     * - Index 0 to arrCount-1: Sizes of parameter arrays (for reference)
-     * - Index arrCount to totalArrCount-1: Sizes of local arrays (for allocation)
-     * 
-     * Usage:
-     * - During Phase 2: new double[methodArgArrayTotalSize[i]] for local arrays
-     * - During Phase 6: Ensures proper memory management
-     */
-    int* methodArgArrayTotalSize = nullptr;
+    DataContainerValue** methodAllContainerCurrentVals = nullptr;
 
     // ==================== Stack Management for Function Calls ====================
     
     /**
-     * Temporary storage for variable values during function call stack operations.
-     * Used to preserve calling context variable values across function execution.
-     * Size: varCount
+     * Temporary storage for container values during function call stack operations.
+     * Used to preserve calling context container values across function execution.
+     * Size: argSize
      * 
      * Usage Timeline:
      * 1. Phase 1: Save parameter values from called function context
      * 2. Phase 4: Update with final values from called function
-     * 3. Phase 5: Use to restore calling context variables
+     * 3. Phase 5: Use to restore calling context containers
      * 
-     * Purpose: Ensures proper variable restoration in recursive calls
-     * Example: Prevents outer function variables from being corrupted by inner calls
+     * Purpose: Ensures proper container restoration in recursive calls
+     * Example: Prevents outer function containers from being corrupted by inner calls
+     */
+    DataContainerValue** containerStackCurrent = nullptr;
+
+    // ==================== Legacy Members (Kept for Built-in Function Compatibility) ====================
+    
+    /**
+     * LEGACY: Total number of variables declared within the function (including parameters).
+     * Kept for backward compatibility with existing built-in function implementations.
+     * Will be phased out as built-in functions are updated to use unified approach.
+     */
+    int totalVarCount = 0;
+    
+    /**
+     * LEGACY: Total number of arrays declared within the function (including parameters).
+     * Kept for backward compatibility with existing built-in function implementations.
+     * Will be phased out as built-in functions are updated to use unified approach.
+     */
+    int totalArrCount = 0;
+
+    /**
+     * LEGACY: Array of pointers to parameter variable addresses in the called function.
+     * Kept for backward compatibility with existing built-in function implementations.
+     * Will be replaced by unified AbstractDataContainer approach.
+     */
+    double** methodCalledOriginalPlaceHolderAddrs = nullptr;
+    
+    /**
+     * LEGACY: Array of pointers to argument variable addresses in the calling function.
+     * Kept for backward compatibility with existing built-in function implementations.
+     * Will be replaced by unified AbstractDataContainer approach.
+     */
+    double** methodCallingOriginalPlaceHolderAddrs = nullptr;
+
+    /**
+     * LEGACY: Array of pointers to array parameter addresses in the called function.
+     * Kept for backward compatibility with existing built-in function implementations.
+     * Will be replaced by unified AbstractDataContainer approach.
+     */
+    ArrayValue*** methodCalledArrayPlaceHolderAddrs = nullptr;
+
+    /**
+     * LEGACY: Array of pointers to argument array addresses in the calling function.
+     * Kept for backward compatibility with existing built-in function implementations.
+     * Will be replaced by unified AbstractDataContainer approach.
+     */
+    ArrayValue*** methodCallingArrayPlaceHolderAddrs = nullptr;
+
+    /**
+     * LEGACY: Array to store current values of all variables in the function scope.
+     * Kept for backward compatibility. Will be replaced by methodAllContainerCurrentVals.
+     */
+    double* methodArgVariableCurrentVal = nullptr;
+    
+    /**
+     * LEGACY: Array of pointers to all variable addresses within the function.
+     * Kept for backward compatibility. Will be replaced by methodAllContainers.
+     */
+    double** methodArgVariableAddr = nullptr;
+
+    /**
+     * LEGACY: Array to store current array pointers for all arrays in the function scope.
+     * Kept for backward compatibility. Will be replaced by methodAllContainerCurrentVals.
+     */
+    double** methodArgArrayCurrentVal = nullptr;
+    
+    /**
+     * LEGACY: Array of pointers to all array addresses within the function.
+     * Kept for backward compatibility. Will be replaced by methodAllContainers.
+     */
+    double*** methodArgArrayAddr = nullptr;
+    
+    /**
+     * LEGACY: Array storing the total size of each array in the function.
+     * Kept for backward compatibility with array allocation logic.
+     */
+    int* methodArgArrayTotalSize = nullptr;
+
+    /**
+     * LEGACY: Temporary storage for variable values during function call stack operations.
+     * Kept for backward compatibility. Will be replaced by containerStackCurrent.
      */
     double* variableStackCurrent = nullptr;
     
     /**
-     * Temporary storage for array references during function call stack operations.
-     * Used to preserve calling context array references across function execution.
-     * Size: arrCount
-     * 
-     * Usage Timeline:
-     * 1. Phase 2: Save array references from called function context
-     * 2. Phase 4: Update with final references from called function
-     * 3. Phase 6: Use to restore calling context arrays
-     * 
-     * Purpose: Maintains proper array reference semantics across function calls
+     * LEGACY: Temporary storage for array references during function call stack operations.
+     * Kept for backward compatibility. Will be replaced by containerStackCurrent.
      */
     ArrayValue** arrayStackCurrent = nullptr;
 

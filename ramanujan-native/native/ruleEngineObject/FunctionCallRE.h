@@ -13,8 +13,8 @@
 class FunctionCallRE : public RuleEngineInputUnits {
 public:    
     FunctionCall* functionCall = nullptr;
-    RuleEngineInputUnits** arguments = nullptr;
-    RuleEngineInputUnits** allVariablesInMethod = nullptr;
+    AbstractDataContainer** arguments = nullptr;
+    AbstractDataContainer** allVariablesInMethod = nullptr;
     int argSize = 0;
     CommandRE* commmandRe = nullptr;
     std::string firstCommandId;
@@ -40,14 +40,14 @@ public:
         firstCommandId = functionCall->firstCommandId;
         commmandRe = dynamic_cast<CommandRE *>(getFromMap(map, firstCommandId));
         argSize = functionCall->argumentsSize;
-        arguments = new RuleEngineInputUnits*[argSize];
+        arguments = new AbstractDataContainer*[argSize];
         auto itr = functionCall->arguments.begin();
         for (int i = 0; i < functionCall->argumentsSize && itr != functionCall->arguments.end(); i++, itr++) {
-            arguments[i] = map->at(*itr);
+            arguments[i] = (AbstractDataContainer*)map->at(*itr);
         }
-        allVariablesInMethod = new RuleEngineInputUnits*[functionCall->allVariablesInMethodSize];
+        allVariablesInMethod = new AbstractDataContainer*[functionCall->allVariablesInMethodSize];
         for (int i=0; i< functionCall->allVariablesInMethodSize; i++) {
-            allVariablesInMethod[i] = map->at(functionCall->allVariablesInMethod[i]);
+            allVariablesInMethod[i] = (AbstractDataContainer*)map->at(functionCall->allVariablesInMethod[i]);
         }
         setFieldDone = true;
     }

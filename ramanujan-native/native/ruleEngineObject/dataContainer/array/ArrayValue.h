@@ -17,7 +17,8 @@
 
 class AbstractDataContainer;
 
-class ArrayValue : public DataContainerValue {
+
+class ArrayValue {
 private:
     Array* array = nullptr;
 
@@ -38,6 +39,7 @@ public:
         this->dimensions = toBeCopied->dimensions;
         this->sizeAtIndex = toBeCopied->sizeAtIndex;
         this->val = new double[toBeCopied->totalSize]();
+
         this->totalSize = toBeCopied->totalSize;
 
     }
@@ -47,6 +49,11 @@ public:
             delete[] dimensions;
         if(val != nullptr)
             delete[] val;
+    }
+
+    ~ArrayValue()
+    {
+        destroy();
     }
 
     void add(int* index, double value);
@@ -114,6 +121,26 @@ public:
             sizeAtIndex[index - 1] = result;
         }
         return result;
+    }
+};
+
+class ArrayValDataContainer : public DataContainerValue {
+public:
+    ArrayValue* arrayValue;
+
+    ArrayValDataContainer(Array * array, std::string originalArrayId)
+        : arrayValue(new ArrayValue(array, originalArrayId)) {}
+
+    ArrayValDataContainer(ArrayValDataContainer& copy) {
+        arrayValue = copy.arrayValue;
+    }
+
+    void* getPtr() override {
+        return arrayValue;
+    }
+
+    void setValPtr(void* ptr) override {
+        arrayValue = (ArrayValue*)(ptr);
     }
 };
 

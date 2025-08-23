@@ -32,7 +32,7 @@ private:
 
     double * getArrayValueDataContainer() {
         int translatedIndex = 0;
-        ArrayValue * arrayVal = arrayRe->arrayValue;
+        ArrayValue * arrayVal = (ArrayValue* )(arrayRe->getVal())->getPtr(); // TODO: pranav: to optimize it, can we add something function call stack maintainence to cache getPtr info in AbstractDataContainer so we prevent double ptr hops.
         int *sizeAtIndex = arrayVal->sizeAtIndex;
         //indexes can be only variables.
         for (int i = 0; i < (dimensionSize - 1); i++) {
@@ -58,10 +58,10 @@ public:
             VariableRE* var = dynamic_cast<VariableRE*>(iterator->second);
 //            dataContainers[dimensionSize] = dataContainerRe;
             if(var != nullptr) {
-                valPtrArr[dimensionSize] = var->getValPtrPtr();
+                valPtrArr[dimensionSize] = (double *)(var->getVal()->getPtr());
             } else {
                 ConstantRE* constant = dynamic_cast<ConstantRE*>(iterator->second);
-                valPtrArr[dimensionSize] = constant->getValPtrPtr();
+                valPtrArr[dimensionSize] = (double *)(constant->getVal()->getPtr());
             }
             dimensionSize++;
         }

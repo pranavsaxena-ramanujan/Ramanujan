@@ -142,11 +142,11 @@ double* CommandRE::getVar() {
         return nullptr;
     }
     if(variableRE != nullptr) {
-        return variableRE->getValPtrPtr();
+        return (double *)variableRE->getVal()->getPtr(); //TODO: pranav: same optimization from getArrayValueDataContainer.
     }
 
     if(constantRE != nullptr){
-        return constantRE->getValPtrPtr();
+        return (double *)(constantRE->getVal()->getPtr());
 
     }
 }

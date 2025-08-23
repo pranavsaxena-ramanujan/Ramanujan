@@ -39,12 +39,12 @@ std::unordered_map<std::string, ProcessingResult>* Processor::process(RuleEngine
 
     for(RuleEngineInputUnits* variable : variableREs) {
         VariableRE* variableRE = (VariableRE*)(variable);
-        dataFieldOriginalData.insert(std::make_pair(variableRE->getValPtrPtr(), *variableRE->getValPtrPtr()));
+        dataFieldOriginalData.insert(std::make_pair(&variableRE->value.value, variableRE->value.value));
     }
 
     for(RuleEngineInputUnits* array : arrayREs) {
         ArrayRE* arrayRE = (ArrayRE*)(array);
-        ArrayValue* arrayValue = (ArrayValue*)(arrayRE->getVal());
+        ArrayValue* arrayValue = (ArrayValue*)(arrayRE->getVal()->getPtr());
         int size = arrayValue->totalSize;
         for(int i = 0; i < size; i++) {
             dataFieldOriginalData.insert(std::make_pair(&arrayValue->val[i],arrayValue->val[i]));
@@ -66,7 +66,7 @@ std::unordered_map<std::string, double>* Processor::varChangeMap() {
     std::unordered_map<std::string, double>* varChangeMap = new std::unordered_map<std::string, double>();
     for(RuleEngineInputUnits *variableRE1 : variableREs) {
         VariableRE* variableRE = (VariableRE*)variableRE1;
-        double* valPtr = variableRE->getValPtrPtr();
+        double* valPtr = &variableRE->value.value;
         double originalVal = dataFieldOriginalData.at(valPtr);
         double newVal = *valPtr;
 //        if (originalVal != newVal) {
@@ -80,7 +80,7 @@ std::unordered_map<std::string, std::unordered_map<std::string, double>*>* Proce
     std::unordered_map<std::string, std::unordered_map<std::string, double>*> *arrChangeMap = new std::unordered_map<std::string, std::unordered_map<std::string, double>*>();
     for(RuleEngineInputUnits *arrayRE1 : arrayREs) {
         ArrayRE* arrayRE = (ArrayRE*)arrayRE1;
-        ArrayValue* arrayValue = (ArrayValue*)(arrayRE->getVal());
+        ArrayValue* arrayValue = (ArrayValue*)(arrayRE->getVal()->getPtr());
         int size = arrayValue->totalSize;
         std::unordered_map<std::string, double> *arrChangeMap1 = new std::unordered_map<std::string, double>();
         bool changed = false;

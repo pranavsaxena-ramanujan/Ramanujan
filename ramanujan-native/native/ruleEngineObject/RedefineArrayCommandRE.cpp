@@ -14,7 +14,7 @@ void RedefineArrayCommandRE::process() {
     // 1. Compute new dimensions using the class field dims
     for (int i = 0; i < dimsCount; ++i) {
         if (isVariableDimension[i] && dimensionVariableREs[i]) {
-            dims[i] = static_cast<int>(*dimensionVariableREs[i]->getValPtrPtr());
+            dims[i] = static_cast<int>(dimensionVariableREs[i]->value.value);
         } else if (!isVariableDimension[i]) {
             dims[i] = staticDimensions[i];
         } else {
@@ -32,14 +32,8 @@ void RedefineArrayCommandRE::process() {
     newArray->dimensionSize = dimsCount;
     // Optionally, copy dataType, name, etc. if needed
 
-    // 3. Create a new ArrayValue with the new Array
-    ArrayValue* oldArrayValue = *arrayValuePtr;
-    ArrayValue* newArrayValue = new ArrayValue(newArray, arrayId);
+    ArrayValue newArrayValue(newArray, arrayId);
 
     // 4. Update the pointer and delete the old ArrayValue
     *arrayValuePtr = newArrayValue;
-    if (oldArrayValue) {
-        oldArrayValue->destroy();
-        delete oldArrayValue;
-    }
 }

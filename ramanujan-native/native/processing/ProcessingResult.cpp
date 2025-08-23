@@ -23,7 +23,7 @@ void ProcessingResult::addVariableRE(VariableRE *variableRE) {
 std::unordered_map<std::string, double> *ProcessingResult::getVarMap() {
     std::unordered_map<std::string, double> *map = new std::unordered_map<std::string, double>();
     for(VariableRE *variableRE : *variableREList) {
-        (*map)[variableRE->getId()] = *variableRE->getValPtrPtr();
+        (*map)[variableRE->getId()] = variableRE->value.value;
     }
     return map;
 }

@@ -17,11 +17,11 @@ public:
     std::vector<bool> isVariableDimension; // true if dimension is a variable, false if explicit integer
 
     // Pointer to the ArrayValue* of the target ArrayRE
-    ArrayValue **arrayValuePtr = nullptr;
+    ArrayValue *arrayValuePtr = nullptr;
 
     void destroy() override {
         if (arrayValuePtr) {
-            delete *arrayValuePtr; // Assuming ownership of the ArrayValue
+            delete arrayValuePtr; // Assuming ownership of the ArrayValue
             arrayValuePtr = nullptr;
         }
     }
@@ -35,7 +35,7 @@ public:
         if (itArr != map->end()) {
             ArrayRE* arrayRE = dynamic_cast<ArrayRE*>(itArr->second);
             if (arrayRE) {
-                arrayValuePtr = arrayRE->getValPtr();
+                arrayValuePtr = arrayRE->arrayValue->arrayValue;
             }
         }
         for (const auto& varId : newDimensions) {

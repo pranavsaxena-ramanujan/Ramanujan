@@ -13,22 +13,36 @@
 #include <stack>
 #include <cmath>
 
-class DoublePtr : public RuleEngineInputUnits{
+class DoublePtr : public DataContainerValue{
+
 public:
-    virtual double* getValPtrPtr() = 0;
+    double value;
+
+    DoublePtr(double value = 0.0) : value(value) {}
+
+    DoublePtr(DoublePtr& inDoublePtr)
+    {
+        value = inDoublePtr.value;
+    }
+
+    void* getPtr() override {
+        return &value;
+    }
+
+    void setValPtr(void* ptr) override {
+        value = *((double*)(ptr));
+    }
 };
 
 
-class VariableRE : public DoublePtr {
+class VariableRE : public AbstractDataContainer, public RuleEngineInputUnits {
     Variable *variable;
-
-    double value;
 
     bool added = false;
 
 public:
     std::string name, frameCount;
-    VariableRE(Variable *variable) {
+    VariableRE(Variable *variable) : AbstractDataContainer(&value) {
         this->variable = variable;
 
         id = variable->id;
@@ -37,16 +51,13 @@ public:
         if(std::isnan(val)) {
             val = 0;
         }
-        value = val;
+        value.value = val;
         frameCount = variable->frameCount;
+
     }
 
     void destroy() override {
 
-    }
-
-    void setValue(double value) {
-        this->value = value;
     }
 
     void setFields(std::unordered_map<std::string, RuleEngineInputUnits *> *map) override {
@@ -57,19 +68,18 @@ public:
 
     }
 
-    double* getValPtrPtr() override {
-        return &value;
+    std::string getId() override {
+        return id;
     }
+
+    DoublePtr value;
 };
 
-class ConstantRE : public DoublePtr {
-private:
-    double value;
-
+class ConstantRE : public AbstractDataContainer, public RuleEngineInputUnits {
 public:
-    ConstantRE(Constant* constant) {
-        this->value =constant->value;
-    }
+    DoublePtr doublePtr;
+    ConstantRE(Constant* constant) : AbstractDataContainer(&doublePtr), doublePtr(constant->value)
+    { }
 
     void destroy() {
     }
@@ -78,11 +88,11 @@ public:
 
     }
 
-    void process() override {
+    std::string getId() override {
+        return id;
     }
 
-    double *getValPtrPtr() override {
-        return &value;
+    void process() override {
     }
 };
 #endif //NATIVE_VARIABLERE_H
