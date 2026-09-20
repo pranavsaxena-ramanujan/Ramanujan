@@ -1050,20 +1050,18 @@ RuleEngineInputUnits *GPUFunctionCommandRE::process() {
 
   for (int di = 0; di < gpuDataArgCount; di++) {
     cl_mem buf = (cl_mem)gpuAvCache[di]->gpuBuffer;
-    // if (buf == nullptr) {
-    //   RJ_GPU_LOG("[GPU] arg %d has no GPU buffer for kernel '%s' — missing "
-    //              "LOAD_MEM(array) before first use\n",
-    //              di, gpuKernelName.c_str());
-    //   gpuBufferError = true;
-    //   break;
-    // }
-    //gpuSetErr =
-        clSetKernelArg(gpuKernel, (cl_uint)di, sizeof(cl_mem), &buf);
-    // if (gpuSetErr != CL_SUCCESS) {
-    //   RJ_GPU_LOG("[GPU] clSetKernelArg arg=%d failed err=%d\n", di, gpuSetErr);
-    //   gpuBufferError = true;
-    //   break;
-    // }
+    if (buf == nullptr) {
+      RJ_GPU_LOG("[GPU] arg %d has no GPU buffer for kernel '%s'\n",
+                 di, gpuKernelName.c_str());
+      gpuBufferError = true;
+      break;
+    }
+    gpuSetErr = clSetKernelArg(gpuKernel, (cl_uint)di, sizeof(cl_mem), &buf);
+    if (gpuSetErr != CL_SUCCESS) {
+      RJ_GPU_LOG("[GPU] clSetKernelArg arg=%d failed err=%d\n", di, gpuSetErr);
+      gpuBufferError = true;
+      break;
+    }
   }
 
   // Optional dispatch-state diagnostics; enable when investigating skipped
@@ -1102,13 +1100,18 @@ RuleEngineInputUnits *GPUFunctionCommandRE::process() {
     }
 #endif
 
-    // gpuErr =
-        clEnqueueNDRangeKernel(s_clCtx.queue, gpuKernel, gpuWorkDim, nullptr,
-                               gpuGlobalWorkSize, gpuLocalWorkSizePtr, 0, nullptr, nullptr);
-
-    // if (gpuErr != CL_SUCCESS) {
-    //   RJ_GPU_LOG("[GPU] clEnqueueNDRangeKernel failed: %d\n", gpuErr);
-    // }
+    gpuErr = clEnqueueNDRangeKernel(s_clCtx.queue, gpuKernel, gpuWorkDim, nullptr,
+                                   gpuGlobalWorkSize, gpuLocalWorkSizePtr, 0, nullptr, nullptr);
+    if (gpuErr != CL_SUCCESS) {
+      RJ_GPU_LOG("[GPU] clEnqueueNDRangeKernel '%s' failed: %d\n",
+                 gpuKernelName.c_str(), gpuErr);
+    } else {
+      gpuErr = clFinish(s_clCtx.queue);
+      if (gpuErr != CL_SUCCESS) {
+        RJ_GPU_LOG("[GPU] clFinish after '%s' failed: %d\n",
+                   gpuKernelName.c_str(), gpuErr);
+      }
+    }
 
     // Optional full-buffer trace and matmul oracle; enable for GPU debugging.
     // runDispatchDiagnostics();
@@ -1678,8 +1681,8 @@ RuleEngineInputUnits *LOAD_MEM::process() {
       // always do a real copy here to avoid stale/corrupt reads.
       flags |= CL_MEM_COPY_HOST_PTR;
 #else
-      flags |= arrayValue->isBinaryLoaded ? CL_MEM_USE_HOST_PTR
-                                          : CL_MEM_COPY_HOST_PTR;
+  flags |= arrayValue->isCachedVal ? CL_MEM_USE_HOST_PTR
+               : CL_MEM_COPY_HOST_PTR;
 #endif
       cl_int err;
       cl_mem buf = clCreateBuffer(s_clCtx.context, flags, needed,

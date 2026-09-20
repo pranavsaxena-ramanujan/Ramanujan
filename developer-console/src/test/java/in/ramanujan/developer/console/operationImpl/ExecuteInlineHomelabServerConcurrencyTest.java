@@ -12,6 +12,8 @@ import java.io.InputStreamReader;
 import java.io.OutputStream;
 import java.net.HttpURLConnection;
 import java.net.URL;
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -36,6 +38,28 @@ public class ExecuteInlineHomelabServerConcurrencyTest {
 
     private static final int PORT = 8899;
     private static final String DEFAULT_FAT_JAR_NAME = "developer-console-1.0-SNAPSHOT-fat.jar";
+
+    @Test
+    public void binaryDumpWritesSiblingBinaryAndCompactFreshStub() throws Exception {
+        Path workDir = Files.createTempDirectory("homelab_binary_dump_");
+        try {
+            Path source = workDir.resolve("source.bin");
+            Path csvOut = workDir.resolve("cache.csv");
+            ByteBuffer values = ByteBuffer.allocate(3 * Float.BYTES).order(ByteOrder.LITTLE_ENDIAN);
+            values.putFloat(1.0f).putFloat(2.0f).putFloat(3.0f);
+            Files.write(source, values.array());
+
+            ExecuteInlineHomelabServer.writeBinaryFileAsCsv(source.toString(), csvOut.toString());
+
+            Path binOut = workDir.resolve("cache.bin");
+            Assert.assertArrayEquals(values.array(), Files.readAllBytes(binOut));
+            Assert.assertEquals("0,0,0\n", new String(Files.readAllBytes(csvOut), StandardCharsets.UTF_8));
+            Assert.assertTrue(Files.getLastModifiedTime(binOut).toMillis()
+                    >= Files.getLastModifiedTime(csvOut).toMillis());
+        } finally {
+            deleteRecursively(workDir);
+        }
+    }
 
     @Test
     public void concurrentOrchestratorRunsWithRealHomelabAndWorkerSucceed() throws Exception {

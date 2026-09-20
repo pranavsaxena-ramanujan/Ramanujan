@@ -5,11 +5,11 @@
 #include "ArrayValue.h"
 #include "../DataContainerValueFunctionCommandRE.h"
 
+#include <fstream>
 #include <mutex>
 #include <sys/stat.h>
 #include <fcntl.h>
 #ifdef _WIN32
-#include <fstream>
 #else
 #include <sys/mman.h>
 #include <unistd.h>
@@ -19,6 +19,17 @@
 // Global cache: binaryFilePath -> {float* data, int count}
 static std::mutex                                              s_binaryMutex;
 static std::unordered_map<std::string, std::pair<float*, int>> s_binaryCache;
+
+static bool isMutableRuntimeBinary(const std::string& path) {
+    const size_t slash = path.find_last_of("/\\");
+    const std::string name = slash == std::string::npos ? path : path.substr(slash + 1);
+    const auto endsWith = [&name](const char* suffix) {
+        const size_t suffixLength = std::char_traits<char>::length(suffix);
+        return name.size() >= suffixLength
+            && name.compare(name.size() - suffixLength, suffixLength, suffix) == 0;
+    };
+    return name == "hidden.bin" || endsWith("_k_cache.bin") || endsWith("_v_cache.bin");
+}
 
 ArrayValue::ArrayValue(Array* array , std::string originalArrayId) {
     this->array = array;
@@ -44,9 +55,10 @@ ArrayValue::ArrayValue(Array* array , std::string originalArrayId) {
     if (!array->binaryFile.empty()) {
         // Check cache first (avoids re-reading disk on every kernel call)
         std::string key = array->binaryFile;
+        const bool cacheable = !isMutableRuntimeBinary(key);
         float* fdata = nullptr;
         int fcount = 0;
-        {
+        if (cacheable) {
             std::lock_guard<std::mutex> lk(s_binaryMutex);
             auto it = s_binaryCache.find(key);
             if (it != s_binaryCache.end()) {
@@ -84,21 +96,29 @@ ArrayValue::ArrayValue(Array* array , std::string originalArrayId) {
                 size_t mapSize = totalSize * sizeof(float);
                 if (mapSize == 0) mapSize = sizeof(float);
 
-                // Two-step mmap: anonymous region covers the full totalSize (tail past
-                // fcount is demand-zeroed, avoiding SIGBUS on a short file); MAP_FIXED
-                // overlays the file on the first fcount floats. The overlay is file-backed
-                // and read-only, so its pages are reclaimable page cache the kernel can
-                // evict under memory pressure -- essential for the ~2.7 GB of Phi-3 weights
-                // on a 3.6 GB device. clCreateBuffer(CL_MEM_COPY_HOST_PTR) copies via a
-                // CPU memcpy, which faults these pages in normally (no GPU-DMA race).
-                void* mapped = mmap(nullptr, mapSize, PROT_READ | PROT_WRITE,
-                                    MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-                if (mapped != MAP_FAILED) {
-                    if (fcount > 0) {
-                        mmap(mapped, (size_t)fcount * sizeof(float), PROT_READ,
-                             MAP_PRIVATE | MAP_FIXED, fd, 0);
+                if (cacheable) {
+                    // Two-step mmap: anonymous region covers the full totalSize (tail past
+                    // fcount is demand-zeroed, avoiding SIGBUS on a short file); MAP_FIXED
+                    // overlays the immutable file data.
+                    void* mapped = mmap(nullptr, mapSize, PROT_READ | PROT_WRITE,
+                                        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+                    if (mapped != MAP_FAILED) {
+                        if (fcount > 0) {
+                            mmap(mapped, (size_t)fcount * sizeof(float), PROT_READ,
+                                 MAP_PRIVATE | MAP_FIXED, fd, 0);
+                        }
+                        fdata = static_cast<float*>(mapped);
                     }
-                    fdata = static_cast<float*>(mapped);
+                } else if (ALIGNED_ALLOC(&fdata, 4096, mapSize) == 0 && fdata != nullptr) {
+                    memset(fdata, 0, mapSize);
+                    size_t bytesRemaining = (size_t)fcount * sizeof(float);
+                    char* destination = reinterpret_cast<char*>(fdata);
+                    while (bytesRemaining > 0) {
+                        ssize_t bytesRead = read(fd, destination, bytesRemaining);
+                        if (bytesRead <= 0) break;
+                        destination += bytesRead;
+                        bytesRemaining -= (size_t)bytesRead;
+                    }
                 }
                 close(fd);
             }
@@ -115,16 +135,15 @@ ArrayValue::ArrayValue(Array* array , std::string originalArrayId) {
                     memset(fdata, 0, totalSize * sizeof(float));
                 }
             }
-            if (fdata) {
+            if (fdata && cacheable) {
                 std::lock_guard<std::mutex> lk(s_binaryMutex);
                 s_binaryCache[key] = {fdata, fcount};
             }
         }
-        // val[] is now a direct pointer to the static cache (ZERO COPY)
         val = fdata;
         isBinaryLoaded  = true;
-        isCachedVal = true;
-        cachedFloatData = fdata;
+        isCachedVal = cacheable;
+        cachedFloatData = cacheable ? fdata : nullptr;
     } else {
         ALIGNED_ALLOC(&val, 4096, totalSize * sizeof(float));
         memset(val, 0, totalSize * sizeof(float));

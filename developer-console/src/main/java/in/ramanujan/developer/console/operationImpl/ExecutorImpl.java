@@ -297,7 +297,13 @@ public class ExecutorImpl implements Operation {
             try { new java.io.File(oldPath).delete(); } catch (Exception ignored) {}
         }
         binaryArrayFileStore.clear();
-        if (binaryArrayMap != null) binaryArrayFileStore.putAll(binaryArrayMap);
+        if (binaryArrayMap != null) {
+            for (Map.Entry<String, String> entry : binaryArrayMap.entrySet()) {
+                String name = entry.getKey();
+                if (name.contains("_name_")) name = name.split("_name_", 2)[1];
+                binaryArrayFileStore.put(name, entry.getValue());
+            }
+        }
     }
 
     public static CodeRunRequest createJson(List<String> args) throws JsonProcessingException {

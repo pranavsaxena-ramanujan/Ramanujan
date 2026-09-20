@@ -109,10 +109,12 @@ public class ExecuteInline implements Operation {
                     }
                     array.getValues().putAll(arrayResult);
                 }
+            } else if ("binaryArrayFiles".equalsIgnoreCase(key)) {
+                ExecutorImpl.setBinaryArrayFileStore((Map<String, String>) value);
             } else {
                 Variable variable = variableMap.get(key);
                 if(variable == null) {
-                    throw new IOException("Variable not found");
+                    throw new IOException("Variable not found: " + key);
                 }
                 variable.setValue(value);
             }

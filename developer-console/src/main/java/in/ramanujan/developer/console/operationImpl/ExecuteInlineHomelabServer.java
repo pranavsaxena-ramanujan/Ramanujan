@@ -689,23 +689,29 @@ public class ExecuteInlineHomelabServer extends ExecuteInline {
         }
     }
 
-    /** Converts a raw little-endian float32 binary file into a single flat comma-separated
-     *  CSV line, matching the format written by write_flat_csv()/read by read_flat_csv() on
-     *  the python client side. Avoids ever materializing a per-element Map/JSON structure. */
-    private static void writeBinaryFileAsCsv(String binFilePath, String csvOutPath) throws IOException {
-        byte[] raw = java.nio.file.Files.readAllBytes(java.nio.file.Paths.get(binFilePath));
-        java.nio.FloatBuffer floats = java.nio.ByteBuffer.wrap(raw)
-                .order(java.nio.ByteOrder.LITTLE_ENDIAN)
-                .asFloatBuffer();
-        int n = floats.remaining();
-        StringBuilder sb = new StringBuilder(Math.max(16, n * 12));
-        for (int i = 0; i < n; i++) {
-            if (i > 0) sb.append(',');
-            sb.append(floats.get(i));
+        static void writeBinaryFileAsCsv(String binFilePath, String csvOutPath) throws IOException {
+        java.nio.file.Path source = java.nio.file.Paths.get(binFilePath);
+        java.nio.file.Path csvOut = java.nio.file.Paths.get(csvOutPath);
+        String fileName = csvOut.getFileName().toString();
+        String binName = fileName.endsWith(".csv")
+            ? fileName.substring(0, fileName.length() - 4) + ".bin"
+            : fileName + ".bin";
+        java.nio.file.Path binOut = csvOut.resolveSibling(binName);
+        java.nio.file.Files.copy(source, binOut,
+            java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+
+        long floatCount = java.nio.file.Files.size(binOut) / Float.BYTES;
+        int columns = floatCount > 1 && floatCount % 3072 == 0 ? 3072 : (int) floatCount;
+        StringBuilder stub = new StringBuilder(Math.max(1, columns * 2));
+        for (int i = 0; i < columns; i++) {
+            if (i > 0) stub.append(',');
+            stub.append('0');
         }
-        sb.append('\n');
-        java.nio.file.Files.write(java.nio.file.Paths.get(csvOutPath),
-                sb.toString().getBytes(StandardCharsets.UTF_8));
+        stub.append('\n');
+        if (floatCount > columns) stub.append("0\n");
+        java.nio.file.Files.write(csvOut, stub.toString().getBytes(StandardCharsets.UTF_8));
+        java.nio.file.Files.setLastModifiedTime(binOut,
+            java.nio.file.attribute.FileTime.fromMillis(System.currentTimeMillis() + 2000));
     }
 
     /** Workers poll this to receive work.

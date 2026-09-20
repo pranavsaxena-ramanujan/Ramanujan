@@ -19,6 +19,7 @@ import java.io.IOException;
 import java.io.InputStreamReader;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
+import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.*;
 
@@ -338,6 +339,16 @@ public class ExecuteInlineServer extends ExecuteInline {
                 System.out.println("Usage: dump <arrayName> [outputFile]");
                 return;
             }
+            String binaryFile = ExecutorImpl.binaryArrayFileStore.get(arrName);
+            if (binaryFile != null && outFile != null) {
+                try {
+                    dumpBinaryArray(binaryFile, outFile);
+                    System.out.println("Dumped " + arrName + " to " + outFile);
+                } catch (Exception ex) {
+                    System.out.println("Error writing file: " + ex.getMessage());
+                }
+                return;
+            }
             Map<String, Object> arr = ExecutorImpl.arrayStore.get(arrName);
             if (arr == null || arr.isEmpty()) {
                 System.out.println("Array not found or empty: " + arrName);
@@ -393,5 +404,30 @@ public class ExecuteInlineServer extends ExecuteInline {
         }
 
         System.out.println("Unknown command: " + line);
+    }
+
+    private static void dumpBinaryArray(String sourcePath, String csvOutPath) throws IOException {
+        Path source = Paths.get(sourcePath);
+        Path csvOut = Paths.get(csvOutPath);
+        String fileName = csvOut.getFileName().toString();
+        String binName = fileName.endsWith(".csv")
+                ? fileName.substring(0, fileName.length() - 4) + ".bin"
+                : fileName + ".bin";
+        Path binOut = csvOut.resolveSibling(binName);
+        Files.copy(source, binOut, java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+
+        long floatCount = Files.size(binOut) / Float.BYTES;
+        StringBuilder stub = new StringBuilder();
+        int columns = floatCount > 1 && floatCount % 3072 == 0 ? 3072 : (int) floatCount;
+        for (int i = 0; i < columns; i++) {
+            if (i > 0) stub.append(',');
+            stub.append('0');
+        }
+        stub.append('\n');
+        if (floatCount > columns) stub.append("0\n");
+        Files.write(csvOut, stub.toString().getBytes(StandardCharsets.UTF_8));
+        Files.setLastModifiedTime(binOut, java.nio.file.attribute.FileTime.fromMillis(
+                System.currentTimeMillis() + 2000
+        ));
     }
 }
