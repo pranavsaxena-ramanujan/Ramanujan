@@ -28,7 +28,8 @@ static bool isMutableRuntimeBinary(const std::string& path) {
         return name.size() >= suffixLength
             && name.compare(name.size() - suffixLength, suffixLength, suffix) == 0;
     };
-    return name == "hidden.bin" || endsWith("_k_cache.bin") || endsWith("_v_cache.bin");
+    return name == "hidden.bin" || name == "h_state.bin"
+        || endsWith("_k_cache.bin") || endsWith("_v_cache.bin");
 }
 
 ArrayValue::ArrayValue(Array* array , std::string originalArrayId) {

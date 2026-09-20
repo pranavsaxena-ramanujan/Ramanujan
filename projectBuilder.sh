@@ -10,7 +10,10 @@ if [ -z "$RAMANUJAN_WS" ]; then
 fi
 mkdir -p "$RAMANUJAN_WS"
 
-cd "$REPO_ROOT"/commons
+cd "$REPO_ROOT"/sharded-llm-model
+mvn clean install
+
+cd ../commons
 mvn clean install
 
 cd ../rule-engine
