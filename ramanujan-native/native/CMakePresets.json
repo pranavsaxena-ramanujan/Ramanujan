@@ -1,0 +1,22 @@
+{
+  "version": 3,
+  "configurePresets": [
+    {
+      "name": "native-llm",
+      "displayName": "Ramanujan native LLM (OpenCL)",
+      "generator": "Unix Makefiles",
+      "binaryDir": "${sourceDir}/build",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "GPU_ENABLED": "ON"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "native-llm",
+      "configurePreset": "native-llm",
+      "targets": ["native_llm"]
+    }
+  ]
+}

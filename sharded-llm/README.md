@@ -9,10 +9,9 @@ memory. Phi-3 Mini is the first implemented architecture and safetensors is the
 first implemented source format.
 
 The conversion, four-shard prefill, KV-cache transfer, autoregressive decode,
-binary tensor transport, and inference memory guard all run. The execution path
-is still experimental: generated tokens are not yet numerically correct because
-decode computes nonzero projections and cache rows but does not persist the
-residual updates into the hidden state.
+binary tensor transport, and inference memory guard all run. The local runner
+now generates the expected answer for the reference prompt; remote execution is
+still experimental.
 
 ## Inspiration
 
@@ -45,7 +44,8 @@ coupling the system to GGUF or one model architecture:
 - Added a local runner that transfers hidden state and per-layer K/V caches
 	between shard invocations.
 - Added inference-only RSS monitoring. The JVM heap is capped at 6 GiB and the
-	default process ceiling is 8 GiB.
+	default worker process ceiling is 7 GiB. A worker that crosses the ceiling
+	is killed and its shard is retried once from disk-backed inputs.
 - Added optional diagnostics for hidden-state and cache continuity.
 
 Remote orchestrator, homelab scheduling, and worker placement are not wired to
@@ -73,38 +73,32 @@ manifests, and checksums.
 Package verification completed for 340 files totaling 3,215,516,137 bytes.
 The converter test suite completed with 8 passing tests.
 
-A complete four-shard, 10-token run exited successfully under the memory limit:
+A 16-token run with a fresh worker per shard produced:
 
 ```text
-token ids: [450, 12116, 28666, 29373, 15898, 5629, 1087, 3075, 22042, 31516]
-text:      Theoretesiarong Fich przviceconstrained然
-peak JVM RSS: approximately 1.33 GiB
-peak runner RSS: approximately 137 MiB
+token ids: [450, 2533, 310, 29871, 29906, 322, 29871, 29906, 338, 29871, 29946,
+            29889, 910, 338, 263, 6996]
+text:      The sum of 2 and 2 is 4. This is a basic
+peak JVM RSS: approximately 0.85 GiB
 ```
 
-This output proves mechanical prefill/decode execution and state transfer, but
-it is not a correct answer to the prompt and must not be treated as a model
-quality result.
+A 12-token single-worker run produced `The sum of 2 and 2 is 4.` with peak
+JVM RSS of approximately 1.46 GiB. A 6-token run started one JVM, compiled
+each of the eight shard programs once, reused that IR for the remaining 16
+shard runs, and took 4.4-6.2 seconds per decode token. Diagnostics show that
+each decode shard changes only the current hidden-state row, preserves previous
+K/V rows, and writes a nonzero current K/V row.
 
-The latest two-token diagnostic produced `[450, 12116]` (`Theoret`). It also
-showed:
+## Resolved Decode Issue
 
-- Prefill hidden states and K/V cache rows are nonzero in all four shards.
-- Decode preserves all previous cache rows and writes a nonzero current row.
-- Decode attention and MLP projection buffers are nonzero.
-- The decoded hidden-state file remains bit-for-bit unchanged across each shard.
+Decode inputs were passed as symlinks named `h_state.bin` and
+`l*_k_cache.bin`/`l*_v_cache.bin`. Translation canonicalizes binary paths, so
+native saw the symlink targets' names and treated mutable state as immutable
+weights. It mapped those files read-only, so decode writes were lost before
+`RETURN`. The runner now passes state through hard links, falling back to a
+copy, so native sees the logical state names and allocates writable buffers.
 
-## Probable Current Issue
-
-The strongest current hypothesis is an indexing or write-back defect in
-`residual_add_decode_GPU_1`. It computes valid nonzero attention and MLP outputs,
-but neither residual addition changes any hidden-state row. Its original kernel
-used a floating sequence position directly as an array-row index, unlike the
-working decode kernels that explicitly derive an integer `row_int`. The
-generator now normalizes this residual index, but the refreshed package and
-end-to-end output still need validation.
-
-Other risks to validate before remote execution are:
+Risks to validate before remote execution are:
 
 - Numerical parity between the converted 4-bit weights and a trusted reference.
 - Correct mutable-buffer behavior across JVM, JNI, OpenCL, and binary sidecars.
@@ -134,6 +128,32 @@ enforced only while running inference.
 python3 sharded-llm/run_phi3_shards.py "What is 2 + 2?" --n-tokens 10
 ```
 
-Use `--diagnostics` for bounded hidden/cache continuity statistics. The runner
-starts a fresh JVM, processes shards sequentially, enforces the RSS ceiling, and
-removes temporary hidden-state and KV-cache files on exit.
+The runner starts one worker JVM for the whole generation and registers the
+package with `REGISTER_SHARDS <model-manifest.json>`. The package stays on
+disk; the worker validates its prefill/decode program paths. Each program is
+compiled to IR on first use, and the worker keeps that IR (about 350-420 KB per
+program) keyed by program path and input shapes. Shard weights stay on disk and
+the runner binds them once per generation, so each shard run sends only hidden
+and K/V state plus sequence length.
+
+After the caller dumps the completed shard's hidden state, K/V caches, and token
+(if present), `CHANGE_SHARD <next-program.py>` clears the native immutable-weight
+cache; the next `run` maps that shard's weights from disk. The runner processes
+shards sequentially, enforces the RSS ceiling, and removes temporary hidden-state
+and KV-cache files on exit. If the worker breaches 7 GiB, the runner kills it,
+starts a new worker, re-registers the package, and resumes from the same shard's
+disk-backed inputs. A second breach on that shard stops the run. A failed kernel
+cannot change shards in place; its worker is replaced.
+
+This is an explicit weight-cache eviction, not yet proof of complete native
+heap cleanup: `ArrayRE::destroy()` currently does not free its per-call array
+objects. Use `--worker-per-shard` to start a fresh JVM for every shard run; it
+returns all native memory at each shard boundary but recompiles IR every time.
+`--diagnostics` uses per-shard workers because its instrumented programs are
+generated outside the registered package.
+
+The runner explicitly loads `libnative_llm.dylib` from `--native-dir`. Other
+Java callers continue to load `libnative.dylib`. The worker requires a
+developer-console JAR and LLM native library built with `changeShard`. Homelab
+and remote orchestrator dispatch do not yet use this protocol or provide a
+durable cross-device commit protocol.

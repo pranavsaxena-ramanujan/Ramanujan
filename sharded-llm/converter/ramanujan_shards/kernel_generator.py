@@ -20,7 +20,6 @@ def generate_phi3_prefill_kernel(reference_kernel: Path, layer_start: int,
         "logits_compute_GPU_1",
         "argmax_GPU_1",
     ])
-    functions = _use_integer_decode_residual_row(functions)
     layer_blocks = _prefill_layer_blocks(source, layer_start, layer_end)
     cache_names = [name for layer in range(layer_start, layer_end)
                    for name in ("l{0}_k_cache".format(layer), "l{0}_v_cache".format(layer))]
@@ -111,6 +110,7 @@ def generate_phi3_decode_kernel(reference_kernel: Path, layer_start: int,
         "logits_compute_GPU_1",
         "argmax_GPU_1",
     ])
+    functions = _use_integer_decode_row(functions)
     layer_blocks = _decode_layer_blocks(source, layer_start, layer_end)
     cache_names = [name for layer in range(layer_start, layer_end)
                    for name in ("l{0}_k_cache".format(layer), "l{0}_v_cache".format(layer))]
@@ -167,6 +167,64 @@ def generate_phi3_decode_kernel(reference_kernel: Path, layer_start: int,
     return generated
 
 
+def _use_integer_decode_row(functions: str) -> str:
+    # rmsnorm_decode_GPU_1 and residual_add_decode_GPU_1 index arrays with the raw
+    # double `cur_n_seq_arr[0] - 1.0` instead of an epsilon-nudged integer accumulator
+    # (the pattern every other decode function uses). Left as-is, the OpenCL C cast to
+    # int truncates incorrectly whenever float round-tripping nudges the value below
+    # the intended integer, corrupting the row offset. Patch the generated decode
+    # source in place rather than the (stable) reference kernel file.
+    patches = [
+        (
+            "def rmsnorm_decode_GPU_1(hidden, gamma, out, cur_n_seq_arr, k):\n"
+            "    row = cur_n_seq_arr[0] - 1.0\n"
+            "    base = 0\n"
+            "    hk = 0\n"
+            "    idx = 0\n"
+            "\n"
+            "    base = row * 3072",
+            "def rmsnorm_decode_GPU_1(hidden, gamma, out, cur_n_seq_arr, k):\n"
+            "    row_int = 0\n"
+            "    r_f = (cur_n_seq_arr[0] - 1.0) + 0.1\n"
+            "    while r_f >= 1024.0:\n"
+            "        row_int = row_int + 1024\n"
+            "        r_f = r_f - 1024.0\n"
+            "    while r_f >= 1.0:\n"
+            "        row_int = row_int + 1\n"
+            "        r_f = r_f - 1.0\n"
+            "    base = 0\n"
+            "    hk = 0\n"
+            "    idx = 0\n"
+            "\n"
+            "    base = row_int * 3072",
+        ),
+        (
+            "def residual_add_decode_GPU_1(hidden, buf, cur_n_seq_arr, col):\n"
+            "    idx = 0\n"
+            "    row = cur_n_seq_arr[0] - 1.0\n"
+            "    idx = row * 3072 + col\n"
+            "    hidden[idx] = hidden[idx] + buf[idx]",
+            "def residual_add_decode_GPU_1(hidden, buf, cur_n_seq_arr, col):\n"
+            "    idx = 0\n"
+            "    row_int = 0\n"
+            "    r_f = (cur_n_seq_arr[0] - 1.0) + 0.1\n"
+            "    while r_f >= 1024.0:\n"
+            "        row_int = row_int + 1024\n"
+            "        r_f = r_f - 1024.0\n"
+            "    while r_f >= 1.0:\n"
+            "        row_int = row_int + 1\n"
+            "        r_f = r_f - 1.0\n"
+            "    idx = row_int * 3072 + col\n"
+            "    hidden[idx] = hidden[idx] + buf[idx]",
+        ),
+    ]
+    for old, new in patches:
+        if old not in functions:
+            raise ValueError("decode function has an unexpected shape")
+        functions = functions.replace(old, new, 1)
+    return functions
+
+
 def _function_source(source: str, names: Iterable[str]) -> str:
     lines = source.splitlines()
     tree = ast.parse(source)
@@ -178,26 +236,6 @@ def _function_source(source: str, names: Iterable[str]) -> str:
             raise ValueError("reference kernel is missing function: {0}".format(name))
         blocks.append("\n".join(lines[node.lineno - 1:node.end_lineno]))
     return "\n\n".join(blocks)
-
-
-def _use_integer_decode_residual_row(source: str) -> str:
-    old = """    row = cur_n_seq_arr[0] - 1.0
-    idx = row * 3072 + col
-    hidden[idx] = hidden[idx] + buf[idx]"""
-    new = """    row = cur_n_seq_arr[0] - 1.0
-    row_int = 0
-    r_f = row + 0.1
-    while r_f >= 1024.0:
-        row_int = row_int + 1024
-        r_f = r_f - 1024.0
-    while r_f >= 1.0:
-        row_int = row_int + 1
-        r_f = r_f - 1.0
-    idx = row_int * 3072 + col
-    hidden[idx] = hidden[idx] + buf[idx]"""
-    if old not in source:
-        raise ValueError("decode residual function has an unexpected shape")
-    return source.replace(old, new, 1)
 
 
 def _prefill_layer_blocks(source: str, layer_start: int, layer_end: int) -> str:

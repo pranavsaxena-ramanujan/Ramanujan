@@ -1,5 +1,7 @@
 package in.ramanujan.developer.console.operationImpl;
 
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import in.ramanujan.developer.console.Operation;
 import in.ramanujan.developer.console.model.pojo.CodeRunRequest;
 import in.ramanujan.developer.console.model.pojo.csv.CsvInformation;
@@ -30,6 +32,8 @@ import static in.ramanujan.developer.console.operationImpl.ExecutorImpl.createJs
  * Reads newline-delimited commands from stdin:
  *
  *   run <kernel.py> <csv1> <csv2> ...   — compile and execute a kernel
+ *   REGISTER_SHARDS <model-manifest.json> — register package program paths
+ *   CHANGE_SHARD <next-program.py>       — evict the previous shard after dumps
  *   dump <name> [file]                  — dump array to stdout or file
  *   var  <name>                         — print scalar variable value
  *   arr  <name> <index>                 — print one array element
@@ -46,13 +50,26 @@ import static in.ramanujan.developer.console.operationImpl.ExecutorImpl.createJs
  */
 public class ExecuteInlineServer extends ExecuteInline {
 
-    // Compiled DAG cache — reused across calls for the same kernel file.
-    // The server is single-threaded (stdin loop), so no synchronisation needed.
-    private String               cachedKernelPath  = null;
-    private DagElement           cachedFirstDag    = null;
-    private List<DagElement>     cachedDagList     = null;
-    private Map<String, Variable> cachedVariableMap = null;
-    private Map<String, Array>    cachedArrayMap    = null;
+    private static final class CompiledProgram {
+        final DagElement firstDag;
+        final List<DagElement> dagList;
+        final Map<String, Variable> variableMap;
+        final Map<String, Array> arrayMap;
+
+        CompiledProgram(DagElement firstDag, List<DagElement> dagList,
+                        Map<String, Variable> variableMap, Map<String, Array> arrayMap) {
+            this.firstDag = firstDag;
+            this.dagList = dagList;
+            this.variableMap = variableMap;
+            this.arrayMap = arrayMap;
+        }
+    }
+
+    // Keyed by program path and input shapes; holds every registered shard program, else one entry.
+    private final Map<String, CompiledProgram> compiledPrograms = new HashMap<>();
+    private String nextShardKernel = null;
+    private boolean lastRunSucceeded = true;
+    private Set<Path> registeredShardPrograms = null;
 
     // Default set of array names always populated into the dump store.
     // Existing orchestrators that send no --dump flags rely on this list.
@@ -84,6 +101,39 @@ public class ExecuteInlineServer extends ExecuteInline {
                 break;
             }
 
+            if (line.startsWith("REGISTER_SHARDS ")) {
+                try {
+                    registeredShardPrograms = readShardPrograms(
+                            Paths.get(line.substring("REGISTER_SHARDS ".length()).trim()));
+                    compiledPrograms.clear();
+                    System.out.println("SHARDS_REGISTERED");
+                } catch (Exception e) {
+                    System.out.println("SHARD_ERROR: " + e.getMessage());
+                }
+                System.out.flush();
+                continue;
+            }
+
+            if (line.startsWith("CHANGE_SHARD ")) {
+                String nextKernel = line.substring("CHANGE_SHARD ".length()).trim();
+                try {
+                    Path nextProgram = Paths.get(nextKernel).toRealPath();
+                    if (!lastRunSucceeded || registeredShardPrograms == null
+                            || !registeredShardPrograms.contains(nextProgram)) {
+                        throw new IllegalStateException("restart worker or register the next program");
+                    }
+                    new in.ramanujan.rule.engine.NativeProcessor().changeShard();
+                    ExecutorImpl.setStores(null, null);
+                    ExecutorImpl.setBinaryArrayFileStore(null);
+                    nextShardKernel = nextProgram.toString();
+                    System.out.println("SHARD_READY");
+                } catch (Exception e) {
+                    System.out.println("SHARD_ERROR: " + e.getMessage());
+                }
+                System.out.flush();
+                continue;
+            }
+
             if (line.startsWith("run ")) {
                 // Parse: run <kernel.py> <csv1> ... [--dump name1 name2 ...]
                 // Everything after --dump is a set of array names the client wants populated.
@@ -98,7 +148,18 @@ public class ExecuteInlineServer extends ExecuteInline {
                     else        kernelArgs.add(parts[i]);
                 }
                 try {
+                    if (registeredShardPrograms != null && !registeredShardPrograms.contains(
+                            Paths.get(kernelArgs.get(0)).toRealPath())) {
+                        throw new IllegalArgumentException("program is not in the registered package");
+                    }
+                    if (nextShardKernel != null && !nextShardKernel.equals(
+                            Paths.get(kernelArgs.get(0)).toRealPath().toString())) {
+                        throw new IllegalArgumentException("expected shard program " + nextShardKernel);
+                    }
+                    lastRunSucceeded = false;
                     runKernel(kernelArgs, dumpTargets);
+                    lastRunSucceeded = true;
+                    nextShardKernel = null;
                     System.out.println("KERNEL_DONE");
                 } catch (Exception e) {
                     System.out.println("KERNEL_ERROR: " + e.getMessage());
@@ -111,6 +172,52 @@ public class ExecuteInlineServer extends ExecuteInline {
             handleQueryCommand(line);
             System.out.flush();
         }
+    }
+
+    Set<Path> readShardPrograms(Path manifestPath) throws IOException {
+        Path root = manifestPath.toRealPath().getParent();
+        JsonNode shards = new ObjectMapper().readTree(manifestPath.toFile()).path("shards");
+        if (!shards.isArray() || shards.size() == 0) {
+            throw new IOException("package has no shards");
+        }
+        Set<Path> programs = new HashSet<>();
+        for (JsonNode shard : shards) {
+            String relativePath = shard.path("manifestPath").asText();
+            if (relativePath.isEmpty()) {
+                throw new IOException("shard has no manifestPath");
+            }
+            Path shardManifest = root.resolve(relativePath).toRealPath();
+            if (!shardManifest.startsWith(root) || !Files.isRegularFile(shardManifest)) {
+                throw new IOException("invalid shard manifest: " + relativePath);
+            }
+            for (String entrypoint : Arrays.asList("prefill", "decode")) {
+                Path program = shardManifest.getParent().resolve("programs")
+                        .resolve(entrypoint + ".py").toRealPath();
+                if (!program.startsWith(root) || !Files.isRegularFile(program)) {
+                    throw new IOException("invalid shard program: " + program);
+                }
+                programs.add(program);
+            }
+        }
+        return programs;
+    }
+
+    static String inputShapeKey(List<CsvInformation> csvList) {
+        List<String> shapes = new ArrayList<>();
+        for (CsvInformation csv : csvList) {
+            String data = csv.getData() == null ? "" : csv.getData();
+            int lineEnd = data.indexOf('\n');
+            String firstLine = lineEnd < 0 ? data : data.substring(0, lineEnd);
+            int columns = firstLine.isEmpty() ? 0 : firstLine.split(",", -1).length;
+            int rows = 0;
+            for (int i = 0; i < data.length(); i++) {
+                if (data.charAt(i) == '\n') rows++;
+            }
+            if (!data.isEmpty() && !data.endsWith("\n")) rows++;
+            shapes.add(Paths.get(csv.getFileName()).getFileName() + ":" + rows + "x" + columns);
+        }
+        Collections.sort(shapes);
+        return String.join(",", shapes);
     }
 
     // -------------------------------------------------------------------------
@@ -133,12 +240,13 @@ public class ExecuteInlineServer extends ExecuteInline {
         DagElement            firstDag;
         List<DagElement>      dagList;
 
-        boolean cacheHit = kernelPath.equals(cachedKernelPath) && cachedFirstDag != null;
-        if (cacheHit) {
-            variableMap = cachedVariableMap;
-            arrayMap    = cachedArrayMap;
-            firstDag    = cachedFirstDag;
-            dagList     = cachedDagList;
+        String programKey = kernelPath + "|" + inputShapeKey(csvList);
+        CompiledProgram compiled = compiledPrograms.get(programKey);
+        if (compiled != null) {
+            variableMap = compiled.variableMap;
+            arrayMap    = compiled.arrayMap;
+            firstDag    = compiled.firstDag;
+            dagList     = compiled.dagList;
 
             // Clear mutable state so re-population starts clean
             for (Array a : arrayMap.values()) {
@@ -191,11 +299,11 @@ public class ExecuteInlineServer extends ExecuteInline {
             System.err.println("[Server] compiled in " + (System.currentTimeMillis() - t0)
                     + "ms  DAG=" + (dagList.size() + 1));
 
-            cachedKernelPath  = kernelPath;
-            cachedFirstDag    = firstDag;
-            cachedDagList     = dagList;
-            cachedVariableMap = variableMap;
-            cachedArrayMap    = arrayMap;
+            if (registeredShardPrograms == null) {
+                compiledPrograms.clear();
+            }
+            compiledPrograms.put(programKey,
+                    new CompiledProgram(firstDag, dagList, variableMap, arrayMap));
         }
 
         long execStart = System.currentTimeMillis();

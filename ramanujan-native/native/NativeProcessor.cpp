@@ -4,6 +4,12 @@
 
 #include "in_ramanujan_rule_engine_NativeProcessor.h"
 #include "rule_engine_input.pb.h"
+#include "ruleEngineObject/dataContainer/array/ArrayValue.h"
+
+extern "C" JNIEXPORT void JNICALL Java_in_ramanujan_rule_engine_NativeProcessor_changeShard
+        (JNIEnv *, jobject) {
+    ArrayValue::clearBinaryCache();
+}
 
 JNIEXPORT jobject JNICALL Java_in_ramanujan_rule_engine_NativeProcessor_process
         (JNIEnv *env, jobject obj, jbyteArray ruleEngineInputProtoBytes, jstring firstCommandIdStr) {

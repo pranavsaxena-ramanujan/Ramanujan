@@ -19,7 +19,9 @@ GIB = 1024 ** 3
 
 
 class MemoryLimitExceeded(RuntimeError):
-    pass
+    def __init__(self, label, rss, limit):
+        self.label = label
+        super().__init__("{0} RSS {1} exceeded limit {2}".format(label, rss, limit))
 
 
 class RssMonitor:
@@ -33,6 +35,11 @@ class RssMonitor:
 
     def add(self, label, pid):
         self._pids[label] = pid
+
+    def remove(self, label):
+        self._pids.pop(label, None)
+        if self.failure is not None and self.failure.label == label:
+            self.failure = None
 
     def start(self):
         self._thread.start()
@@ -50,18 +57,14 @@ class RssMonitor:
             for label, pid in list(self._pids.items()):
                 rss = _rss_bytes(pid)
                 self.peak_bytes[label] = max(self.peak_bytes.get(label, 0), rss)
-                if rss > self.limit_bytes:
-                    self.failure = MemoryLimitExceeded(
-                        "{0} RSS {1} exceeded limit {2}".format(
-                            label, rss, self.limit_bytes
-                        )
-                    )
-                    try:
-                        os.kill(pid, 9)
-                    except ProcessLookupError:
-                        pass
-                    self._stop.set()
-                    return
+                if rss > self.limit_bytes and self.failure is None:
+                    self.failure = MemoryLimitExceeded(label, rss, self.limit_bytes)
+                    if label == "ramanujan-jvm":
+                        try:
+                            os.kill(pid, 9)
+                        except ProcessLookupError:
+                            pass
+                    break
 
 
 def _rss_bytes(pid):
@@ -77,19 +80,21 @@ def _rss_bytes(pid):
 
 
 class RamanujanServer:
-    def __init__(self, java, jar, native_dir, workspace, monitor, diagnostics=False):
+    def __init__(self, java, jar, native_dir, workspace, monitor, diagnostics=False,
+                 package_manifest=None):
         self.java = java
         self.jar = jar
         self.native_dir = native_dir
         self.workspace = workspace
         self.monitor = monitor
         self.diagnostics = diagnostics
+        self.package_manifest = package_manifest
         self.process = None
         self.stderr_tail = collections.deque(maxlen=80)
 
     def start(self):
         self.workspace.mkdir(parents=True, exist_ok=True)
-        native_library = self.native_dir / "libnative.dylib"
+        native_library = self.native_dir / "libnative_llm.dylib"
         if not native_library.is_file():
             raise FileNotFoundError("native library not found: {0}".format(native_library))
         shutil.copy2(native_library, self.workspace / native_library.name)
@@ -101,6 +106,7 @@ class RamanujanServer:
             str(self.java),
             "-Xmx6g",
             "-XX:+UseG1GC",
+            "-Dramanujan.nativeLibrary=native_llm",
             "-Djava.library.path=" + str(self.native_dir),
             "-jar",
             str(self.jar),
@@ -118,12 +124,21 @@ class RamanujanServer:
         self.monitor.add("ramanujan-jvm", self.process.pid)
         threading.Thread(target=self._drain_stderr, daemon=True).start()
         self._wait_for("SERVER_READY", 90)
+        if self.package_manifest is not None:
+            self.process.stdin.write("REGISTER_SHARDS {0}\n".format(self.package_manifest))
+            self.process.stdin.flush()
+            self._wait_for("SHARDS_REGISTERED", 30)
 
     def run(self, kernel, csv_paths, timeout):
         command = "run " + " ".join([str(kernel)] + [str(path) for path in csv_paths])
         self.process.stdin.write(command + "\n")
         self.process.stdin.flush()
         self._wait_for("KERNEL_DONE", timeout)
+
+    def change_shard(self, kernel, timeout):
+        self.process.stdin.write("CHANGE_SHARD {0}\n".format(kernel))
+        self.process.stdin.flush()
+        self._wait_for("SHARD_READY", timeout)
 
     def dump(self, name, path, timeout=180):
         self.process.stdin.write("dump {0} {1}\n".format(name, path))
@@ -141,6 +156,8 @@ class RamanujanServer:
             except Exception:
                 self.process.kill()
                 self.process.wait(timeout=15)
+        self.monitor.remove("ramanujan-jvm")
+        self.process = None
 
     def _wait_for(self, expected, timeout, prefix=False):
         deadline = time.time() + timeout
@@ -156,7 +173,8 @@ class RamanujanServer:
             if not ready:
                 continue
             line = self.process.stdout.readline().rstrip()
-            if line.startswith("KERNEL_ERROR"):
+            if (line.startswith("KERNEL_ERROR") or line.startswith("SHARD_ERROR")
+                    or line.startswith("Unknown command")):
                 raise RuntimeError(line + "\n" + "".join(self.stderr_tail))
             if (prefix and line.startswith(expected)) or line == expected:
                 return
@@ -210,14 +228,37 @@ def _cache_names(shard_dir):
     ]
 
 
-def _bind_shard_inputs(shard_dir, run_dir, hidden_bin, sequence_length,
+def _link_state(source, destination):
+    # Native decides mutability from the resolved file name, so a symlink would expose the target's name.
+    try:
+        os.link(source, destination)
+    except OSError:
+        shutil.copyfile(source, destination)
+
+
+def _bind_shard_weights(shard_dir, binding_dir):
+    binding_dir.mkdir(parents=True)
+    csv_paths = []
+    for source in sorted((shard_dir / "weights").glob("*.bin")):
+        if source.name == "embed_tokens.bin":
+            continue
+        name = source.stem
+        (binding_dir / source.name).symlink_to(source)
+        csv_path = binding_dir / (name + ".csv")
+        _write_csv(csv_path, _columns_for_weight(name, source.stat().st_size // 4))
+        _mark_csv_older_than_binary(csv_path, source)
+        csv_paths.append(csv_path)
+    return csv_paths
+
+
+def _bind_shard_inputs(weight_csvs, run_dir, hidden_bin, sequence_length,
                        hidden_name="hidden", cache_bins=None):
     input_dir = run_dir / "inputs"
     input_dir.mkdir(parents=True)
     csv_paths = []
 
     hidden_link = input_dir / (hidden_name + ".bin")
-    hidden_link.symlink_to(hidden_bin)
+    _link_state(hidden_bin, hidden_link)
     hidden_csv = input_dir / (hidden_name + ".csv")
     _write_csv(hidden_csv, 3072)
     _mark_csv_older_than_binary(hidden_csv, hidden_bin)
@@ -231,23 +272,12 @@ def _bind_shard_inputs(shard_dir, run_dir, hidden_bin, sequence_length,
 
     for name, source in sorted((cache_bins or {}).items()):
         destination = input_dir / (name + ".bin")
-        destination.symlink_to(source)
+        _link_state(source, destination)
         csv_path = input_dir / (name + ".csv")
         _write_csv(csv_path, 3072)
         _mark_csv_older_than_binary(csv_path, source)
         csv_paths.append(csv_path)
-
-    for source in sorted((shard_dir / "weights").glob("*.bin")):
-        if source.name == "embed_tokens.bin":
-            continue
-        name = source.stem
-        destination = input_dir / source.name
-        destination.symlink_to(source)
-        csv_path = input_dir / (name + ".csv")
-        _write_csv(csv_path, _columns_for_weight(name, source.stat().st_size // 4))
-        _mark_csv_older_than_binary(csv_path, source)
-        csv_paths.append(csv_path)
-    return csv_paths
+    return csv_paths + weight_csvs
 
 
 def _dump_caches(server, shard_dir, state_dir):
@@ -260,9 +290,39 @@ def _dump_caches(server, shard_dir, state_dir):
     return cache_bins
 
 
-def _write_token_embedding(path, embeddings, token_id, position):
-    with path.open("wb") as stream:
-        stream.truncate(1024 * 3072 * 4)
+def _execute_shard(server, kernel, csv_paths, shard_dir, run_dir, state_dir,
+                   timeout, diagnostics=False, token_csv=None, reuse_worker=False):
+    for attempt in range(2):
+        completed = False
+        try:
+            if reuse_worker and server.process is not None:
+                server.change_shard(kernel, timeout)
+            else:
+                server.start()
+            server.run(kernel, csv_paths, timeout)
+            hidden_csv = run_dir / "h_state-output.csv"
+            server.dump("h_state", hidden_csv)
+            caches = _dump_caches(server, shard_dir, state_dir)
+            if diagnostics:
+                server.dump("h_attn_buf", run_dir / "h_attn_buf.csv")
+                server.dump("h_out_buf", run_dir / "h_out_buf.csv")
+            if token_csv is not None:
+                server.dump("argmax_arr", token_csv)
+            server.monitor.check()
+            completed = True
+            return hidden_csv.with_suffix(".bin"), caches
+        except MemoryLimitExceeded as exc:
+            if exc.label != "ramanujan-jvm" or attempt == 1:
+                raise
+            print(json.dumps({"event": "worker-restart", "shard": shard_dir.name,
+                              "reason": "rss-limit"}), flush=True)
+        finally:
+            if not reuse_worker or not completed:
+                server.close()
+
+
+def _write_token_embedding(path, previous_hidden, embeddings, token_id, position):
+    shutil.copyfile(previous_hidden, path)
     hidden = np.memmap(path, dtype="<f4", mode="r+", shape=(1024, 3072))
     hidden[position] = embeddings[token_id]
     hidden.flush()
@@ -338,6 +398,8 @@ def run_inference(args):
     shards = manifest["shards"]
     if len(shards) != 4:
         raise ValueError("expected four shards")
+    # Diagnostic programs live outside the registered package, so they need per-shard workers.
+    reuse_worker = not (args.worker_per_shard or args.diagnostics)
 
     tokenizer = AutoTokenizer.from_pretrained(
         str(model_dir), trust_remote_code=True, local_files_only=True
@@ -365,9 +427,15 @@ def run_inference(args):
             work_dir / "rj-workspace",
             monitor,
             diagnostics=args.diagnostics,
+            package_manifest=package_dir / "model-manifest.json" if reuse_worker else None,
         )
-        server.start()
-
+        weight_csvs = {
+            shard_summary["shardId"]: _bind_shard_weights(
+                (package_dir / shard_summary["manifestPath"]).parent,
+                work_dir / "weights" / shard_summary["shardId"],
+            )
+            for shard_summary in shards
+        }
         shard_timings = []
         cache_bins = {}
         for index, shard_summary in enumerate(shards):
@@ -375,16 +443,18 @@ def run_inference(args):
             shard_dir = (package_dir / shard_summary["manifestPath"]).parent
             shard_run_dir = work_dir / shard_summary["shardId"]
             csv_paths = _bind_shard_inputs(
-                shard_dir, shard_run_dir, hidden_bin, len(token_ids)
+                weight_csvs[shard_summary["shardId"]], shard_run_dir, hidden_bin, len(token_ids)
             )
             before = time.time()
-            server.run(shard_dir / "programs" / "prefill.py", csv_paths, args.timeout)
-            next_hidden_csv = shard_run_dir / "h_state.csv"
-            server.dump("h_state", next_hidden_csv)
-            hidden_bin = next_hidden_csv.with_suffix(".bin")
-            cache_bins.update(_dump_caches(
-                server, shard_dir, work_dir / "state-prefill" / shard_summary["shardId"]
-            ))
+            hidden_bin, shard_caches = _execute_shard(
+                server, shard_dir / "programs" / "prefill.py", csv_paths,
+                shard_dir, shard_run_dir,
+                work_dir / "state-prefill" / shard_summary["shardId"],
+                args.timeout,
+                token_csv=work_dir / "next-token.csv" if index == len(shards) - 1 else None,
+                reuse_worker=reuse_worker,
+            )
+            cache_bins.update(shard_caches)
             if args.diagnostics:
                 cache_norms = [
                     _row_norm(cache_bins[name], len(token_ids) - 1)
@@ -412,7 +482,6 @@ def run_inference(args):
             )
 
         token_csv = work_dir / "next-token.csv"
-        server.dump("argmax_arr", token_csv)
         token_values = np.fromfile(token_csv.with_suffix(".bin"), dtype="<f4")
         if token_values.size == 0:
             raise RuntimeError("argmax_arr was empty")
@@ -424,11 +493,11 @@ def run_inference(args):
             if position >= 1024:
                 raise ValueError("prompt plus generated tokens exceeds 1024")
             decode_hidden = work_dir / "decode-{0:02d}-hidden.bin".format(len(generated_tokens))
-            _write_token_embedding(decode_hidden, embeddings, generated_tokens[-1], position)
+            _write_token_embedding(decode_hidden, hidden_bin, embeddings, generated_tokens[-1], position)
             hidden_bin = decode_hidden
             step_started = time.time()
             next_cache_bins = {}
-            for shard_summary in shards:
+            for index, shard_summary in enumerate(shards):
                 monitor.check()
                 shard_dir = (package_dir / shard_summary["manifestPath"]).parent
                 shard_run_dir = work_dir / "decode-{0:02d}".format(len(generated_tokens)) / shard_summary["shardId"]
@@ -436,7 +505,7 @@ def run_inference(args):
                     name: cache_bins[name] for name in _cache_names(shard_dir)
                 }
                 csv_paths = _bind_shard_inputs(
-                    shard_dir,
+                    weight_csvs[shard_summary["shardId"]],
                     shard_run_dir,
                     hidden_bin,
                     position + 1,
@@ -450,18 +519,18 @@ def run_inference(args):
                     decode_kernel = _diagnostic_decode_kernel(
                         decode_kernel, shard_run_dir / "decode-diagnostic.py"
                     )
-                server.run(decode_kernel, csv_paths, args.timeout)
-                next_hidden_csv = shard_run_dir / "h_state-output.csv"
-                server.dump("h_state", next_hidden_csv)
-                hidden_bin = next_hidden_csv.with_suffix(".bin")
-                next_cache_bins.update(_dump_caches(
-                    server, shard_dir, shard_run_dir / "state"
-                ))
+                token_csv = (work_dir / "next-token-{0:02d}.csv".format(len(generated_tokens))
+                             if index == len(shards) - 1 else None)
+                hidden_bin, dumped_caches = _execute_shard(
+                    server, decode_kernel, csv_paths, shard_dir, shard_run_dir,
+                    shard_run_dir / "state", args.timeout,
+                    diagnostics=args.diagnostics, token_csv=token_csv,
+                    reuse_worker=reuse_worker,
+                )
+                next_cache_bins.update(dumped_caches)
                 if args.diagnostics:
                     attention_csv = shard_run_dir / "h_attn_buf.csv"
                     output_csv = shard_run_dir / "h_out_buf.csv"
-                    server.dump("h_attn_buf", attention_csv)
-                    server.dump("h_out_buf", output_csv)
                     hidden_delta = _row_delta(input_hidden_path, hidden_bin, position)
                     cache_checks = {
                         name: _cache_continuity(
@@ -499,7 +568,6 @@ def run_inference(args):
                     }, sort_keys=True), flush=True)
             cache_bins = next_cache_bins
             token_csv = work_dir / "next-token-{0:02d}.csv".format(len(generated_tokens))
-            server.dump("argmax_arr", token_csv)
             token_values = np.fromfile(token_csv.with_suffix(".bin"), dtype="<f4")
             if token_values.size == 0:
                 raise RuntimeError("argmax_arr was empty during decode")
@@ -548,9 +616,11 @@ def parse_args():
         "--jar", type=Path, default=Path.home() / "Desktop/ws/developer-console-1.0-SNAPSHOT-fat.jar"
     )
     parser.add_argument("--native-dir", type=Path, default=Path.home() / "Desktop/ws")
-    parser.add_argument("--max-rss-gb", type=float, default=8.0)
+    parser.add_argument("--max-rss-gb", type=float, default=7.0)
     parser.add_argument("--n-tokens", type=int, default=1)
     parser.add_argument("--diagnostics", action="store_true")
+    parser.add_argument("--worker-per-shard", action="store_true",
+                        help="start a fresh JVM for every shard run instead of one worker")
     parser.add_argument("--timeout", type=int, default=1800)
     return parser.parse_args()
 

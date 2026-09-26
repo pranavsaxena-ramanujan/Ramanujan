@@ -18,7 +18,27 @@
 
 // Global cache: binaryFilePath -> {float* data, int count}
 static std::mutex                                              s_binaryMutex;
-static std::unordered_map<std::string, std::pair<float*, int>> s_binaryCache;
+struct CachedBinary {
+    float* data;
+    int count;
+    size_t bytes;
+    bool mapped;
+};
+static std::unordered_map<std::string, CachedBinary> s_binaryCache;
+
+void ArrayValue::clearBinaryCache() {
+    std::lock_guard<std::mutex> lock(s_binaryMutex);
+    for (const auto& entry : s_binaryCache) {
+#ifndef _WIN32
+        if (entry.second.mapped) {
+            munmap(entry.second.data, entry.second.bytes);
+            continue;
+        }
+#endif
+        ALIGNED_FREE(entry.second.data);
+    }
+    s_binaryCache.clear();
+}
 
 static bool isMutableRuntimeBinary(const std::string& path) {
     const size_t slash = path.find_last_of("/\\");
@@ -57,14 +77,26 @@ ArrayValue::ArrayValue(Array* array , std::string originalArrayId) {
         // Check cache first (avoids re-reading disk on every kernel call)
         std::string key = array->binaryFile;
         const bool cacheable = !isMutableRuntimeBinary(key);
+    #ifndef _WIN32
+        if (cacheable) {
+            char* resolved = realpath(key.c_str(), nullptr);
+            if (resolved != nullptr) {
+            key = resolved;
+            free(resolved);
+            }
+        }
+    #endif
         float* fdata = nullptr;
         int fcount = 0;
+        size_t allocatedBytes = (size_t)totalSize * sizeof(float);
+        if (allocatedBytes == 0) allocatedBytes = sizeof(float);
+        bool mapped = false;
         if (cacheable) {
             std::lock_guard<std::mutex> lk(s_binaryMutex);
             auto it = s_binaryCache.find(key);
             if (it != s_binaryCache.end()) {
-                fdata  = it->second.first;
-                fcount = it->second.second;
+            fdata  = it->second.data;
+            fcount = it->second.count;
             }
         }
         if (!fdata) {
@@ -94,21 +126,21 @@ ArrayValue::ArrayValue(Array* array , std::string originalArrayId) {
                 fcount = (int)(fileSize / sizeof(float));
                 if (fcount > totalSize) fcount = totalSize;
 
-                size_t mapSize = totalSize * sizeof(float);
-                if (mapSize == 0) mapSize = sizeof(float);
+                size_t mapSize = allocatedBytes;
 
                 if (cacheable) {
                     // Two-step mmap: anonymous region covers the full totalSize (tail past
                     // fcount is demand-zeroed, avoiding SIGBUS on a short file); MAP_FIXED
                     // overlays the immutable file data.
-                    void* mapped = mmap(nullptr, mapSize, PROT_READ | PROT_WRITE,
+                    void* mapping = mmap(nullptr, mapSize, PROT_READ | PROT_WRITE,
                                         MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-                    if (mapped != MAP_FAILED) {
+                    if (mapping != MAP_FAILED) {
                         if (fcount > 0) {
-                            mmap(mapped, (size_t)fcount * sizeof(float), PROT_READ,
+                            mmap(mapping, (size_t)fcount * sizeof(float), PROT_READ,
                                  MAP_PRIVATE | MAP_FIXED, fd, 0);
                         }
-                        fdata = static_cast<float*>(mapped);
+                        fdata = static_cast<float*>(mapping);
+                        mapped = true;
                     }
                 } else if (ALIGNED_ALLOC(&fdata, 4096, mapSize) == 0 && fdata != nullptr) {
                     memset(fdata, 0, mapSize);
@@ -138,7 +170,7 @@ ArrayValue::ArrayValue(Array* array , std::string originalArrayId) {
             }
             if (fdata && cacheable) {
                 std::lock_guard<std::mutex> lk(s_binaryMutex);
-                s_binaryCache[key] = {fdata, fcount};
+                s_binaryCache[key] = {fdata, fcount, allocatedBytes, mapped};
             }
         }
         val = fdata;

@@ -38,6 +38,7 @@ CMakeFiles/
 
 *.DS_Store
 *.json
+!ramanujan-native/native/CMakePresets.json
 */cmake.check_cache*
 
 # Ignore native libraries

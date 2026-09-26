@@ -14,12 +14,14 @@ import java.io.IOException;
 public class NativeProcessor {
     public native void process(byte[] ruleEngineInputProto, String firstCommandId);
 
+    public native void changeShard();
+
     public HashMap jniObject;
     public ArrayList debugPoints;
 
     static {
         try {
-            NativeLibraryLoader.load("native");
+            NativeLibraryLoader.load(System.getProperty("ramanujan.nativeLibrary", "native"));
         } catch (IOException e) {
             throw new RuntimeException("Failed to load native library", e);
         }
