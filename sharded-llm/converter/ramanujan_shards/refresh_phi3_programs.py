@@ -16,6 +16,10 @@ def refresh_phi3_programs(package_dir: Path, reference_kernel: Path):
 
     refreshed = []
     shards = package_manifest["shards"]
+    ranges = []
+    for shard_summary in shards:
+        metadata = _read_json(package_dir / shard_summary["manifestPath"])["adapterMetadata"]
+        ranges.append((int(metadata["layer_start"]), int(metadata["layer_end"])))
     for shard_index, shard_summary in enumerate(shards):
         manifest_path = package_dir / shard_summary["manifestPath"]
         shard_dir = manifest_path.parent
@@ -36,6 +40,11 @@ def refresh_phi3_programs(package_dir: Path, reference_kernel: Path):
                 reference_kernel, layer_start, layer_end, include_output, resident_kv=True
             ),
         }
+        if shard_index == 0:
+            programs["programs/decode_fused.py"] = generate_phi3_decode_kernel(
+                reference_kernel, ranges[0][0], ranges[-1][1], True,
+                resident_kv=True, shard_ranges=ranges,
+            )
         for relative_path, source in programs.items():
             path = shard_dir / relative_path
             path.write_text(source, encoding="utf-8")

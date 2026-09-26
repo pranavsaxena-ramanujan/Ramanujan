@@ -97,7 +97,17 @@ def generate_phi3_prefill_kernel(reference_kernel: Path, layer_start: int,
 
 def generate_phi3_decode_kernel(reference_kernel: Path, layer_start: int,
                                 layer_end: int, include_output: bool,
-                                resident_kv: bool = False) -> str:
+                                resident_kv: bool = False,
+                                shard_ranges=None) -> str:
+    if shard_ranges is not None:
+        valid_ranges = (bool(shard_ranges) and resident_kv and include_output
+                        and shard_ranges[0][0] == layer_start
+                        and shard_ranges[-1][1] == layer_end
+                        and all(start < end for start, end in shard_ranges)
+                        and all(left[1] == right[0] for left, right
+                                in zip(shard_ranges, shard_ranges[1:])))
+        if not valid_ranges:
+            raise ValueError("fused decode requires contiguous resident shards and output")
     source = reference_kernel.read_text(encoding="utf-8")
     functions = _function_source(source, [
         "matmul_4bit_decode_GPU_1",
@@ -167,6 +177,28 @@ def generate_phi3_decode_kernel(reference_kernel: Path, layer_start: int,
     syncs = ["GPU_SYNC({0})".format(name) for name in ["h_state"] + cache_names
              + (["argmax_arr"] if include_output else [])]
     releases = ["RELEASE_MEM({0})".format(name) for name in weight_names + shared_buffers + cache_names]
+    if shard_ranges is not None:
+        output_weights = ["ln_f_g", "lm_head_1", "lm_head_2"]
+        loads = ["LOAD_MEM({0})".format(name) for name in shared_buffers
+                 if name not in output_weights]
+        staged = []
+        for start, end in shard_ranges:
+            names = ([name for layer in range(start, end) for name in _layer_weight_names(layer)]
+                     + [name for layer in range(start, end)
+                        for name in ("l{0}_k_cache".format(layer), "l{0}_v_cache".format(layer))])
+            block = _decode_layer_blocks(source, start, end)
+            if resident_kv:
+                block = _fuse_decode_residuals(block)
+            staged.extend(["\n".join("LOAD_MEM({0})".format(name) for name in names),
+                           block,
+                           "\n".join("GPU_SYNC({0})".format(name) for name in names
+                                     if name.endswith("_cache")),
+                           "\n".join("RELEASE_MEM({0})".format(name) for name in names)])
+        layer_blocks = "\n\n".join(staged)
+        output_lines = (["LOAD_MEM({0})".format(name) for name in output_weights]
+                        + output_lines)
+        syncs = ["GPU_SYNC(h_state)", "GPU_SYNC(argmax_arr)"]
+        releases = ["RELEASE_MEM({0})".format(name) for name in shared_buffers]
     generated = "\n\n".join([
         "# Generated Phi-3 Ramanujan decode shard. Do not edit.",
         "\n".join(declarations), functions, "\n".join(loads), layer_blocks,

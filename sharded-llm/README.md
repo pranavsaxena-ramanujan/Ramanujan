@@ -127,7 +127,26 @@ enforced only while running inference.
 ```bash
 python3 sharded-llm/run_phi3_shards.py "What is 2 + 2?" --n-tokens 10
 python3 sharded-llm/run_phi3_shards.py "What is 2 + 2?" --n-tokens 10 --resident-kv --profile
+python3 sharded-llm/run_phi3_shards.py "What is 2 + 2?" --n-tokens 10 --resident-kv --native-loop --profile
 ```
+
+`--native-loop` runs all four decode ranges through one generated native program
+per token, staging one shard's GPU weights at a time and keeping hidden state
+on the GPU across shard boundaries. Prefill remains four separate runs. It
+requires `--resident-kv` and a refreshed package with `decode_fused.py`; the
+existing `refresh_phi3_programs` command below generates and checksums it.
+`--gpu-pool` is an independent opt-in (also requires `--resident-kv`) that
+reuses up to 768 MiB of idle, same-size OpenCL buffers with a fresh upload on
+each use. Both flags require rebuilding the worker JAR and native library.
+The fused mode still prepares inputs and serializes one program through Java
+per token; it is not a zero-IPC C++ loop or a guaranteed single JNI call.
+Neither mode checkpoints KV after decode, so worker failure stops generation.
+In one local five-token comparison, fused decode without the pool took 1.22-1.37
+seconds for the last three decode steps; the four-call resident path took 1.76
+seconds for its second decode step in a separate three-token run. With the pool
+enabled, a later ten-token run slowed to 2.69-3.60 seconds per step. These are
+single-run observations, not a 5+ tokens/second result; keep pooling off unless
+profiling shows a benefit on the target device.
 
 `--resident-kv` is an opt-in sequential-shard mode. Prefill checkpoints each
 shard's cache once; subsequent decode calls keep all four shards' K/V arrays in

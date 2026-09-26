@@ -81,7 +81,7 @@ def _rss_bytes(pid):
 
 class RamanujanServer:
     def __init__(self, java, jar, native_dir, workspace, monitor, diagnostics=False,
-                 package_manifest=None, resident_kv=False, profile=False):
+                 package_manifest=None, resident_kv=False, profile=False, gpu_pool=False):
         self.java = java
         self.jar = jar
         self.native_dir = native_dir
@@ -91,6 +91,7 @@ class RamanujanServer:
         self.package_manifest = package_manifest
         self.resident_kv = resident_kv
         self.profile = profile
+        self.gpu_pool = gpu_pool
         self.process = None
         self.stderr_tail = collections.deque(maxlen=80)
 
@@ -105,6 +106,7 @@ class RamanujanServer:
         env["RAMANUJAN_SEQUENTIAL"] = "true"
         env["RAMANUJAN_MAX_PARALLELISM"] = "1"
         env["RAMANUJAN_RESIDENT_KV"] = "true" if self.resident_kv else "false"
+        env["RAMANUJAN_GPU_POOL"] = "true" if self.gpu_pool else "false"
         command = [
             str(self.java),
             "-Xmx6g",
@@ -424,11 +426,17 @@ def run_inference(args):
         raise ValueError("expected four shards")
     if args.resident_kv and (args.worker_per_shard or args.diagnostics):
         raise ValueError("resident KV requires the persistent worker without diagnostics")
+    if args.gpu_pool and not args.resident_kv:
+        raise ValueError("GPU pool requires resident KV mode")
+    if args.native_loop and not args.resident_kv:
+        raise ValueError("native loop requires resident KV mode")
     if args.resident_kv:
         for shard_summary in shards:
             shard_dir = (package_dir / shard_summary["manifestPath"]).parent
             if not (shard_dir / "programs" / "decode_resident.py").is_file():
                 raise ValueError("refresh the shard programs before enabling resident KV")
+    if args.native_loop and not (package_dir / "shard-00/programs/decode_fused.py").is_file():
+        raise ValueError("refresh the shard programs before enabling the native loop")
     # Diagnostic programs live outside the registered package, so they need per-shard workers.
     reuse_worker = not (args.worker_per_shard or args.diagnostics)
 
@@ -461,6 +469,7 @@ def run_inference(args):
             package_manifest=package_dir / "model-manifest.json" if reuse_worker else None,
             resident_kv=args.resident_kv,
             profile=args.profile,
+            gpu_pool=args.gpu_pool,
         )
         weight_csvs = {
             shard_summary["shardId"]: _bind_shard_weights(
@@ -469,6 +478,10 @@ def run_inference(args):
             )
             for shard_summary in shards
         }
+        fused_weight_csvs = []
+        if args.native_loop:
+            fused_weight_csvs = list({path.stem: path for shard_summary in shards
+                                      for path in weight_csvs[shard_summary["shardId"]]}.values())
         shard_timings = []
         cache_bins = {}
         for index, shard_summary in enumerate(shards):
@@ -532,6 +545,34 @@ def run_inference(args):
             hidden_bin = decode_hidden
             step_started = time.time()
             next_cache_bins = cache_bins.copy() if args.resident_kv else {}
+            if args.native_loop:
+                fused_dir = work_dir / "decode-{0:02d}".format(len(generated_tokens)) / "fused"
+                csv_paths = _bind_shard_inputs(
+                    fused_weight_csvs, fused_dir, hidden_bin, position + 1,
+                    hidden_name="h_state", cache_bins=cache_bins,
+                )
+                hidden_bin, _ = _execute_shard(
+                    server, package_dir / "shard-00/programs/decode_fused.py",
+                    csv_paths, package_dir / "shard-00", fused_dir, fused_dir / "state",
+                    args.timeout, token_csv=work_dir / "next-token-{0:02d}.csv".format(len(generated_tokens)),
+                    reuse_worker=True, resident_kv=True, allow_retry=False,
+                    profile=args.profile,
+                )
+                monitor.check()
+                token_csv = work_dir / "next-token-{0:02d}.csv".format(len(generated_tokens))
+                token_values = np.fromfile(token_csv.with_suffix(".bin"), dtype="<f4")
+                if token_values.size == 0:
+                    raise RuntimeError("argmax_arr was empty during decode")
+                generated_tokens.append(int(token_values[0]))
+                decode_timings.append(time.time() - step_started)
+                print(json.dumps({
+                    "event": "token-complete", "tokenIndex": len(generated_tokens) - 1,
+                    "tokenId": generated_tokens[-1],
+                    "token": tokenizer.decode([generated_tokens[-1]]),
+                    "seconds": round(decode_timings[-1], 3),
+                    "jvmPeakRssBytes": monitor.peak_bytes.get("ramanujan-jvm", 0),
+                }, sort_keys=True), flush=True)
+                continue
             for index, shard_summary in enumerate(shards):
                 monitor.check()
                 shard_dir = (package_dir / shard_summary["manifestPath"]).parent
@@ -663,6 +704,10 @@ def parse_args():
                         help="start a fresh JVM for every shard run instead of one worker")
     parser.add_argument("--resident-kv", action="store_true",
                         help="keep KV buffers in native memory across decode; disable retry after prefill")
+    parser.add_argument("--gpu-pool", action="store_true",
+                        help="reuse bounded OpenCL buffers between shards (requires --resident-kv)")
+    parser.add_argument("--native-loop", action="store_true",
+                        help="decode all four shards in one worker run (requires --resident-kv)")
     parser.add_argument("--profile", action="store_true",
                         help="print per-shard run and result transfer timings")
     parser.add_argument("--timeout", type=int, default=1800)

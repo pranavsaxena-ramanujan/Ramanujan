@@ -47,6 +47,31 @@ class Phi3EmitterTest(unittest.TestCase):
         self.assertIn("RETURN(h_state)", source)
         self.assertNotIn("RETURN(h_state, l0_k_cache", source)
 
+    def test_fused_decode_stages_shards_and_returns_once(self):
+        reference = Path(__file__).parents[3] / "ramanujan-test-codes" / "phi3" / "phi3_transformer_stack_4bit.py"
+        source = generate_phi3_decode_kernel(
+            reference, 0, 32, True, resident_kv=True,
+            shard_ranges=[(0, 8), (8, 16), (16, 24), (24, 32)],
+        )
+        ast.parse(source)
+        self.assertEqual(1, source.count("RETURN(h_state, argmax_arr)"))
+        self.assertEqual(64, source.count("GPU_SYNC(l"))
+        self.assertEqual(1, source.count("LOAD_MEM(h_state)"))
+        self.assertEqual(1, source.count("LOAD_MEM(l0_qkv_packed)"))
+        self.assertLess(source.index("RELEASE_MEM(l7_v_cache)"),
+                        source.index("LOAD_MEM(l8_qkv_packed)"))
+        self.assertLess(source.index("RELEASE_MEM(l23_v_cache)"),
+                        source.index("LOAD_MEM(l24_qkv_packed)"))
+        self.assertLess(source.index("RELEASE_MEM(l31_v_cache)"),
+                        source.index("LOAD_MEM(lm_head_1)"))
+
+    def test_fused_decode_rejects_incomplete_ranges(self):
+        reference = Path(__file__).parents[3] / "ramanujan-test-codes" / "phi3" / "phi3_transformer_stack_4bit.py"
+        for ranges in ([], [(0, 8), (9, 32)], [(0, 0), (0, 32)]):
+            with self.subTest(ranges=ranges), self.assertRaises(ValueError):
+                generate_phi3_decode_kernel(reference, 0, 32, True,
+                                            resident_kv=True, shard_ranges=ranges)
+
     def test_chunked_quantization_round_trip_and_temp_cleanup(self):
         values = np.array([
             [-7.0, -3.0, 0.0, 1.0, 4.0, 7.0, 2.0],

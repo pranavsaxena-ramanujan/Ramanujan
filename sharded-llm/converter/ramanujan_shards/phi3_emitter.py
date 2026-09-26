@@ -71,6 +71,15 @@ def emit_phi3_package(model_dir: Path, output_dir: Path, reference_kernel: Path)
                                             resident_kv=True),
                 encoding="utf-8",
             )
+            if shard_index == 0:
+                ranges = [(int(item.metadata["layer_start"]), int(item.metadata["layer_end"]))
+                          for item in graph.stages]
+                (programs_dir / "decode_fused.py").write_text(
+                    generate_phi3_decode_kernel(reference_kernel, ranges[0][0],
+                                                ranges[-1][1], True, resident_kv=True,
+                                                shard_ranges=ranges),
+                    encoding="utf-8",
+                )
             checksums = _checksums(shard_dir)
             state = [
                 {

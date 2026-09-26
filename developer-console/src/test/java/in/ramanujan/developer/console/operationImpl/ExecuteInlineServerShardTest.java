@@ -58,15 +58,17 @@ public class ExecuteInlineServerShardTest {
         Files.write(programs.resolve("prefill.py"), new byte[0]);
         Files.write(programs.resolve("decode.py"), new byte[0]);
         Files.write(programs.resolve("decode_resident.py"), new byte[0]);
+        Files.write(programs.resolve("decode_fused.py"), new byte[0]);
         Path manifest = root.resolve("model-manifest.json");
         Files.write(manifest,
                 "{\"shards\":[{\"manifestPath\":\"shard-00/manifest.json\"}]}"
                         .getBytes(StandardCharsets.UTF_8));
 
         Set<Path> paths = new ExecuteInlineServer().readShardPrograms(manifest);
-        assertEquals(3, paths.size());
+        assertEquals(4, paths.size());
         assertTrue(paths.contains(programs.resolve("decode.py").toRealPath()));
         assertTrue(paths.contains(programs.resolve("decode_resident.py").toRealPath()));
+        assertTrue(paths.contains(programs.resolve("decode_fused.py").toRealPath()));
     }
 
     @Test(expected = IOException.class)

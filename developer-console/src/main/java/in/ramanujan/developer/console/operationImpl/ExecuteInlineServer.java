@@ -207,6 +207,14 @@ public class ExecuteInlineServer extends ExecuteInline {
                 }
                 programs.add(resolved);
             }
+            Path fusedProgram = shardManifest.getParent().resolve("programs/decode_fused.py");
+            if (Files.exists(fusedProgram)) {
+                Path resolved = fusedProgram.toRealPath();
+                if (!resolved.startsWith(root) || !Files.isRegularFile(resolved)) {
+                    throw new IOException("invalid fused shard program: " + fusedProgram);
+                }
+                programs.add(resolved);
+            }
         }
         return programs;
     }

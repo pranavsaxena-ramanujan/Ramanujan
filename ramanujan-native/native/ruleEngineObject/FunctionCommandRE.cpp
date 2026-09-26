@@ -378,6 +378,50 @@ struct GpuContext {
 
 static GpuContext s_clCtx;
 
+static constexpr size_t kIdleGpuPoolLimit = 768ULL * 1024 * 1024;
+struct IdleGpuPool {
+  std::mutex mutex;
+  std::unordered_map<size_t, std::vector<cl_mem>> buffers;
+  size_t bytes = 0;
+
+  ~IdleGpuPool() {
+    if (s_clCtx.queue)
+      clFinish(s_clCtx.queue);
+    for (const auto &entry : buffers)
+      for (cl_mem buffer : entry.second)
+        clReleaseMemObject(buffer);
+  }
+};
+static IdleGpuPool s_idleGpuPool;
+
+static bool gpuPoolEnabled() {
+  const char *enabled = std::getenv("RAMANUJAN_GPU_POOL");
+  return enabled != nullptr && std::strcmp(enabled, "true") == 0;
+}
+
+static cl_mem takeIdleGpuBuffer(size_t bytes) {
+  std::lock_guard<std::mutex> lock(s_idleGpuPool.mutex);
+  auto found = s_idleGpuPool.buffers.find(bytes);
+  if (found == s_idleGpuPool.buffers.end() || found->second.empty())
+    return nullptr;
+  cl_mem buffer = found->second.back();
+  found->second.pop_back();
+  s_idleGpuPool.bytes -= bytes;
+  if (found->second.empty())
+    s_idleGpuPool.buffers.erase(found);
+  return buffer;
+}
+
+static void returnIdleGpuBuffer(cl_mem buffer, size_t bytes) {
+  std::lock_guard<std::mutex> lock(s_idleGpuPool.mutex);
+  if (bytes > kIdleGpuPoolLimit - s_idleGpuPool.bytes) {
+    clReleaseMemObject(buffer);
+    return;
+  }
+  s_idleGpuPool.buffers[bytes].push_back(buffer);
+  s_idleGpuPool.bytes += bytes;
+}
+
 // ── Shared program cache (cl_program is thread-safe after clBuildProgram) ──
 // Compile each source string only once; threads then create their own kernels.
 // The program pointer is *also* memoised on the FunctionCommandRE instance
@@ -1654,7 +1698,12 @@ RuleEngineInputUnits *RELEASE_MEM::process() {
       // queue first — releasing an in-use buffer here would free memory the
       // GPU is still reading, corrupting results (e.g. garbage output).
       clFinish(s_clCtx.queue);
-      clReleaseMemObject((cl_mem)arrayValue->gpuBuffer);
+      if (gpuPoolEnabled()) {
+        returnIdleGpuBuffer((cl_mem)arrayValue->gpuBuffer,
+                            arrayValue->gpuBufferBytes);
+      } else {
+        clReleaseMemObject((cl_mem)arrayValue->gpuBuffer);
+      }
       arrayValue->gpuBuffer = nullptr;
       arrayValue->gpuBufferBytes = 0;
     }
@@ -1674,6 +1723,21 @@ RuleEngineInputUnits *LOAD_MEM::process() {
         return nextUnit;
       }
       size_t needed = (size_t)arrayValue->totalSize * sizeof(float);
+      if (gpuPoolEnabled()) {
+        cl_mem reused = takeIdleGpuBuffer(needed);
+        if (reused != nullptr) {
+          cl_int err = clEnqueueWriteBuffer(s_clCtx.queue, reused, CL_TRUE,
+                                             0, needed, arrayValue->val,
+                                             0, nullptr, nullptr);
+          if (err == CL_SUCCESS) {
+            arrayValue->gpuBuffer = reused;
+            arrayValue->gpuBufferBytes = needed;
+            return nextUnit;
+          }
+          RJ_GPU_LOG("[LOAD_MEM] pooled upload failed: %d\n", err);
+          clReleaseMemObject(reused);
+        }
+      }
       cl_mem_flags flags = CL_MEM_READ_WRITE;
 #ifdef __ANDROID__
       // See the matching comment in GPUFunctionCommandRE::process(): Android
@@ -1681,8 +1745,9 @@ RuleEngineInputUnits *LOAD_MEM::process() {
       // always do a real copy here to avoid stale/corrupt reads.
       flags |= CL_MEM_COPY_HOST_PTR;
 #else
-  flags |= arrayValue->isCachedVal ? CL_MEM_USE_HOST_PTR
-               : CL_MEM_COPY_HOST_PTR;
+  flags |= gpuPoolEnabled() ? CL_MEM_COPY_HOST_PTR
+               : (arrayValue->isCachedVal ? CL_MEM_USE_HOST_PTR
+                                         : CL_MEM_COPY_HOST_PTR);
 #endif
       cl_int err;
       cl_mem buf = clCreateBuffer(s_clCtx.context, flags, needed,
