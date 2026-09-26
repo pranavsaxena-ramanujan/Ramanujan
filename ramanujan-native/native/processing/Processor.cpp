@@ -45,7 +45,12 @@ Processor::~Processor() {
       variableRE-> destroy();
   }
   for (auto arrayRE : arrayREs) {
-    arrayRE->destroy();
+    const char* resident = std::getenv("RAMANUJAN_RESIDENT_KV");
+    if (resident != nullptr && std::string(resident) == "true") {
+      delete static_cast<ArrayRE *>(arrayRE);
+    } else {
+      arrayRE->destroy();
+    }
   }
   arrayREs.clear();
   variableREs.clear();

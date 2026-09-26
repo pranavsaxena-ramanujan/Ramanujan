@@ -8,7 +8,17 @@
 
 extern "C" JNIEXPORT void JNICALL Java_in_ramanujan_rule_engine_NativeProcessor_changeShard
         (JNIEnv *, jobject) {
-    ArrayValue::clearBinaryCache();
+    const char* resident = std::getenv("RAMANUJAN_RESIDENT_KV");
+    if (resident != nullptr && std::string(resident) == "true") {
+        ArrayValue::adviseBinaryCacheIdle();
+    } else {
+        ArrayValue::clearBinaryCache();
+    }
+}
+
+extern "C" JNIEXPORT void JNICALL Java_in_ramanujan_rule_engine_NativeProcessor_resetShardSession
+        (JNIEnv *, jobject) {
+    ArrayValue::clearResidentState();
 }
 
 JNIEXPORT jobject JNICALL Java_in_ramanujan_rule_engine_NativeProcessor_process

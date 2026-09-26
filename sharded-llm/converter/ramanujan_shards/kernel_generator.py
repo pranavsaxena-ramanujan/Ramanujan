@@ -96,7 +96,8 @@ def generate_phi3_prefill_kernel(reference_kernel: Path, layer_start: int,
 
 
 def generate_phi3_decode_kernel(reference_kernel: Path, layer_start: int,
-                                layer_end: int, include_output: bool) -> str:
+                                layer_end: int, include_output: bool,
+                                resident_kv: bool = False) -> str:
     source = reference_kernel.read_text(encoding="utf-8")
     functions = _function_source(source, [
         "matmul_4bit_decode_GPU_1",
@@ -112,6 +113,14 @@ def generate_phi3_decode_kernel(reference_kernel: Path, layer_start: int,
     ])
     functions = _use_integer_decode_row(functions)
     layer_blocks = _decode_layer_blocks(source, layer_start, layer_end)
+    if resident_kv:
+        projection = _function_source(source, ["matmul_4bit_decode_GPU_1"])
+        fused = projection.replace("def matmul_4bit_decode_GPU_1(",
+                                   "def matmul_4bit_residual_decode_GPU_1(", 1)
+        if "C[c_idx] = s" not in fused:
+            raise ValueError("decode projection has an unexpected shape")
+        functions += "\n\n" + fused.replace("C[c_idx] = s", "C[c_idx] = C[c_idx] + s", 1)
+        layer_blocks = _fuse_decode_residuals(layer_blocks)
     cache_names = [name for layer in range(layer_start, layer_end)
                    for name in ("l{0}_k_cache".format(layer), "l{0}_v_cache".format(layer))]
     weight_names = [name for layer in range(layer_start, layer_end) for name in _layer_weight_names(layer)]
@@ -147,7 +156,7 @@ def generate_phi3_decode_kernel(reference_kernel: Path, layer_start: int,
         for name in weight_names + shared_buffers + cache_names
     ]
     output_lines: List[str] = []
-    return_names = ["h_state"] + cache_names
+    return_names = ["h_state"] + ([] if resident_kv else cache_names)
     if include_output:
         output_lines.extend([
             "rmsnorm_decode_GPU_1(h_state, ln_f_g, h_ln1, cur_n_seq_arr, 3072)",
@@ -155,7 +164,8 @@ def generate_phi3_decode_kernel(reference_kernel: Path, layer_start: int,
             "argmax_GPU_1(logits, argmax_arr, 1)",
         ])
         return_names.append("argmax_arr")
-    syncs = ["GPU_SYNC({0})".format(name) for name in return_names]
+    syncs = ["GPU_SYNC({0})".format(name) for name in ["h_state"] + cache_names
+             + (["argmax_arr"] if include_output else [])]
     releases = ["RELEASE_MEM({0})".format(name) for name in weight_names + shared_buffers + cache_names]
     generated = "\n\n".join([
         "# Generated Phi-3 Ramanujan decode shard. Do not edit.",
@@ -165,6 +175,25 @@ def generate_phi3_decode_kernel(reference_kernel: Path, layer_start: int,
     ])
     ast.parse(generated)
     return generated
+
+
+def _fuse_decode_residuals(layer_blocks: str) -> str:
+    import re
+
+    pattern = re.compile(
+        r"matmul_4bit_decode_GPU_1\((attn_out|h_ff_buf), (l\d+_(?:o|down)_packed), "
+        r"(l\d+_(?:o|down)_scales), (h_attn_buf|h_out_buf), (kp_proj|kp_fcp), "
+        r"cur_n_seq_arr, 3072\)\n"
+        r"residual_add_decode_GPU_1\(h_state, \4, cur_n_seq_arr, 3072\)"
+    )
+    fused, count = pattern.subn(
+        lambda match: "matmul_4bit_residual_decode_GPU_1({0}, {1}, {2}, h_state, {3}, cur_n_seq_arr, 3072)".format(
+            match.group(1), match.group(2), match.group(3), match.group(5)),
+        layer_blocks,
+    )
+    if count != layer_blocks.count("residual_add_decode_GPU_1("):
+        raise ValueError("decode residual has an unexpected shape")
+    return fused
 
 
 def _use_integer_decode_row(functions: str) -> str:

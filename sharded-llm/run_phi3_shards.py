@@ -81,7 +81,7 @@ def _rss_bytes(pid):
 
 class RamanujanServer:
     def __init__(self, java, jar, native_dir, workspace, monitor, diagnostics=False,
-                 package_manifest=None):
+                 package_manifest=None, resident_kv=False, profile=False):
         self.java = java
         self.jar = jar
         self.native_dir = native_dir
@@ -89,6 +89,8 @@ class RamanujanServer:
         self.monitor = monitor
         self.diagnostics = diagnostics
         self.package_manifest = package_manifest
+        self.resident_kv = resident_kv
+        self.profile = profile
         self.process = None
         self.stderr_tail = collections.deque(maxlen=80)
 
@@ -102,6 +104,7 @@ class RamanujanServer:
         env["RAMANUJAN_WS"] = str(self.workspace)
         env["RAMANUJAN_SEQUENTIAL"] = "true"
         env["RAMANUJAN_MAX_PARALLELISM"] = "1"
+        env["RAMANUJAN_RESIDENT_KV"] = "true" if self.resident_kv else "false"
         command = [
             str(self.java),
             "-Xmx6g",
@@ -145,6 +148,11 @@ class RamanujanServer:
         self.process.stdin.flush()
         self._wait_for("Dumped " + name, timeout, prefix=True)
 
+    def take(self, name, path, timeout=180):
+        self.process.stdin.write("take {0} {1}\n".format(name, path))
+        self.process.stdin.flush()
+        self._wait_for("Taken " + name, timeout)
+
     def close(self):
         if self.process is None:
             return
@@ -183,11 +191,11 @@ class RamanujanServer:
     def _drain_stderr(self):
         for line in self.process.stderr:
             self.stderr_tail.append(line)
-            if self.diagnostics and (
+            if (self.profile and line.startswith("[Server]")) or (self.diagnostics and (
                 "SKIPPING dispatch" in line
                 or "clEnqueueNDRangeKernel" in line
                 or "has no GPU buffer" in line
-            ):
+            )):
                 print(line.rstrip(), flush=True)
 
 
@@ -280,18 +288,22 @@ def _bind_shard_inputs(weight_csvs, run_dir, hidden_bin, sequence_length,
     return csv_paths + weight_csvs
 
 
-def _dump_caches(server, shard_dir, state_dir):
+def _dump_caches(server, shard_dir, state_dir, take=False):
     state_dir.mkdir(parents=True, exist_ok=True)
     cache_bins = {}
     for name in _cache_names(shard_dir):
         csv_path = state_dir / (name + ".csv")
-        server.dump(name, csv_path)
+        if take:
+            server.take(name, csv_path.with_suffix(".bin"))
+        else:
+            server.dump(name, csv_path)
         cache_bins[name] = csv_path.with_suffix(".bin")
     return cache_bins
 
 
 def _execute_shard(server, kernel, csv_paths, shard_dir, run_dir, state_dir,
-                   timeout, diagnostics=False, token_csv=None, reuse_worker=False):
+                   timeout, diagnostics=False, token_csv=None, reuse_worker=False,
+                   resident_kv=False, allow_retry=True, profile=False):
     for attempt in range(2):
         completed = False
         try:
@@ -299,20 +311,32 @@ def _execute_shard(server, kernel, csv_paths, shard_dir, run_dir, state_dir,
                 server.change_shard(kernel, timeout)
             else:
                 server.start()
+            run_started = time.monotonic()
             server.run(kernel, csv_paths, timeout)
+            run_seconds = time.monotonic() - run_started
+            transfer_started = time.monotonic()
             hidden_csv = run_dir / "h_state-output.csv"
-            server.dump("h_state", hidden_csv)
-            caches = _dump_caches(server, shard_dir, state_dir)
+            if resident_kv:
+                server.take("h_state", hidden_csv.with_suffix(".bin"))
+            else:
+                server.dump("h_state", hidden_csv)
+            caches = (_dump_caches(server, shard_dir, state_dir, take=resident_kv)
+                      if not resident_kv or kernel.name == "prefill.py" else {})
             if diagnostics:
                 server.dump("h_attn_buf", run_dir / "h_attn_buf.csv")
                 server.dump("h_out_buf", run_dir / "h_out_buf.csv")
             if token_csv is not None:
                 server.dump("argmax_arr", token_csv)
+            if profile:
+                print(json.dumps({"event": "shard-profile", "shard": shard_dir.name,
+                                  "program": kernel.name, "runSeconds": round(run_seconds, 3),
+                                  "transferSeconds": round(time.monotonic() - transfer_started, 3)}),
+                      flush=True)
             server.monitor.check()
             completed = True
             return hidden_csv.with_suffix(".bin"), caches
         except MemoryLimitExceeded as exc:
-            if exc.label != "ramanujan-jvm" or attempt == 1:
+            if exc.label != "ramanujan-jvm" or attempt == 1 or not allow_retry:
                 raise
             print(json.dumps({"event": "worker-restart", "shard": shard_dir.name,
                               "reason": "rss-limit"}), flush=True)
@@ -398,6 +422,13 @@ def run_inference(args):
     shards = manifest["shards"]
     if len(shards) != 4:
         raise ValueError("expected four shards")
+    if args.resident_kv and (args.worker_per_shard or args.diagnostics):
+        raise ValueError("resident KV requires the persistent worker without diagnostics")
+    if args.resident_kv:
+        for shard_summary in shards:
+            shard_dir = (package_dir / shard_summary["manifestPath"]).parent
+            if not (shard_dir / "programs" / "decode_resident.py").is_file():
+                raise ValueError("refresh the shard programs before enabling resident KV")
     # Diagnostic programs live outside the registered package, so they need per-shard workers.
     reuse_worker = not (args.worker_per_shard or args.diagnostics)
 
@@ -428,6 +459,8 @@ def run_inference(args):
             monitor,
             diagnostics=args.diagnostics,
             package_manifest=package_dir / "model-manifest.json" if reuse_worker else None,
+            resident_kv=args.resident_kv,
+            profile=args.profile,
         )
         weight_csvs = {
             shard_summary["shardId"]: _bind_shard_weights(
@@ -453,6 +486,8 @@ def run_inference(args):
                 args.timeout,
                 token_csv=work_dir / "next-token.csv" if index == len(shards) - 1 else None,
                 reuse_worker=reuse_worker,
+                resident_kv=args.resident_kv,
+                profile=args.profile,
             )
             cache_bins.update(shard_caches)
             if args.diagnostics:
@@ -496,7 +531,7 @@ def run_inference(args):
             _write_token_embedding(decode_hidden, hidden_bin, embeddings, generated_tokens[-1], position)
             hidden_bin = decode_hidden
             step_started = time.time()
-            next_cache_bins = {}
+            next_cache_bins = cache_bins.copy() if args.resident_kv else {}
             for index, shard_summary in enumerate(shards):
                 monitor.check()
                 shard_dir = (package_dir / shard_summary["manifestPath"]).parent
@@ -514,7 +549,9 @@ def run_inference(args):
                 )
                 input_hidden_path = hidden_bin
                 input_hidden_norm = _row_norm(hidden_bin, position)
-                decode_kernel = shard_dir / "programs" / "decode.py"
+                decode_kernel = shard_dir / "programs" / (
+                    "decode_resident.py" if args.resident_kv else "decode.py"
+                )
                 if args.diagnostics:
                     decode_kernel = _diagnostic_decode_kernel(
                         decode_kernel, shard_run_dir / "decode-diagnostic.py"
@@ -526,6 +563,9 @@ def run_inference(args):
                     shard_run_dir / "state", args.timeout,
                     diagnostics=args.diagnostics, token_csv=token_csv,
                     reuse_worker=reuse_worker,
+                    resident_kv=args.resident_kv,
+                    allow_retry=not args.resident_kv,
+                    profile=args.profile,
                 )
                 next_cache_bins.update(dumped_caches)
                 if args.diagnostics:
@@ -621,6 +661,10 @@ def parse_args():
     parser.add_argument("--diagnostics", action="store_true")
     parser.add_argument("--worker-per-shard", action="store_true",
                         help="start a fresh JVM for every shard run instead of one worker")
+    parser.add_argument("--resident-kv", action="store_true",
+                        help="keep KV buffers in native memory across decode; disable retry after prefill")
+    parser.add_argument("--profile", action="store_true",
+                        help="print per-shard run and result transfer timings")
     parser.add_argument("--timeout", type=int, default=1800)
     return parser.parse_args()
 

@@ -65,6 +65,12 @@ def emit_phi3_package(model_dir: Path, output_dir: Path, reference_kernel: Path)
                                             shard_index == len(graph.stages) - 1),
                 encoding="utf-8",
             )
+            (programs_dir / "decode_resident.py").write_text(
+                generate_phi3_decode_kernel(reference_kernel, layer_start, layer_end,
+                                            shard_index == len(graph.stages) - 1,
+                                            resident_kv=True),
+                encoding="utf-8",
+            )
             checksums = _checksums(shard_dir)
             state = [
                 {

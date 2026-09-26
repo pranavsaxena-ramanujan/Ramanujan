@@ -32,6 +32,9 @@ def refresh_phi3_programs(package_dir: Path, reference_kernel: Path):
             "programs/decode.py": generate_phi3_decode_kernel(
                 reference_kernel, layer_start, layer_end, include_output
             ),
+            "programs/decode_resident.py": generate_phi3_decode_kernel(
+                reference_kernel, layer_start, layer_end, include_output, resident_kv=True
+            ),
         }
         for relative_path, source in programs.items():
             path = shard_dir / relative_path

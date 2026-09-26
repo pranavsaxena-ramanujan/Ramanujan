@@ -133,6 +133,8 @@ public:
     ArrayValue(Array* array , std::string originalArrayId);
 
     static void clearBinaryCache();
+    static void adviseBinaryCacheIdle();
+    static void clearResidentState();
 
     ArrayValue(ArrayValue& toBeCopied, bool shallowCopy = false)
     {

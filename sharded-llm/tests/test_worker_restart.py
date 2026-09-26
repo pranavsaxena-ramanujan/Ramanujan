@@ -36,6 +36,11 @@ class FakeServer:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.with_suffix(".bin").write_bytes(b"\0" * 4)
 
+    def take(self, name, path):
+        self.dumps.append(name)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"\0" * 4)
+
     def check(self):
         pass
 
@@ -45,6 +50,17 @@ class FakeServer:
 
 
 class WorkerRestartTests(unittest.TestCase):
+    def test_resident_decode_does_not_export_cache_or_retry(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            server = FakeServer(failures=0)
+            runner._execute_shard(server, root / "decode_resident.py", [], root,
+                                  root / "run", root / "state", 10,
+                                  reuse_worker=True, resident_kv=True, allow_retry=False)
+            self.assertEqual(server.dumps, ["h_state"])
+            self.assertFalse((root / "state").exists())
+            server.close()
+
     def test_persistent_worker_changes_shard_after_dump(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

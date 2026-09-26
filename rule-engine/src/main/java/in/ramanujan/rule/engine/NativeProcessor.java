@@ -15,6 +15,7 @@ public class NativeProcessor {
     public native void process(byte[] ruleEngineInputProto, String firstCommandId);
 
     public native void changeShard();
+    public native void resetShardSession();
 
     public HashMap jniObject;
     public ArrayList debugPoints;

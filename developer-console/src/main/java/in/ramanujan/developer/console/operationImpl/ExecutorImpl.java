@@ -306,6 +306,8 @@ public class ExecutorImpl implements Operation {
         }
     }
 
+    private static final Map<String, String> DIM_STUBS = new java.util.concurrent.ConcurrentHashMap<>();
+
     public static CodeRunRequest createJson(List<String> args) throws JsonProcessingException {
         String codeString = PackageBuildHelper.readFile(args.get(0));
         CodeRunRequest codeRunRequest = new CodeRunRequest();
@@ -340,7 +342,9 @@ public class ExecutorImpl implements Operation {
                         // Synthesise a minimal stub CSV so generateCsvDeclPythonCode gets correct dimensions.
                         // buildDimStub: first row has correct column count; remaining rows are just "0\n".
                         // This is ~24 KB for a 9216x3072 matrix vs ~56 MB for buildZeroGrid — 2000x smaller.
-                        csvInformation.setData(buildDimStub(numRows, numCols));
+                        String shape = numRows + "x" + numCols;
+                        csvInformation.setData(DIM_STUBS.computeIfAbsent(
+                            shape, ignored -> buildDimStub(numRows, numCols)));
                         System.err.println("[createJson]   Binary fast-path: " + numRows + "x" + numCols
                                 + " (" + (binFile.length()/1024/1024) + " MB bin) in "
                                 + (System.currentTimeMillis() - csvReadStart) + "ms");

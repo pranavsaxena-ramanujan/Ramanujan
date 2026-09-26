@@ -36,6 +36,17 @@ class Phi3EmitterTest(unittest.TestCase):
             for node in ast.walk(tree)
         ))
 
+    def test_resident_decode_keeps_cache_synced_without_returning_it(self):
+        reference = Path(__file__).parents[3] / "ramanujan-test-codes" / "phi3" / "phi3_transformer_stack_4bit.py"
+        source = generate_phi3_decode_kernel(reference, 0, 8, False, resident_kv=True)
+        ast.parse(source)
+        self.assertEqual(16, source.count("matmul_4bit_residual_decode_GPU_1(attn_out")
+                         + source.count("matmul_4bit_residual_decode_GPU_1(h_ff_buf"))
+        self.assertNotIn("residual_add_decode_GPU_1(h_state,", source)
+        self.assertIn("GPU_SYNC(l0_k_cache)", source)
+        self.assertIn("RETURN(h_state)", source)
+        self.assertNotIn("RETURN(h_state, l0_k_cache", source)
+
     def test_chunked_quantization_round_trip_and_temp_cleanup(self):
         values = np.array([
             [-7.0, -3.0, 0.0, 1.0, 4.0, 7.0, 2.0],

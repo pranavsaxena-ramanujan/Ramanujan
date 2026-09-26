@@ -105,6 +105,7 @@ public class ExecuteInlineServer extends ExecuteInline {
                 try {
                     registeredShardPrograms = readShardPrograms(
                             Paths.get(line.substring("REGISTER_SHARDS ".length()).trim()));
+                        new in.ramanujan.rule.engine.NativeProcessor().resetShardSession();
                     compiledPrograms.clear();
                     System.out.println("SHARDS_REGISTERED");
                 } catch (Exception e) {
@@ -197,6 +198,14 @@ public class ExecuteInlineServer extends ExecuteInline {
                     throw new IOException("invalid shard program: " + program);
                 }
                 programs.add(program);
+            }
+            Path residentProgram = shardManifest.getParent().resolve("programs/decode_resident.py");
+            if (Files.exists(residentProgram)) {
+                Path resolved = residentProgram.toRealPath();
+                if (!resolved.startsWith(root) || !Files.isRegularFile(resolved)) {
+                    throw new IOException("invalid resident shard program: " + residentProgram);
+                }
+                programs.add(resolved);
             }
         }
         return programs;
@@ -343,7 +352,9 @@ public class ExecuteInlineServer extends ExecuteInline {
         ExecutorImpl.setStores(varStore, arrStore);
         // Hint GC to release large stub strings and old computation objects from this kernel.
         // Without this, hundreds of MB of zero-grid strings accumulate causing GC storms.
-        System.gc();
+        if (!"true".equalsIgnoreCase(System.getenv("RAMANUJAN_RESIDENT_KV"))) {
+            System.gc();
+        }
     }
 
     // -------------------------------------------------------------------------
@@ -439,6 +450,22 @@ public class ExecuteInlineServer extends ExecuteInline {
             return;
         }
 
+        if (line.startsWith("take ")) {
+            String[] parts = line.split(" ", 3);
+            if (parts.length != 3 || !ExecutorImpl.binaryArrayFileStore.containsKey(parts[1])) {
+                System.out.println("SHARD_ERROR: binary array not found");
+                return;
+            }
+            try {
+                takeBinaryArray(ExecutorImpl.binaryArrayFileStore.get(parts[1]), parts[2]);
+                ExecutorImpl.binaryArrayFileStore.remove(parts[1]);
+                System.out.println("Taken " + parts[1]);
+            } catch (IOException ex) {
+                System.out.println("SHARD_ERROR: " + ex.getMessage());
+            }
+            return;
+        }
+
         if (line.startsWith("dump ")) {
             String[] p = line.split(" ");
             String arrName = p.length >= 2 ? p[1] : null;
@@ -512,6 +539,20 @@ public class ExecuteInlineServer extends ExecuteInline {
         }
 
         System.out.println("Unknown command: " + line);
+    }
+
+    static void takeBinaryArray(String sourcePath, String binaryOutPath) throws IOException {
+        Path source = Paths.get(sourcePath);
+        Path destination = Paths.get(binaryOutPath);
+        try {
+            Files.move(source, destination, java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+        } catch (java.nio.file.AtomicMoveNotSupportedException ex) {
+            Files.copy(source, destination, java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+            Files.delete(source);
+        } catch (java.nio.file.FileSystemException ex) {
+            Files.copy(source, destination, java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+            Files.delete(source);
+        }
     }
 
     private static void dumpBinaryArray(String sourcePath, String csvOutPath) throws IOException {

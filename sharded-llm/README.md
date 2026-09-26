@@ -126,7 +126,36 @@ enforced only while running inference.
 
 ```bash
 python3 sharded-llm/run_phi3_shards.py "What is 2 + 2?" --n-tokens 10
+python3 sharded-llm/run_phi3_shards.py "What is 2 + 2?" --n-tokens 10 --resident-kv --profile
 ```
+
+`--resident-kv` is an opt-in sequential-shard mode. Prefill checkpoints each
+shard's cache once; subsequent decode calls keep all four shards' K/V arrays in
+the worker's native memory and return only hidden state and the token. The
+generated `decode_resident.py` also fuses the two projection/residual pairs in
+each layer. Immutable weight mappings remain addressable across shard changes;
+the worker advises the OS that idle mapped pages can be reclaimed. This is an
+advisory hint, not a guarantee that weights stay off RAM or that SSD reads occur
+on every token. The mode reuses Java shape stubs and skips forced per-run GC.
+It requires a server JAR and native library rebuilt with `resetShardSession`.
+For an existing package, regenerate programs and checksums using
+`python3 -m ramanujan_shards.refresh_phi3_programs --package-dir <path> --reference-kernel <path>`
+from the converter directory.
+
+The resident mode does **not** checkpoint K/V after decode. It disables decode
+retries rather than silently restarting from stale prefill caches; use the
+default file-backed path when restartable decode is required. It cannot be
+combined with `--worker-per-shard` or `--diagnostics`. `--profile` reports
+per-shard execution and result-transfer times.
+
+On an M3 Air with 8 GiB, a 10-token run of `What is 2 + 2?` produced
+`The sum of 2 and 2 is `, matching the expected prefix. The nine measured
+decode steps totaled 15.831 seconds (0.57 tokens/second); excluding the first
+decode step they averaged 0.59 tokens/second. The full run, including prefill,
+took 22.664 seconds. The legacy mode on the same binaries took 4.41 and
+4.09 seconds for the first two decode steps, versus 2.73 and 1.77 seconds in
+a separate resident-mode run. Most remaining time is in the four kernel runs
+per token, not file transfer. These results do not establish 10 tokens/second.
 
 The runner starts one worker JVM for the whole generation and registers the
 package with `REGISTER_SHARDS <model-manifest.json>`. The package stays on
@@ -136,18 +165,22 @@ program) keyed by program path and input shapes. Shard weights stay on disk and
 the runner binds them once per generation, so each shard run sends only hidden
 and K/V state plus sequence length.
 
-After the caller dumps the completed shard's hidden state, K/V caches, and token
-(if present), `CHANGE_SHARD <next-program.py>` clears the native immutable-weight
-cache; the next `run` maps that shard's weights from disk. The runner processes
-shards sequentially, enforces the RSS ceiling, and removes temporary hidden-state
-and KV-cache files on exit. If the worker breaches 7 GiB, the runner kills it,
-starts a new worker, re-registers the package, and resumes from the same shard's
-disk-backed inputs. A second breach on that shard stops the run. A failed kernel
-cannot change shards in place; its worker is replaced.
+By default, after the caller dumps the completed shard's hidden state, K/V
+caches, and token (if present), `CHANGE_SHARD <next-program.py>` clears the
+native immutable-weight cache; the next `run` maps that shard's weights from
+disk. In resident mode only the prefill caches are moved to disk, and shard
+changes keep weight mappings while advising idle pages as reclaimable. The
+runner processes shards sequentially, enforces the RSS ceiling, and removes
+temporary hidden-state and KV-cache files on exit. In the default mode, if the
+worker breaches 7 GiB, the runner kills it, starts a new worker, re-registers
+the package, and resumes from the same shard's disk-backed inputs. A second
+breach on that shard stops the run. Resident mode cannot safely retry decode
+after the worker exits because later K/V state is not checkpointed.
 
-This is an explicit weight-cache eviction, not yet proof of complete native
-heap cleanup: `ArrayRE::destroy()` currently does not free its per-call array
-objects. Use `--worker-per-shard` to start a fresh JVM for every shard run; it
+Legacy mode has explicit weight-cache eviction, not yet proof of complete native
+heap cleanup: `ArrayRE::destroy()` does not free its per-call array objects.
+Resident mode deletes per-call array objects after each native run. Use
+`--worker-per-shard` to start a fresh JVM for every shard run; it
 returns all native memory at each shard boundary but recompiles IR every time.
 `--diagnostics` uses per-shard workers because its instrumented programs are
 generated outside the registered package.

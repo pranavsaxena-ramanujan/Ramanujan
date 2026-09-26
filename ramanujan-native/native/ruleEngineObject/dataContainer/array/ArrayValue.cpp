@@ -25,6 +25,26 @@ struct CachedBinary {
     bool mapped;
 };
 static std::unordered_map<std::string, CachedBinary> s_binaryCache;
+static std::unordered_map<std::string, CachedBinary> s_residentState;
+
+void ArrayValue::adviseBinaryCacheIdle() {
+#ifndef _WIN32
+    std::lock_guard<std::mutex> lock(s_binaryMutex);
+    for (const auto& entry : s_binaryCache) {
+        if (entry.second.mapped) {
+            madvise(entry.second.data, entry.second.bytes, MADV_DONTNEED);
+        }
+    }
+#endif
+}
+
+void ArrayValue::clearResidentState() {
+    std::lock_guard<std::mutex> lock(s_binaryMutex);
+    for (const auto& entry : s_residentState) {
+        ALIGNED_FREE(entry.second.data);
+    }
+    s_residentState.clear();
+}
 
 void ArrayValue::clearBinaryCache() {
     std::lock_guard<std::mutex> lock(s_binaryMutex);
@@ -52,6 +72,18 @@ static bool isMutableRuntimeBinary(const std::string& path) {
         || endsWith("_k_cache.bin") || endsWith("_v_cache.bin");
 }
 
+static bool isResidentCache(const std::string& path) {
+    const char* enabled = std::getenv("RAMANUJAN_RESIDENT_KV");
+    if (enabled == nullptr || std::string(enabled) != "true") return false;
+    const size_t slash = path.find_last_of("/\\");
+    const std::string name = slash == std::string::npos ? path : path.substr(slash + 1);
+    const auto endsWith = [&name](const char* suffix) {
+        const size_t length = std::char_traits<char>::length(suffix);
+        return name.size() >= length && name.compare(name.size() - length, length, suffix) == 0;
+    };
+    return endsWith("_k_cache.bin") || endsWith("_v_cache.bin");
+}
+
 ArrayValue::ArrayValue(Array* array , std::string originalArrayId) {
     this->array = array;
 
@@ -77,6 +109,8 @@ ArrayValue::ArrayValue(Array* array , std::string originalArrayId) {
         // Check cache first (avoids re-reading disk on every kernel call)
         std::string key = array->binaryFile;
         const bool cacheable = !isMutableRuntimeBinary(key);
+        const bool resident = isResidentCache(key);
+        const std::string stateName = resident ? key.substr(key.find_last_of("/\\") + 1) : "";
     #ifndef _WIN32
         if (cacheable) {
             char* resolved = realpath(key.c_str(), nullptr);
@@ -91,6 +125,17 @@ ArrayValue::ArrayValue(Array* array , std::string originalArrayId) {
         size_t allocatedBytes = (size_t)totalSize * sizeof(float);
         if (allocatedBytes == 0) allocatedBytes = sizeof(float);
         bool mapped = false;
+        if (resident) {
+            std::lock_guard<std::mutex> lk(s_binaryMutex);
+            auto it = s_residentState.find(stateName);
+            if (it != s_residentState.end()) {
+                if (it->second.bytes != allocatedBytes) {
+                    throw std::runtime_error("resident KV shape changed");
+                }
+                fdata = it->second.data;
+                fcount = it->second.count;
+            }
+        }
         if (cacheable) {
             std::lock_guard<std::mutex> lk(s_binaryMutex);
             auto it = s_binaryCache.find(key);
@@ -168,15 +213,19 @@ ArrayValue::ArrayValue(Array* array , std::string originalArrayId) {
                     memset(fdata, 0, totalSize * sizeof(float));
                 }
             }
-            if (fdata && cacheable) {
+            if (fdata && (cacheable || resident)) {
                 std::lock_guard<std::mutex> lk(s_binaryMutex);
-                s_binaryCache[key] = {fdata, fcount, allocatedBytes, mapped};
+                if (resident) {
+                    s_residentState[stateName] = {fdata, fcount, allocatedBytes, false};
+                } else {
+                    s_binaryCache[key] = {fdata, fcount, allocatedBytes, mapped};
+                }
             }
         }
         val = fdata;
         isBinaryLoaded  = true;
-        isCachedVal = cacheable;
-        cachedFloatData = cacheable ? fdata : nullptr;
+        isCachedVal = cacheable || resident;
+        cachedFloatData = isCachedVal ? fdata : nullptr;
     } else {
         ALIGNED_ALLOC(&val, 4096, totalSize * sizeof(float));
         memset(val, 0, totalSize * sizeof(float));

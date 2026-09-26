@@ -15,6 +15,20 @@ import static org.junit.Assert.assertNotEquals;
 import static org.junit.Assert.assertTrue;
 
 public class ExecuteInlineServerShardTest {
+    @Test
+    public void takeBinaryArrayTransfersOwnershipWithoutCopyingContents() throws IOException {
+        Path root = Files.createTempDirectory("shard-result-");
+        Path source = root.resolve("return.bin");
+        Path destination = root.resolve("cache.bin");
+        Files.write(source, new byte[] {1, 2, 3});
+
+        ExecuteInlineServer.takeBinaryArray(source.toString(), destination.toString());
+
+        assertTrue(!Files.exists(source));
+        assertEquals(3, Files.size(destination));
+        assertEquals(1, Files.readAllBytes(destination)[0]);
+    }
+
     private static CsvInformation csv(String path, String data) {
         CsvInformation info = new CsvInformation();
         info.setFileName(path);
@@ -43,14 +57,16 @@ public class ExecuteInlineServerShardTest {
         Files.write(shard.resolve("manifest.json"), new byte[0]);
         Files.write(programs.resolve("prefill.py"), new byte[0]);
         Files.write(programs.resolve("decode.py"), new byte[0]);
+        Files.write(programs.resolve("decode_resident.py"), new byte[0]);
         Path manifest = root.resolve("model-manifest.json");
         Files.write(manifest,
                 "{\"shards\":[{\"manifestPath\":\"shard-00/manifest.json\"}]}"
                         .getBytes(StandardCharsets.UTF_8));
 
         Set<Path> paths = new ExecuteInlineServer().readShardPrograms(manifest);
-        assertEquals(2, paths.size());
+        assertEquals(3, paths.size());
         assertTrue(paths.contains(programs.resolve("decode.py").toRealPath()));
+        assertTrue(paths.contains(programs.resolve("decode_resident.py").toRealPath()));
     }
 
     @Test(expected = IOException.class)
