@@ -6,9 +6,11 @@ submitted to an `rj homelab` server and executed by `rj worker` processes; the s
 the task affinity, so each worker caches and runs only the shards it is assigned.
 """
 import argparse
+import concurrent.futures
 import hashlib
 import json
 import os
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -35,6 +37,50 @@ def _stub(csv_path, columns, binary):
 def _zeros(path, count, columns):
     np.zeros(count, np.float32).tofile(path)
     return _stub(path.with_suffix(".csv"), columns, path)
+
+
+class WeightPrefetcher:
+    """Warms the OS page cache for upcoming shard steps while the current step computes.
+
+    The native runtime mmaps weight files and faults them in page by page, and eviction
+    only unmaps them. Large sequential reads on background threads fill the page cache
+    ahead of the JVM, so SSD reads overlap with compute and run at sequential speed.
+    """
+    CHUNK = 8 << 20
+
+    def __init__(self, threads):
+        self.pool = concurrent.futures.ThreadPoolExecutor(threads, thread_name_prefix="prefetch")
+        self.pending = set()
+        self.stopped = threading.Event()
+        self.local = threading.local()
+
+    def warm(self, key, files):
+        if key in self.pending:
+            return
+        self.pending.add(key)
+        for path in files:
+            self.pool.submit(self._read, path)
+
+    def consumed(self, key):
+        self.pending.discard(key)
+
+    def _read(self, path):
+        buffer = getattr(self.local, "buffer", None)
+        if buffer is None:
+            buffer = self.local.buffer = bytearray(self.CHUNK)
+        try:
+            with open(path, "rb", buffering=0) as source:
+                if hasattr(os, "posix_fadvise"):
+                    os.posix_fadvise(source.fileno(), 0, 0, os.POSIX_FADV_WILLNEED)
+                    return
+                while not self.stopped.is_set() and source.readinto(buffer):
+                    pass
+        except OSError:
+            pass
+
+    def close(self):
+        self.stopped.set()
+        self.pool.shutdown(wait=True, cancel_futures=True)
 
 
 class Worker:
@@ -137,6 +183,11 @@ class Qwen35Runner:
         self._bind_layers()
         self.workers = [None] * len(self.shards)
         self.position = 0
+        self.prefetcher = WeightPrefetcher(args.prefetch_threads) if args.prefetch_steps > 0 else None
+        last = args.stop_after_layer if args.stop_after_layer is not None else self.config.layers - 1
+        self.cycle = [("layer", layer) for layer in range(last + 1)]
+        if args.stop_after_layer is None:
+            self.cycle.append(("head", None))
 
     def _write_programs(self):
         c, e, directory = self.config, self.encodings, self.work / "programs"
@@ -166,9 +217,10 @@ class Qwen35Runner:
             state.mkdir(parents=True)
             attention = c.is_attention(layer)
             roles = ATTN_TENSORS if attention else DELTA_TENSORS
-            csvs = []
+            csvs, weights = [], []
             for role, suffix in roles.items():
                 tensor = self._tensor("blk.{0}.{1}".format(layer, suffix))
+                weights.append(tensor["file"])
                 (directory / (role + ".bin")).symlink_to(tensor["file"])
                 csvs.append(_stub(directory / (role + ".csv"), tensor_columns(tensor), tensor["file"]))
             if attention:
@@ -185,12 +237,13 @@ class Qwen35Runner:
                 raise ValueError("layer {0} is split across shards".format(layer))
             self.layer_inputs.append({"worker": owners.pop(), "csvs": csvs, "state": state,
                                       "program": self.programs["attn" if attention else "delta"],
-                                      "takes": list(states)})
+                                      "takes": list(states), "weights": weights})
         head = self.work / "bind" / "head"
         head.mkdir()
-        self.head_csvs = []
+        self.head_csvs, self.head_weights = [], []
         for role, name in HEAD_TENSORS.items():
             tensor = self._tensor(name)
+            self.head_weights.append(tensor["file"])
             (head / (role + ".bin")).symlink_to(tensor["file"])
             self.head_csvs.append(_stub(head / (role + ".csv"), tensor_columns(tensor), tensor["file"]))
         owners = {self.owner[name] for name in HEAD_TENSORS.values()}
@@ -198,6 +251,22 @@ class Qwen35Runner:
             raise ValueError("output head is split across shards")
         self.head_worker = owners.pop()
         self.embed_worker = self.owner["token_embd.weight"]
+
+    def _step_weights(self, step):
+        return self.head_weights if step[0] == "head" else self.layer_inputs[step[1]]["weights"]
+
+    def _prefetch(self, step):
+        """Warm `step` and the next --prefetch-steps steps of the layer/head cycle."""
+        if self.prefetcher is None:
+            return
+        index = self.cycle.index(step)
+        for offset in range(self.args.prefetch_steps + 1):
+            upcoming = self.cycle[(index + offset) % len(self.cycle)]
+            self.prefetcher.warm(upcoming, self._step_weights(upcoming))
+
+    def _consumed(self, step):
+        if self.prefetcher is not None:
+            self.prefetcher.consumed(step)
 
     def _worker(self, index):
         if self.workers[index] is None:
@@ -255,6 +324,7 @@ class Qwen35Runner:
         last_layer = self.args.stop_after_layer if self.args.stop_after_layer is not None else self.config.layers - 1
         for layer in range(last_layer + 1):
             spec = self.layer_inputs[layer]
+            self._prefetch(("layer", layer))
             worker = self._worker(spec["worker"])
             started = time.monotonic()
             for directory in directories:
@@ -265,6 +335,7 @@ class Qwen35Runner:
                 takes.update({name: spec["state"] / (name + ".bin") for name in spec["takes"]})
                 worker.run(spec["program"], csvs, takes, evict=directory is directories[-1])
             worker.evict()
+            self._consumed(("layer", layer))
             if self.args.verbose:
                 print(json.dumps({"event": "layer", "layer": layer, "shard": self.shards[spec["worker"]]["id"],
                                   "tokens": len(tokens), "seconds": round(time.monotonic() - started, 2)}),
@@ -275,14 +346,18 @@ class Qwen35Runner:
         return directories
 
     def head(self, directory):
+        self._prefetch(("head", None))
         worker = self._worker(self.head_worker)
         logits, argmax = directory / "logits.bin", directory / "argmax.bin"
         worker.run(self.programs["head"], [directory / "h_state.csv"] + self.head_csvs,
                    {"logits": logits, "argmax_arr": argmax}, evict=True)
         worker.evict()
+        self._consumed(("head", None))
         return int(np.fromfile(argmax, "<f4")[0]), np.fromfile(logits, "<f4")
 
     def close(self):
+        if self.prefetcher is not None:
+            self.prefetcher.close()
         peaks = {}
         for worker in self.workers:
             if worker is not None:
@@ -334,8 +409,14 @@ def parse_args():
                         help="submit shard steps to an `rj homelab` server instead of local JVMs")
     parser.add_argument("--resident-weights", action="store_true",
                         help="with --homelab, keep each worker's shard weights mapped between steps")
+    parser.add_argument("--prefetch-steps", type=int,
+                        help="layer/head steps to read ahead into the page cache while the current "
+                             "step computes (default 1 locally, 0 with --homelab)")
+    parser.add_argument("--prefetch-threads", type=int, default=2)
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()
+    if args.prefetch_steps is None:
+        args.prefetch_steps = 0 if args.homelab else 1
     if args.resident_weights and not args.homelab:
         parser.error("--resident-weights requires --homelab")
     args.stop_after_layer = args.check_layers - 1 if args.check_layers else None

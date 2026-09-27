@@ -7,7 +7,7 @@ as generated Ramanujan DSL compiled to OpenCL kernels. On an 8 GB Apple M3:
 ```
 prompt:  "The capital of France is"
 output:  " Paris.\nThe capital of Germany is"
-speed:   ~11.7 s/token (greedy, SSD-bound), every worker below 800 MB RSS
+speed:   ~7.6 s/token (greedy, SSD-bound), every worker below 1.3 GB RSS
 ```
 
 The hidden state after all 64 layers matches an independent NumPy reference
@@ -249,8 +249,8 @@ shard. Measured peak RSS per worker was 170-280 MB.
 every prompt token runs in order before weights are evicted, which carries the
 recurrent state and KV cache forward while loading each layer once. Decode then
 feeds one token per step through the same path, and the head's Ramanujan
-`argmax` picks the next token. A decode layer step takes about 0.17 s, and 64
-layers plus the head come to about 11.7 s per token.
+`argmax` picks the next token. A decode layer step takes about 0.1 s, and 64
+layers plus the head come to about 7.6 s per token.
 
 **Native runtime optimizations** (`libnative_llm`, built with
 `RAMANUJAN_LLM_OPTIMIZED`):
@@ -275,6 +275,24 @@ For full 64-layer generation, prefill plus first token fell from ~50 s to
 22.4 s, and decode from ~16 s to 11.7 s/token. Compute is now about 1.3 s of
 each token. The rest is re-reading ~250 MB of weights per layer from the SSD,
 because 16 GB of weights cannot stay in 8 GB of RAM.
+
+**Weight prefetch.** Eviction only unmaps weights, so their pages can stay in
+the OS page cache. While a layer computes, background threads in the runner
+read the current and next step's weight files sequentially
+(`--prefetch-steps`, default 1; `--prefetch-threads`, default 2). The JVM's
+page faults then hit RAM instead of the SSD. Measured on the same 4-token
+Paris run:
+
+| `--prefetch-steps` | Prompt + first token | Decode |
+|---|---|---|
+| 0 | 22.7 s | 11.7 s/token |
+| 1 | 17.1 s | 7.6 s/token |
+| 2 | 17.4 s | 7.6 s/token |
+| 2, with 4 threads | 17.7 s | 9.0 s/token |
+
+At ~7.6 s/token the runner reads about 2.1 GB/s, so the SSD is now the limit.
+Prefetch is off by default with `--homelab`, because the orchestrator cannot
+warm a remote worker's page cache.
 
 ## Validation
 
@@ -320,7 +338,7 @@ python3 run_qwen35_shards.py ... --max-new-tokens 1 --reference-token --work-dir
 
 # Tests
 (cd converter && PYTHONPATH=. python3 -m unittest discover -s tests)
-python3 -m unittest tests.test_qwen35_homelab tests.test_worker_restart
+python3 -m unittest tests.test_qwen35_homelab tests.test_qwen35_prefetch tests.test_worker_restart
 (cd ../developer-console && mvn -q test -Dtest='AffinityTaskQueueTest,WorkerBinaryCacheTest')
 ```
 
@@ -334,6 +352,8 @@ Useful flags:
 | `--homelab URL` | off | Run steps on `rj homelab`/`rj worker` ([Distributed](#distributed-rj-homelab-and-rj-worker)) |
 | `--resident-weights` | off | With `--homelab`, keep weights mapped between steps |
 | `--row-cache` | `~/.cache/ramanujan/qwen35-embedding-rows` | Shared token-row directory |
+| `--prefetch-steps` | 1 (0 with `--homelab`) | Steps to read ahead into the page cache |
+| `--prefetch-threads` | 2 | Background prefetch reader threads |
 | `--java`, `--jar`, `--native-dir` | | Choose the runtime binaries |
 
 `--work-dir` must not exist yet; it holds the bindings, state, hidden states,
@@ -450,7 +470,7 @@ does not reach 5 tok/s; that needs faster native kernels (see Limitations).
   untested.
 - **Greedy text completion.** There is no sampling, and no Jinja chat
   template. Raw `<|im_start|>` markup in the prompt is tokenized correctly.
-- **Throughput.** About 11.7 s/token on one 8 GB machine, dominated by SSD
+- **Throughput.** About 7.6 s/token on one 8 GB machine, dominated by SSD
   reads of roughly 16 GB of weights per token. With weights resident, a layer
   takes 17-24 ms against a ~2.5 ms memory-bandwidth bound for ~250 MB of
   weights. The remaining costs are many small OpenCL kernels per layer, scalar
