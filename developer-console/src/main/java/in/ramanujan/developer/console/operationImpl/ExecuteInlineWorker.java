@@ -10,8 +10,12 @@ import in.ramanujan.rule.engine.RuleEngineInputProtoSerializer;
 import java.io.*;
 import java.net.*;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
 import java.util.*;
 import java.util.concurrent.*;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
 
 /**
  * Local worker mode: polls a homelab server for tasks and executes them via
@@ -19,11 +23,19 @@ import java.util.concurrent.*;
  * in the homelab server/orchestrator or in the Android GPU execution path.
  *
  * Usage:
- *   java -jar developer-console.jar worker [server-url] [num-threads]
+ *   java -jar developer-console.jar worker [server-url] [num-threads] [options]
  *
  * Defaults:
  *   server-url   = http://localhost:8888
  *   num-threads  = number of available CPUs
+ *
+ * Options:
+ *   --native-library NAME  native library loaded from $RAMANUJAN_WS (default "native";
+ *                          use "native_llm" for the GGUF/Qwen runtime)
+ *   --cache DIR            where binary arrays fetched from the server are cached
+ *                          (default ~/.ramanujan/worker-cache)
+ *   --max-shards N         most affinity groups (model shards) this worker accepts
+ *   --shared-filesystem    read binary arrays at the server's paths instead of fetching
  *
  * Examples:
  *   java -jar developer-console.jar worker
@@ -38,19 +50,50 @@ public class ExecuteInlineWorker implements Operation {
 
     private static final ObjectMapper MAPPER = new ObjectMapper();
     private static final Object GPU_EXECUTION_LOCK = new Object();
+    // Native keeps one process-wide weight cache; eviction must not overlap an execution.
+    private static final ReentrantReadWriteLock NATIVE_CACHE_LOCK = new ReentrantReadWriteLock();
+
+    private final String hostId = UUID.randomUUID().toString();
+    private int affinityLimit = Integer.MAX_VALUE;
+    private WorkerBinaryCache binaryCache;
+    private Path taskRoot;
 
     @Override
     public void execute(List<String> args) throws IOException {
         // args[0] = "worker", args[1] = optional url, args[2] = optional threads
         String serverUrl = "http://localhost:8888";
         int numThreads = Runtime.getRuntime().availableProcessors();
+        String cacheDir = Paths.get(System.getProperty("user.home"), ".ramanujan", "worker-cache").toString();
+        boolean sharedFilesystem = false;
 
-        if (args.size() >= 2) {
-            String candidate = args.get(1).trim();
+        List<String> positional = new ArrayList<>();
+        for (int i = 1; i < args.size(); i++) {
+            String arg = args.get(i).trim();
+            switch (arg) {
+                case "--native-library":
+                    System.setProperty("ramanujan.nativeLibrary", requireValue(args, ++i, arg));
+                    break;
+                case "--cache":
+                    cacheDir = requireValue(args, ++i, arg);
+                    break;
+                case "--max-shards":
+                    affinityLimit = Integer.parseInt(requireValue(args, ++i, arg));
+                    if (affinityLimit < 1) throw new IllegalArgumentException("--max-shards must be >= 1");
+                    break;
+                case "--shared-filesystem":
+                    sharedFilesystem = true;
+                    break;
+                default:
+                    if (arg.startsWith("--")) throw new IllegalArgumentException("unknown worker option " + arg);
+                    positional.add(arg);
+            }
+        }
+        if (!positional.isEmpty()) {
+            String candidate = positional.get(0);
             if (candidate.startsWith("http")) {
                 serverUrl = candidate.replaceAll("/$", "");
-                if (args.size() >= 3) {
-                    try { numThreads = Integer.parseInt(args.get(2).trim()); }
+                if (positional.size() >= 2) {
+                    try { numThreads = Integer.parseInt(positional.get(1)); }
                     catch (NumberFormatException ignored) {}
                 }
             } else {
@@ -58,10 +101,17 @@ public class ExecuteInlineWorker implements Operation {
                 catch (NumberFormatException ignored) {}
             }
         }
+        if (!sharedFilesystem) {
+            binaryCache = new WorkerBinaryCache(Paths.get(cacheDir), serverUrl);
+            taskRoot = Paths.get(cacheDir).toAbsolutePath().resolve("tasks");
+            Files.createDirectories(taskRoot);
+        }
 
         System.out.println("LOCAL_WORKER_READY");
         System.out.println("LOCAL_WORKER_URL " + serverUrl);
         System.out.println("LOCAL_WORKER_THREADS " + numThreads);
+        System.out.println("LOCAL_WORKER_HOST " + hostId);
+        System.out.println("LOCAL_WORKER_BINARIES " + (sharedFilesystem ? "shared-filesystem" : "cache " + cacheDir));
         System.out.flush();
 
         final String url = serverUrl;
@@ -79,14 +129,15 @@ public class ExecuteInlineWorker implements Operation {
 
     @SuppressWarnings("unchecked")
     private void workerLoop(String serverUrl) {
-        String hostId = UUID.randomUUID().toString();
         System.err.println("[Worker] started hostId=" + hostId);
+        String pollUrl = serverUrl + "/pings/open?uuid=" + hostId
+                + (affinityLimit == Integer.MAX_VALUE ? "" : "&affinityLimit=" + affinityLimit);
 
         while (!Thread.currentThread().isInterrupted()) {
             try {
                 // Long-poll: the server blocks up to 900 ms waiting for work
                 // before returning null, so no client-side sleep is needed.
-                Map<String, Object> pingResp = postJson(serverUrl + "/pings/open?uuid=" + hostId, "");
+                Map<String, Object> pingResp = postJson(pollUrl, "");
                 if (pingResp == null) continue;
                 if (!"SUCCESS".equalsIgnoreCase((String) pingResp.get("status"))) continue;
 
@@ -119,22 +170,44 @@ public class ExecuteInlineWorker implements Operation {
 
                 // Execute via NativeProcessor (same path as Android app)
                 Map<String, Object> results = new HashMap<>();
+                String error = null;
+                boolean evictWeights = Boolean.TRUE.equals(taskData.get("evictWeights"));
+                Path taskDir = taskRoot == null ? null : taskRoot.resolve(uuid);
                 long start = System.currentTimeMillis();
                 try {
+                    if (binaryCache != null) {
+                        binaryCache.localize(rei, taskDir);
+                    }
                     NativeProcessor np = new NativeProcessor();
                     if (firstCommandId != null && !firstCommandId.isEmpty()) {
                         byte[] reiProto = RuleEngineInputProtoSerializer.serialize(rei);
-                        if (gpuKernels.isEmpty()) {
-                            np.process(reiProto, firstCommandId);
-                        } else {
-                            synchronized (GPU_EXECUTION_LOCK) {
+                        NATIVE_CACHE_LOCK.readLock().lock();
+                        try {
+                            if (gpuKernels.isEmpty()) {
                                 np.process(reiProto, firstCommandId);
+                            } else {
+                                synchronized (GPU_EXECUTION_LOCK) {
+                                    np.process(reiProto, firstCommandId);
+                                }
                             }
+                        } finally {
+                            NATIVE_CACHE_LOCK.readLock().unlock();
                         }
                         if (np.jniObject != null) results = np.jniObject;
                     }
-                } catch (Exception e) {
-                    System.err.println("[Worker] execution error for " + uuid + ": " + e.getMessage());
+                    if (evictWeights) {
+                        NATIVE_CACHE_LOCK.writeLock().lock();
+                        try {
+                            np.changeShard();
+                        } finally {
+                            NATIVE_CACHE_LOCK.writeLock().unlock();
+                        }
+                    }
+                } catch (Exception | LinkageError e) {
+                    error = e.getClass().getSimpleName() + ": " + e.getMessage();
+                    System.err.println("[Worker] execution error for " + uuid + ": " + error);
+                } finally {
+                    deleteRecursively(taskDir);
                 }
                 long elapsed = System.currentTimeMillis() - start;
 
@@ -157,10 +230,10 @@ public class ExecuteInlineWorker implements Operation {
                         String arrayId  = be.getKey();
                         String filePath = be.getValue();
                         try {
-                            uploadBinaryFile(serverUrl, uuid, arrayId, filePath);
+                            if (error == null) uploadBinaryFile(serverUrl, uuid, arrayId, filePath);
                         } catch (Exception uploadEx) {
-                            System.err.println("[Worker] failed to upload binary array " + arrayId
-                                    + " for task " + uuid + ": " + uploadEx.getMessage());
+                            error = "upload of binary array " + arrayId + " failed: " + uploadEx.getMessage();
+                            System.err.println("[Worker] " + error + " (task " + uuid + ")");
                         } finally {
                             new File(filePath).delete();
                         }
@@ -172,6 +245,7 @@ public class ExecuteInlineWorker implements Operation {
                 payload.put("uuid",   uuid);
                 payload.put("hostId", hostId);
                 payload.put("data",   results);
+                if (error != null) payload.put("error", error);
                 postJson(serverUrl + "/task/complete", MAPPER.writeValueAsString(payload));
 
             } catch (InterruptedException e) {
@@ -185,6 +259,20 @@ public class ExecuteInlineWorker implements Operation {
                 System.err.println("[Worker] error: " + t);
                 t.printStackTrace();
             }
+        }
+    }
+
+    private static String requireValue(List<String> args, int index, String option) {
+        if (index >= args.size()) throw new IllegalArgumentException(option + " requires a value");
+        return args.get(index).trim();
+    }
+
+    private static void deleteRecursively(Path path) {
+        if (path == null || !Files.exists(path)) return;
+        try (java.util.stream.Stream<Path> walk = Files.walk(path)) {
+            walk.sorted(Comparator.reverseOrder()).forEach(p -> p.toFile().delete());
+        } catch (IOException e) {
+            System.err.println("[Worker] could not delete " + path + ": " + e.getMessage());
         }
     }
 

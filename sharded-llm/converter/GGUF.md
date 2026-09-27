@@ -40,9 +40,9 @@ GGUF header metadata without duplicating weights:
 
 ```sh
 PYTHONPATH=. python3 -m ramanujan_shards.gguf_ir_plan \
-  --package ~/Downloads/Qwen3.8-27B-Q4_1-shards \
-  --gguf ~/Downloads/Qwen3.8-27B-Q4_1.gguf \
-  --output-dir ~/Downloads/Qwen3.8-27B-Q4_1-ir-plan
+  --package ~/Desktop/ramanujan_oss/Qwen3.8-27B-Q4_1-shards \
+  --gguf ~/Desktop/ramanujan_oss/Qwen3.8-27B-Q4_1.gguf \
+  --output-dir ~/Desktop/ramanujan_oss/Qwen3.8-27B-Q4_1-ir-plan
 ```
 
 The output contains `model-plan.json`, one `plan.json` per shard, and
@@ -60,8 +60,8 @@ and the developer-console fat JAR, then from `ramanujan/sharded-llm`:
 
 ```sh
 python3 run_qwen35_shards.py \
-  --package ~/Downloads/Qwen3.8-27B-Q4_1-shards \
-  --metadata ~/Downloads/Qwen3.8-27B-Q4_1-ir-plan/gguf-metadata.json \
+  --package ~/Desktop/ramanujan_oss/Qwen3.8-27B-Q4_1-shards \
+  --metadata ~/Desktop/ramanujan_oss/Qwen3.8-27B-Q4_1-ir-plan/gguf-metadata.json \
   --prompt "The capital of France is" --max-new-tokens 8 \
   --work-dir /tmp/qwen35-run
 ```
@@ -98,7 +98,7 @@ developer-console modules, from the converter directory:
 
 ```sh
 PYTHONPATH=. python3 -m ramanujan_shards.emit_q6_k_operator \
-  --package ~/Downloads/Qwen3.8-27B-Q4_1-shards \
+  --package ~/Desktop/ramanujan_oss/Qwen3.8-27B-Q4_1-shards \
   --tensor output.weight --output-dir /tmp/qwen-output-probe
 cd ..
 python3 run_q6_k_probe.py --binding /tmp/qwen-output-probe/binding.json \
@@ -112,7 +112,7 @@ The other matvec emitters are `emit_q4_1_operator`, `emit_q5_k_operator`, and
 ```sh
 cd converter
 PYTHONPATH=. python3 -m ramanujan_shards.emit_f32_rmsnorm_operator \
-  --package ~/Downloads/Qwen3.8-27B-Q4_1-shards \
+  --package ~/Desktop/ramanujan_oss/Qwen3.8-27B-Q4_1-shards \
   --tensor blk.0.attn_norm.weight --epsilon 9.999999974752427e-7 \
   --output-dir /tmp/qwen-norm-probe
 cd ..

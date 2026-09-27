@@ -1,9 +1,18 @@
 #!/usr/bin/env python3
-"""Run a four-shard Qwen35 GGUF package on Ramanujan workers (one persistent worker per shard)."""
+"""Run a four-shard Qwen35 GGUF package on Ramanujan workers.
+
+By default each shard gets a local persistent JVM. With --homelab, every shard step is
+submitted to an `rj homelab` server and executed by `rj worker` processes; the shard id is
+the task affinity, so each worker caches and runs only the shards it is assigned.
+"""
 import argparse
+import hashlib
 import json
 import os
 import time
+import urllib.error
+import urllib.request
+import uuid
 from pathlib import Path
 
 import numpy as np
@@ -39,7 +48,7 @@ class Worker:
         self.monitor.start()
         self.server.start()
 
-    def run(self, program, csvs, takes):
+    def run(self, program, csvs, takes, evict=False):
         self.server.run(program, csvs, self.timeout)
         for name, destination in takes.items():
             temporary = destination.with_name(destination.name + ".take")
@@ -56,6 +65,51 @@ class Worker:
         self.server.close()
         self.monitor.stop()
         return peak
+
+
+class HomelabWorker:
+    """One shard's steps on an `rj homelab` server; the shard id pins them to one `rj worker`."""
+
+    def __init__(self, shard, args):
+        self.shard = shard
+        self.url = args.homelab.rstrip("/")
+        self.timeout = args.timeout
+        self.resident = args.resident_weights
+
+    def start(self):
+        pass
+
+    def _post(self, route, body):
+        request = urllib.request.Request(self.url + route, json.dumps(body).encode("utf-8"),
+                                         {"Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(request, timeout=self.timeout) as response:
+                payload = json.loads(response.read() or b"{}")
+        except urllib.error.HTTPError as error:
+            detail = error.read().decode("utf-8", "replace")
+            raise RuntimeError("homelab {0} failed with HTTP {1}: {2}".format(route, error.code, detail)) from None
+        if payload.get("status") != "SUCCESS":
+            raise RuntimeError("homelab {0} failed: {1}".format(route, payload))
+        return payload
+
+    def run(self, program, csvs, takes, evict=False):
+        request_id = "{0}-{1}".format(self.shard["id"], uuid.uuid4().hex)
+        self._post("/orchestrator/run", {
+            "args": [str(program)] + [str(csv) for csv in csvs],
+            "requestId": request_id,
+            "affinity": self.shard["id"],
+            "evictWeights": bool(evict and not self.resident)})
+        for name, destination in takes.items():
+            temporary = destination.with_name(destination.name + ".take")
+            self._post("/orchestrator/dump", {"name": name, "path": str(temporary),
+                                              "requestId": request_id, "raw": True})
+            os.replace(temporary, destination)
+
+    def evict(self):
+        pass
+
+    def close(self):
+        return 0
 
 
 class Qwen35Runner:
@@ -147,7 +201,10 @@ class Qwen35Runner:
 
     def _worker(self, index):
         if self.workers[index] is None:
-            worker = Worker(self.shards[index], self.args, self.work / "workers" / self.shards[index]["id"])
+            if self.args.homelab:
+                worker = HomelabWorker(self.shards[index], self.args)
+            else:
+                worker = Worker(self.shards[index], self.args, self.work / "workers" / self.shards[index]["id"])
             worker.start()
             self.workers[index] = worker
         return self.workers[index]
@@ -155,8 +212,7 @@ class Qwen35Runner:
     def _embed(self, token, directory):
         tensor = self._tensor("token_embd.weight")
         row_bytes = tensor_columns(tensor) * 4
-        rows = self.work / "rows"
-        rows.mkdir(exist_ok=True)
+        rows = self._row_cache(tensor["file"])
         row = rows / "tok{0}.bin".format(token)
         if not row.exists():
             with open(tensor["file"], "rb") as source:
@@ -164,14 +220,26 @@ class Qwen35Runner:
                 data = source.read(row_bytes)
             if len(data) != row_bytes:
                 raise ValueError("token id outside embedding table: {0}".format(token))
-            row.write_bytes(data)
+            temporary = row.with_name("{0}.{1}.partial".format(row.name, os.getpid()))
+            temporary.write_bytes(data)
+            os.replace(temporary, row)
         bind = directory / "embed"
         bind.mkdir()
         (bind / "emb_row.bin").symlink_to(row)
         csv = _stub(bind / "emb_row.csv", row_bytes // 4, row)
         hidden = directory / "h_state.bin"
-        self._worker(self.embed_worker).run(self.programs["embed"], [csv], {"h_state": hidden})
+        self._worker(self.embed_worker).run(self.programs["embed"], [csv], {"h_state": hidden}, evict=True)
         _stub(directory / "h_state.csv", self.config.dim, hidden)
+
+    def _row_cache(self, table):
+        # Rows are immutable slices of the embedding table. A stable per-table path lets
+        # workers cache each token row once across runs instead of once per work dir.
+        stat = Path(table).stat()
+        key = hashlib.sha256("{0}\0{1}\0{2}".format(Path(table).resolve(), stat.st_size,
+                                                     stat.st_mtime_ns).encode("utf-8")).hexdigest()[:24]
+        rows = Path(self.args.row_cache).expanduser().resolve() / key
+        rows.mkdir(parents=True, exist_ok=True)
+        return rows
 
     def forward(self, tokens, on_layer=None):
         """Advance every layer's state by `tokens`; returns per-token hidden directories."""
@@ -195,7 +263,7 @@ class Qwen35Runner:
                     csvs.append(directory / "pos_arr.csv")
                 takes = {"h_state": directory / "h_state.bin"}
                 takes.update({name: spec["state"] / (name + ".bin") for name in spec["takes"]})
-                worker.run(spec["program"], csvs, takes)
+                worker.run(spec["program"], csvs, takes, evict=directory is directories[-1])
             worker.evict()
             if self.args.verbose:
                 print(json.dumps({"event": "layer", "layer": layer, "shard": self.shards[spec["worker"]]["id"],
@@ -210,7 +278,7 @@ class Qwen35Runner:
         worker = self._worker(self.head_worker)
         logits, argmax = directory / "logits.bin", directory / "argmax.bin"
         worker.run(self.programs["head"], [directory / "h_state.csv"] + self.head_csvs,
-                   {"logits": logits, "argmax_arr": argmax})
+                   {"logits": logits, "argmax_arr": argmax}, evict=True)
         worker.evict()
         return int(np.fromfile(argmax, "<f4")[0]), np.fromfile(logits, "<f4")
 
@@ -260,8 +328,16 @@ def parse_args():
     parser.add_argument("--check-layers", type=int, help="compare the first N layers with the NumPy reference, then stop")
     parser.add_argument("--reference-token", action="store_true",
                         help="also run the full NumPy reference for the first generated token")
+    parser.add_argument("--row-cache", default="~/.cache/ramanujan/qwen35-embedding-rows",
+                        help="shared directory for token embedding rows (reused across runs)")
+    parser.add_argument("--homelab", metavar="URL",
+                        help="submit shard steps to an `rj homelab` server instead of local JVMs")
+    parser.add_argument("--resident-weights", action="store_true",
+                        help="with --homelab, keep each worker's shard weights mapped between steps")
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()
+    if args.resident_weights and not args.homelab:
+        parser.error("--resident-weights requires --homelab")
     args.stop_after_layer = args.check_layers - 1 if args.check_layers else None
     return args
 

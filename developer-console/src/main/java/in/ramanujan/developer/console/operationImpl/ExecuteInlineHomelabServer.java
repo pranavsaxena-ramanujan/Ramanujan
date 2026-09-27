@@ -55,7 +55,9 @@ public class ExecuteInlineHomelabServer extends ExecuteInline {
     private static final int MAX_COMPLETED_REQUEST_STATES = 64;
 
     // Tasks compiled and waiting to be served to a polling worker
-    private final BlockingQueue<PendingTask> taskQueue = new LinkedBlockingQueue<>();
+    private final AffinityTaskQueue<PendingTask> taskQueue = new AffinityTaskQueue<>();
+    // Binary files referenced by dispatched tasks; /binary/fetch serves only these.
+    private final Set<String> fetchableBinaryFiles = ConcurrentHashMap.newKeySet();
     // Tasks served but not yet completed (keyed by uuid sent to worker)
     private final ConcurrentHashMap<String, PendingTask> inflight = new ConcurrentHashMap<>();
     // Completed run outputs keyed by orchestrator requestId.
@@ -80,13 +82,24 @@ public class ExecuteInlineHomelabServer extends ExecuteInline {
         // via /orchestrator/uploadBinary, for RETURN()-marked arrays too large to
         // ship efficiently as a JSON point-value map.
         final Map<String, String>   binaryArrayFiles = new ConcurrentHashMap<>();
+        // Optional sticky placement key (e.g. model shard id) and post-task weight eviction.
+        final String                affinity;
+        final boolean               evictWeights;
         volatile Throwable          failure = null;
 
-        KernelRun(Map<String, Variable> variableMap, Map<String, Array> arrayMap, List<DagElement> allElements) {
+        KernelRun(Map<String, Variable> variableMap, Map<String, Array> arrayMap, List<DagElement> allElements,
+                  String affinity, boolean evictWeights) {
             this.variableMap      = variableMap;
             this.arrayMap         = arrayMap;
             this.allElements      = allElements;
             this.latch            = new CountDownLatch(allElements.size());
+            this.affinity         = affinity;
+            this.evictWeights     = evictWeights;
+        }
+
+        void fail(Throwable cause) {
+            if (failure == null) failure = cause;
+            while (latch.getCount() > 0) latch.countDown();
         }
     }
 
@@ -197,6 +210,16 @@ public class ExecuteInlineHomelabServer extends ExecuteInline {
             data.put("ruleEngineInput", element.getRuleEngineInput());
             data.put("firstCommandId", element.getFirstCommandId());
             data.put("debug",          false);
+            if (run.evictWeights) {
+                data.put("evictWeights", true);
+            }
+            if (element.getRuleEngineInput() != null && element.getRuleEngineInput().getArrays() != null) {
+                for (Array array : element.getRuleEngineInput().getArrays()) {
+                    if (array.getBinaryFile() != null && !array.getBinaryFile().isEmpty()) {
+                        fetchableBinaryFiles.add(array.getBinaryFile());
+                    }
+                }
+            }
             Map<String, Object> envelope = new LinkedHashMap<>();
             envelope.put("status", "SUCCESS");
             envelope.put("data",   data);
@@ -204,15 +227,15 @@ public class ExecuteInlineHomelabServer extends ExecuteInline {
 
             PendingTask task = new PendingTask(taskUuid, element, run, responseJson);
             inflight.put(taskUuid, task);
-            taskQueue.add(task);
+            taskQueue.add(task, run.affinity);
 
             System.err.println("[Homelab] dispatched task (firstCmd=" + element.getFirstCommandId()
-                    + ", uuid=" + taskUuid + ") | queued=" + taskQueue.size()
+                    + ", uuid=" + taskUuid + (run.affinity != null ? ", affinity=" + run.affinity : "")
+                    + ") | queued=" + taskQueue.size()
                     + ", inflight=" + inflight.size());
         } catch (Exception e) {
             System.err.println("[Homelab] error dispatching element " + element.getId() + ": " + e.getMessage());
-            run.failure = e;
-            run.latch.countDown();
+            run.fail(e);
         }
     }
 
@@ -254,6 +277,11 @@ public class ExecuteInlineHomelabServer extends ExecuteInline {
     }
 
     protected void dispatchToWorkers(List<String> args, String requestId) throws Exception {
+        dispatchToWorkers(args, requestId, null, false);
+    }
+
+    protected void dispatchToWorkers(List<String> args, String requestId, String affinity,
+                                     boolean evictWeights) throws Exception {
         long t0 = System.currentTimeMillis();
 
         Map<String, Variable> variableMap = new HashMap<>();
@@ -301,7 +329,7 @@ public class ExecuteInlineHomelabServer extends ExecuteInline {
         System.err.println("[Homelab] compiled " + args.get(0)
                 + " in " + (System.currentTimeMillis() - t0) + "ms  DAG=" + allElements.size());
 
-        KernelRun run = new KernelRun(variableMap, arrayMap, allElements);
+        KernelRun run = new KernelRun(variableMap, arrayMap, allElements, affinity, evictWeights);
 
         // Identify all root DAG elements (elements with no previous dependencies)
         List<DagElement> roots = new ArrayList<>();
@@ -324,7 +352,7 @@ public class ExecuteInlineHomelabServer extends ExecuteInline {
         run.latch.await();
 
         if (run.failure != null) {
-            throw new RuntimeException("Kernel execution failed on worker", run.failure);
+            throw new RuntimeException("Kernel execution failed on worker: " + run.failure.getMessage(), run.failure);
         }
 
         System.err.println("[Homelab] all " + allElements.size() + " element(s) done in "
@@ -438,6 +466,7 @@ public class ExecuteInlineHomelabServer extends ExecuteInline {
         createdServer.createContext("/orchestrator/run",  this::handleOrchestratorRun);
         createdServer.createContext("/orchestrator/dump", this::handleOrchestratorDump);
         createdServer.createContext("/binary/fetch",      this::handleBinaryFetch);
+        createdServer.createContext("/binary/stat",       this::handleBinaryStat);
         createdServer.createContext("/orchestrator/uploadBinary", this::handleUploadBinary);
         createdServer.setExecutor(Executors.newCachedThreadPool());
         createdServer.start();
@@ -461,8 +490,10 @@ public class ExecuteInlineHomelabServer extends ExecuteInline {
         String requestId = req.get("requestId") != null
                 ? String.valueOf(req.get("requestId"))
                 : UUID.randomUUID().toString();
+        Object affinity = req.get("affinity");
+        boolean evictWeights = Boolean.TRUE.equals(req.get("evictWeights"));
         try {
-            dispatchToWorkers(args, requestId);
+            dispatchToWorkers(args, requestId, affinity != null ? String.valueOf(affinity) : null, evictWeights);
             Map<String, Object> response = new LinkedHashMap<>();
             response.put("status", "SUCCESS");
             response.put("requestId", requestId);
@@ -491,6 +522,23 @@ public class ExecuteInlineHomelabServer extends ExecuteInline {
         }
 
         String binaryFile = runState.binaryArrayFileStore.get(name);
+        if (Boolean.TRUE.equals(req.get("raw"))) {
+            // Raw mode copies the float32 file exactly, leaving any caller-owned CSV stub untouched.
+            if (binaryFile == null) {
+                sendJson(ex, 404, "{\"status\":\"ERROR\",\"message\":\"No binary array: " + name + "\"}");
+                return;
+            }
+            try {
+                copyBinaryAtomically(binaryFile, path);
+                sendJson(ex, 200, "{\"status\":\"SUCCESS\"}");
+            } catch (Exception e) {
+                Map<String, Object> err = new LinkedHashMap<>();
+                err.put("status", "ERROR");
+                err.put("message", e.getMessage() != null ? e.getMessage() : e.toString());
+                sendJson(ex, 500, MAPPER.writeValueAsString(err));
+            }
+            return;
+        }
         if (binaryFile != null) {
             System.err.println("[Homelab] dump request: name=" + name + " path=" + path
                     + " (binary-backed, file=" + binaryFile + ")");
@@ -599,46 +647,78 @@ public class ExecuteInlineHomelabServer extends ExecuteInline {
         }
     }
 
-    /** Serves raw binary files from the server's filesystem to the worker. */
-    private void handleBinaryFetch(HttpExchange ex) throws IOException {
-        try {
-            String query = ex.getRequestURI().getRawQuery();
-            String path = null;
-            if (query != null) {
-                String[] pairs = query.split("&");
-                for (String pair : pairs) {
-                    int idx = pair.indexOf("=");
-                    if (idx > 0 && java.net.URLDecoder.decode(pair.substring(0, idx), "UTF-8").equals("path")) {
-                        path = java.net.URLDecoder.decode(pair.substring(idx + 1), "UTF-8");
-                        break;
-                    }
+    /** Resolves the {@code path} query parameter to a file referenced by a dispatched task, or sends an error. */
+    private File resolveFetchableFile(HttpExchange ex) throws IOException {
+        String query = ex.getRequestURI().getRawQuery();
+        String path = null;
+        if (query != null) {
+            for (String pair : query.split("&")) {
+                int idx = pair.indexOf("=");
+                if (idx > 0 && URLDecoder.decode(pair.substring(0, idx), "UTF-8").equals("path")) {
+                    path = URLDecoder.decode(pair.substring(idx + 1), "UTF-8");
+                    break;
                 }
             }
+        }
+        if (path == null || path.isEmpty()) {
+            consumeBody(ex);
+            sendJson(ex, 400, "{\"status\":\"ERROR\",\"message\":\"Missing path parameter\"}");
+            return null;
+        }
+        if (!fetchableBinaryFiles.contains(path)) {
+            consumeBody(ex);
+            sendJson(ex, 403, "{\"status\":\"ERROR\",\"message\":\"Path is not referenced by a dispatched task\"}");
+            return null;
+        }
+        File file = new File(path);
+        if (!file.isFile()) {
+            consumeBody(ex);
+            sendJson(ex, 404, MAPPER.writeValueAsString(Collections.singletonMap("message", "File not found: " + path)));
+            return null;
+        }
+        return file;
+    }
 
-            if (path == null || path.isEmpty()) {
-                sendJson(ex, 400, "{\"status\":\"ERROR\",\"message\":\"Missing path parameter\"}");
-                return;
-            }
-
-            File file = new File(path);
-            if (!file.exists() || !file.isFile()) {
-                sendJson(ex, 404, "{\"status\":\"ERROR\",\"message\":\"File not found: " + path + "\"}");
-                return;
-            }
-
+    /** Serves raw binary files referenced by dispatched tasks to workers. */
+    private void handleBinaryFetch(HttpExchange ex) throws IOException {
+        try {
+            File file = resolveFetchableFile(ex);
+            if (file == null) return;
             ex.getResponseHeaders().set("Content-Type", "application/octet-stream");
+            ex.getResponseHeaders().set("X-Ramanujan-Mtime", String.valueOf(file.lastModified()));
             ex.sendResponseHeaders(200, file.length());
             try (InputStream is = new FileInputStream(file);
                  OutputStream os = ex.getResponseBody()) {
-                byte[] buf = new byte[65536];
+                byte[] buf = new byte[1 << 20];
                 int n;
                 while ((n = is.read(buf)) != -1) {
                     os.write(buf, 0, n);
                 }
             }
         } catch (Exception e) {
-            sendJson(ex, 500, "{\"status\":\"ERROR\",\"message\":\"" + e.getMessage() + "\"}");
+            sendJson(ex, 500, MAPPER.writeValueAsString(Collections.singletonMap("message", String.valueOf(e.getMessage()))));
         }
+    }
+
+    /** Returns {size, mtime} so workers can reuse a cached copy without downloading it again. */
+    private void handleBinaryStat(HttpExchange ex) throws IOException {
+        File file = resolveFetchableFile(ex);
+        if (file == null) return;
+        Map<String, Object> response = new LinkedHashMap<>();
+        response.put("status", "SUCCESS");
+        response.put("size", file.length());
+        response.put("mtime", file.lastModified());
+        consumeBody(ex);
+        sendJson(ex, 200, MAPPER.writeValueAsString(response));
+    }
+
+    static void copyBinaryAtomically(String source, String destination) throws IOException {
+        java.nio.file.Path target = java.nio.file.Paths.get(destination);
+        java.nio.file.Path temporary = target.resolveSibling(target.getFileName() + ".partial");
+        java.nio.file.Files.copy(java.nio.file.Paths.get(source), temporary,
+                java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+        java.nio.file.Files.move(temporary, target, java.nio.file.StandardCopyOption.REPLACE_EXISTING,
+                java.nio.file.StandardCopyOption.ATOMIC_MOVE);
     }
 
     /**
@@ -721,9 +801,27 @@ public class ExecuteInlineHomelabServer extends ExecuteInline {
      */
     private void handleOpenPing(HttpExchange ex) throws IOException {
         consumeBody(ex);
+        String hostId = null;
+        int affinityLimit = Integer.MAX_VALUE;
+        String query = ex.getRequestURI().getRawQuery();
+        if (query != null) {
+            for (String pair : query.split("&")) {
+                int idx = pair.indexOf('=');
+                if (idx <= 0) continue;
+                String key = URLDecoder.decode(pair.substring(0, idx), "UTF-8");
+                String value = URLDecoder.decode(pair.substring(idx + 1), "UTF-8");
+                if ("uuid".equals(key)) hostId = value;
+                else if ("affinityLimit".equals(key)) {
+                    try { affinityLimit = Integer.parseInt(value); } catch (NumberFormatException ignored) {}
+                }
+            }
+        }
         PendingTask task;
         try {
-            task = taskQueue.poll(900, TimeUnit.MILLISECONDS);
+            task = taskQueue.poll(hostId, affinityLimit, 900);
+            if (task != null && task.kernelRun.affinity != null) {
+                System.err.println("[Homelab] affinity " + task.kernelRun.affinity + " -> worker " + hostId);
+            }
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             task = null;
@@ -753,10 +851,18 @@ public class ExecuteInlineHomelabServer extends ExecuteInline {
                 Map<String, Object> payload = MAPPER.readValue(body, Map.class);
                 String             uuid    = (String) payload.get("uuid");
                 Map<String, Object> results = (Map<String, Object>) payload.get("data");
+                Object hostId = payload.get("hostId");
+                taskQueue.completed(hostId != null ? String.valueOf(hostId) : null);
 
                 PendingTask task = inflight.remove(uuid);
                 if (task == null) {
                     System.err.println("[Homelab] received unknown uuid: " + uuid);
+                    return;
+                }
+                Object error = payload.get("error");
+                if (error != null) {
+                    System.err.println("[Homelab] worker " + hostId + " failed task " + uuid + ": " + error);
+                    task.kernelRun.fail(new RuntimeException(String.valueOf(error)));
                     return;
                 }
                 synchronized (task.kernelRun) {

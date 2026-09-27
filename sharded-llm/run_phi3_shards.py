@@ -7,6 +7,7 @@ from pathlib import Path
 import select
 import shutil
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -97,7 +98,7 @@ class RamanujanServer:
 
     def start(self):
         self.workspace.mkdir(parents=True, exist_ok=True)
-        native_library = self.native_dir / "libnative_llm.dylib"
+        native_library = self.native_dir / ("libnative_llm" + (".dylib" if sys.platform == "darwin" else ".so"))
         if not native_library.is_file():
             raise FileNotFoundError("native library not found: {0}".format(native_library))
         shutil.copy2(native_library, self.workspace / native_library.name)
