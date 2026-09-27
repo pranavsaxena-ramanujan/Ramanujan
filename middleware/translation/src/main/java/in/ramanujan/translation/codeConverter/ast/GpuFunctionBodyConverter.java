@@ -450,6 +450,60 @@ public class GpuFunctionBodyConverter {
                 return "((float)(((uint)(" + packedExpr + ") >> "
                         + "((uint)(" + nibbleExpr + ") * 4u)) & 15u))";
             }
+                if ("GGUF_Q4_1_VALUE".equals(calledName) && call.getArgs().size() == 3) {
+                String weights = convertExpr(call.getArgs().get(0));
+                String block = "((uint)(" + convertExpr(call.getArgs().get(1)) + "))";
+                String position = "((uint)(" + convertExpr(call.getArgs().get(2)) + "))";
+                String offset = "(" + block + " * 5u)";
+                String halves = "((__global const half*)(&" + weights + "[" + offset + "]))";
+                String word = "as_uint(" + weights + "[" + offset + " + 1u + (("
+                    + position + " & 15u) >> 2u)])";
+                String shift = "(((" + position + " & 3u) * 8u) + (("
+                    + position + " >> 4u) * 4u))";
+                return "(vload_half(1, " + halves + ") + vload_half(0, " + halves
+                    + ") * ((float)((" + word + " >> " + shift + ") & 15u)))";
+                }
+            if ("GGUF_Q5_K_VALUE".equals(calledName) && call.getArgs().size() == 3) {
+                String weights = convertExpr(call.getArgs().get(0));
+                String block = "((uint)(" + convertExpr(call.getArgs().get(1)) + "))";
+                String position = "((uint)(" + convertExpr(call.getArgs().get(2)) + "))";
+                String group = "(" + position + " >> 5u)";
+                String bytes = "((__global const uchar*)(&" + weights + "[" + block + " * 44u]))";
+                String halves = "((__global const half*)(&" + weights + "[" + block + " * 44u]))";
+                String scale = "(" + group + " < 4u ? (" + bytes + "[4u + " + group + "] & 63u)"
+                    + " : ((" + bytes + "[8u + " + group + "] & 15u) | (("
+                    + bytes + "[" + group + "] >> 6u) << 4u)))";
+                String minimum = "(" + group + " < 4u ? (" + bytes + "[8u + " + group + "] & 63u)"
+                    + " : ((" + bytes + "[8u + " + group + "] >> 4u) | (("
+                    + bytes + "[4u + " + group + "] >> 6u) << 4u)))";
+                String quant = "(((" + bytes + "[48u + ((" + group + " >> 1u) * 32u) + ("
+                    + position + " & 31u)] >> ((" + group + " & 1u) * 4u)) & 15u)"
+                    + " | (((" + bytes + "[16u + (" + position + " & 31u)] >> " + group
+                    + ") & 1u) << 4u))";
+                return "(vload_half(0, " + halves + ") * ((float)" + scale + ") * ((float)"
+                    + quant + ") - vload_half(1, " + halves + ") * ((float)" + minimum + "))";
+            }
+            if ("GGUF_Q6_K_VALUE".equals(calledName) && call.getArgs().size() == 3) {
+                String weights = convertExpr(call.getArgs().get(0));
+                String block = "((uint)(" + convertExpr(call.getArgs().get(1)) + "))";
+                String position = "((uint)(" + convertExpr(call.getArgs().get(2)) + "))";
+                String bytes = "((__global const uchar*)(" + weights + "))";
+                String base = "(" + block + " * 210u)";
+                String half = "(" + position + " >> 7u)";
+                String segment = "((" + position + " >> 5u) & 3u)";
+                String index = "(" + position + " & 31u)";
+                String low = bytes + "[" + base + " + " + half + " * 64u + (" + segment
+                    + " & 1u) * 32u + " + index + "]";
+                String high = bytes + "[" + base + " + 128u + " + half + " * 32u + "
+                    + index + "]";
+                String quant = "(((" + low + " >> ((" + segment + " >> 1u) * 4u)) & 15u)"
+                    + " | (((" + high + " >> (" + segment + " * 2u)) & 3u) << 4u))";
+                String subscale = "as_char(" + bytes + "[" + base + " + 192u + " + half
+                    + " * 8u + (" + index + " >> 4u) + " + segment + " * 2u])";
+                String scale = "((__global const half*)(&" + bytes + "[" + base + " + 208u]))";
+                return "(vload_half(0, " + scale + ") * ((float)" + subscale + ") *"
+                    + " ((float)((int)" + quant + " - 32)))";
+            }
             // Guard: self-recursion is not permitted in GPU kernel or device-function code.
             if (calledName != null && calledName.equals(currentGeneratingFuncName)) {
                 throw new IllegalArgumentException(

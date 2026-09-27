@@ -1375,7 +1375,17 @@ public class PythonAstToRuleEngineInputConverter {
             functionCall.setImmediateParentRuleEngineInputUnitId(parentScopeUnit.getId());
         }
         
-        List<Command> bodyCommands = convertBody(funcDef.getBody(), variableScope, variableFrameMap, counter, functionCall);
+        boolean gpuFunction = funcDef.getName().matches(".*_GPU_\\d+$");
+        List<Command> bodyCommands;
+        if (gpuFunction) {
+            Command gpuBody = new Command();
+            gpuBody.setId("command_" + UUID.randomUUID().toString());
+            gpuBody.setImmediateParentRuleEngineInputUnitId(functionCall.getId());
+            ruleEngineInput.getCommands().add(gpuBody);
+            bodyCommands = Collections.singletonList(gpuBody);
+        } else {
+            bodyCommands = convertBody(funcDef.getBody(), variableScope, variableFrameMap, counter, functionCall);
+        }
         if (!bodyCommands.isEmpty()) {
             functionCall.setFirstCommandId(bodyCommands.get(0).getId());
         }
@@ -1402,7 +1412,7 @@ public class PythonAstToRuleEngineInputConverter {
         //   - N (in the function name) = work_dim passed to clEnqueueNDRangeKernel.
         //   - Last N params  → range dim args → get_global_id(0..N-1) declarations in kernel.
         //   - First K params → __global float* data args in the kernel signature.
-        if (funcDef.getName().matches(".*_GPU_\\d+$")) {
+        if (gpuFunction) {
             try {
                 // Build a map of all non-GPU helper functions visible to this GPU kernel.
                 // GPU-suffixed functions are excluded because they cannot be called as device functions.

@@ -34,6 +34,7 @@ import static in.ramanujan.developer.console.operationImpl.ExecutorImpl.createJs
  *   run <kernel.py> <csv1> <csv2> ...   — compile and execute a kernel
  *   REGISTER_SHARDS <model-manifest.json> — register package program paths
  *   CHANGE_SHARD <next-program.py>       — evict the previous shard after dumps
+ *   EVICT_WEIGHTS                        — unmap cached immutable weight binaries
  *   dump <name> [file]                  — dump array to stdout or file
  *   var  <name>                         — print scalar variable value
  *   arr  <name> <index>                 — print one array element
@@ -108,6 +109,17 @@ public class ExecuteInlineServer extends ExecuteInline {
                         new in.ramanujan.rule.engine.NativeProcessor().resetShardSession();
                     compiledPrograms.clear();
                     System.out.println("SHARDS_REGISTERED");
+                } catch (Exception e) {
+                    System.out.println("SHARD_ERROR: " + e.getMessage());
+                }
+                System.out.flush();
+                continue;
+            }
+
+            if (line.equals("EVICT_WEIGHTS")) {
+                try {
+                    new in.ramanujan.rule.engine.NativeProcessor().changeShard();
+                    System.out.println("WEIGHTS_EVICTED");
                 } catch (Exception e) {
                     System.out.println("SHARD_ERROR: " + e.getMessage());
                 }

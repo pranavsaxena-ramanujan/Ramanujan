@@ -5,8 +5,10 @@
 This work adapts the model-sharding idea used by SwarmLLM to Ramanujan. A large
 LLM is converted into model-agnostic Ramanujan IR packages so that separate
 devices can own different shards while each device keeps only one shard in
-memory. Phi-3 Mini is the first implemented architecture and safetensors is the
-first implemented source format.
+memory. Phi-3 Mini from safetensors is the first executable architecture.
+Qwen3.8-27B from GGUF (Gated DeltaNet + attention) also runs across four
+Ramanujan workers; see [QWEN35_GGUF.md](QWEN35_GGUF.md) for its infrastructure,
+GGUF-to-shard conversion, and runtime.
 
 The conversion, four-shard prefill, KV-cache transfer, autoregressive decode,
 binary tensor transport, and inference memory guard all run. The local runner
@@ -19,7 +21,8 @@ SwarmLLM demonstrates GGUF model sharding across resource-constrained peers.
 The equivalent Ramanujan design keeps the useful operational idea but avoids
 coupling the system to GGUF or one model architecture:
 
-- Source readers ingest formats such as safetensors now and GGUF later.
+- Source readers ingest safetensors and GGUF (local or HTTP Range); the Phi-3
+  safetensors adapter and the Qwen35 GGUF program generator emit executable IR.
 - Architecture adapters map model-specific tensors and execution structure.
 - Tensor encoders produce Ramanujan-compatible representations.
 - Package manifests describe shards, capabilities, entrypoints, tensors, state,
@@ -209,3 +212,120 @@ Java callers continue to load `libnative.dylib`. The worker requires a
 developer-console JAR and LLM native library built with `changeShard`. Homelab
 and remote orchestrator dispatch do not yet use this protocol or provide a
 durable cross-device commit protocol.
+
+## Performance Gap & Path to 5+ tok/sec (Memory-Constrained Sharding)
+
+### Baseline Comparison: In-VRAM vs Sharded
+
+| Metric | Monolithic All-in-VRAM (`phi3_transformer_stack_4bit.py`) | Current Sharded LLM (`run_phi3_shards.py --resident-kv`) | Target Sharded LLM (Memory-Constrained) |
+|---|---|---|---|
+| **Decode Throughput** | **12.0 tok/sec** | **0.59 tok/sec** | **5.0+ tok/sec** |
+| **Decode Latency / Token** | ~83.3 ms | ~1,700 ms | $\le$ 200 ms |
+| **Memory Footprint** | Full model resident in VRAM (~2.4 GiB) | $\le$ 1 shard active + KV cache ($\le$ 1.5 GiB RSS) | $\le$ 1 shard active + staging buffer |
+| **Execution Loop** | Native GPU `while _step < n_tokens:` loop; zero host interaction | 4 shard invocations per token via Python $\leftrightarrow$ Java $\leftrightarrow$ C++ $\leftrightarrow$ OpenCL | Pipelined native execution loop; zero per-shard host overhead |
+| **Weight Buffer Churn** | Allocated once at startup; released once on exit | `clCreateBuffer` & `clReleaseMemObject` called for every tensor, 4 times/token | Pre-allocated static GPU pool; weights streamed via DMA |
+| **Storage / Page Fault I/O** | 0 bytes/token during generation | ~2 GB cold page faults/token via `madvise(MADV_DONTNEED)` | Amortized $\le$ 400 MB/token via speculative verification |
+
+### Bottleneck Breakdown: Why Sharded Decode Takes ~1,700 ms
+
+At 12 tok/sec, the 32-layer Phi-3 4-bit model requires only **~83.3 ms of total GPU compute per token** (~20.8 ms per 8-layer shard). The remaining ~1,617 ms in sharded decode is consumed by host-side and driver-side overheads across the 4 sequential shard dispatches:
+
+1. **Storage Bandwidth Wall & Page Faults (~700–900 ms/token)**:
+   In resident mode, `ArrayValue::adviseBinaryCacheIdle()` invokes `madvise(..., MADV_DONTNEED)` on weight mappings after each shard run to respect the process RSS ceiling. This forces the OS kernel to discard active pages. On the subsequent token, executing the 4 shards causes **~2.0 GB of SSD page faults per token**. Even on high-speed NVMe/Apple Unified Storage (2.5–3.0 GB/s sequential read), reading 2.0 GB every token incurs 650–800 ms of pure storage latency.
+2. **OpenCL Buffer Allocation & Tear-down Churn (~300–450 ms/token)**:
+   The generated `decode_resident.py` executes `LOAD_MEM` at the start of every shard (allocating ~40+ `cl_mem` buffers via `clCreateBuffer`) and `RELEASE_MEM` at the end (calling `clFinish()` and `clReleaseMemObject`). Tearing down and recreating OpenCL device buffers 4 times per token drains GPU execution pipelines and introduces significant driver synchronization overhead.
+3. **Cross-Process Coordination & Disk Staging (~250–350 ms/token)**:
+   Each shard transition involves:
+   - Python driver preparing directories, hard-linking state, generating CSV stubs, and calling `os.utime`.
+   - IPC over stdin/stdout pipes between Python and Java (`run`, `take`, `CHANGE_SHARD`).
+   - Hidden state (`h_state.bin`) and tokens dumped to and read from disk between shards.
+4. **JVM AST Repopulation & Protobuf Serialization (~150–200 ms/token)**:
+   For every shard invocation, `ExecuteInlineServer` runs `createJson` / `repopulateCsvArrayValues` with Java thread pools, serializes the DAG to protobuf via `RuleEngineInputProtoSerializer`, and passes the payload over JNI to C++ where `proto.ParseFromArray` reconstructs the native AST.
+
+---
+
+### The Fundamental Physics of Single-Device Memory-Constrained Sharding
+
+When running on a device whose memory capacity is strictly smaller than the model (e.g. running a model requiring 8 GiB on a 4 GiB device, or running large models on resource-constrained nodes), only a subset of layers can reside in memory at any moment.
+
+If weights are streamed sequentially for **1 token at a time**, the theoretical maximum throughput is hard-capped by sequential storage/bus bandwidth:
+$$\text{Throughput}_{\max} = \frac{\text{Storage Bandwidth (Bytes/s)}}{\text{Model Size (Bytes)}} = \frac{3.0\text{ GB/s}}{2.0\text{ GB}} \approx 1.5\text{ tokens/second}$$
+
+Even with instantaneous compute and zero software overhead, streaming 2.0 GB sequentially from a 3.0 GB/s SSD for a single token cannot exceed ~1.5 tok/sec.
+
+Therefore, the roadmap to achieve **5.0+ tok/sec** depends on the memory boundary of the target device:
+1. **Tier 1 (Model > GPU VRAM, but fits in System RAM)**: CPU RAM $\rightarrow$ GPU VRAM sharding with unified bus transfer (Target: **6.0–10.0 tok/sec**).
+2. **Tier 2 (Model > System RAM, streaming from SSD)**: High-bandwidth NVMe + 2-3 bit quantization + batched request pipelining (Target: **3.5–6.0 tok/sec**).
+
+---
+
+### Direct Engineering Solutions & Projected Throughput
+
+#### Strategy 1: Tiered Memory Sharding (CPU RAM $\leftrightarrow$ GPU VRAM Pipelining)
+* **Problem in Current Code**: `ArrayValue::adviseBinaryCacheIdle()` invokes `madvise(MADV_DONTNEED)`, which flushes weight pages completely out of system RAM to disk, forcing cold SSD page faults on every token even if system RAM has free space.
+* **Architecture**:
+  - Keep all 2.0 GB of weights resident in CPU host memory (mapped or pinned).
+  - Shard strictly across the **GPU VRAM boundary**: only 1 shard (~500 MB) resides in GPU memory at any time.
+  - Transfer weights over PCIe / system memory bus into GPU VRAM per shard.
+* **Throughput Math**:
+  - PCIe 4.0 / Unified Memory bus bandwidth: **$\ge$ 25 GB/s** (Apple Silicon unified bus: 100–150 GB/s).
+  - Host-to-Device transfer for 2.0 GB: $\frac{2.0\text{ GB}}{25\text{ GB/s}} = 80\text{ ms}$.
+  - GPU compute: $83.3\text{ ms}$.
+  - Latency per token: $80\text{ ms} + 83.3\text{ ms} = 163.3\text{ ms}$.
+  - **Expected Throughput: $\approx$ 6.1 tok/sec** (or **$\approx$ 10.0 tok/sec** with double-buffered PCIe overlap).
+
+#### Strategy 2: In-Process Native C++ Sharded Loop (Zero-IPC / Zero-Protobuf)
+* **Problem in Current Code**: Every shard transition runs Python `select()`, pipe IPC (`run`, `take`, `CHANGE_SHARD`), writes 20+ CSV stubs with 3,072 comma strings, calls Java thread pools (`repopulateCsvArrayValues`), and serializes/deserializes the entire DAG through Protobuf (`RuleEngineInputProtoSerializer`).
+* **Architecture**:
+  - Eliminate the Python and Java orchestration loop during autoregressive decode.
+  - Implement a direct native C++ runner loop:
+    ```cpp
+    void runShardedDecodeLoop(int n_tokens) {
+        for (int step = 0; step < n_tokens; ++step) {
+            shard0.run(h_state);
+            shard1.run(h_state);
+            shard2.run(h_state);
+            shard3.run(h_state, &next_token);
+        }
+    }
+    ```
+  - State (`h_state`) is passed as a direct memory pointer in RAM/VRAM without disk staging.
+* **Time Saved**: ~400–600 ms of pure CPU/IPC overhead eliminated per token.
+
+#### Strategy 3: Persistent GPU Buffer Pooling (Eliminating OpenCL Churn)
+* **Problem in Current Code**: `LOAD_MEM` calls `clCreateBuffer` 40+ times per shard; `RELEASE_MEM` calls `clFinish` and `clReleaseMemObject` 40+ times per shard (160 alloc/free calls per token).
+* **Architecture**:
+  - Pre-allocate a static GPU memory pool for 1 shard (~500 MB) plus permanent scratch buffers (`h_state`, `h_ff_buf`, `qkv_buf`).
+  - When switching shards, copy or DMA-stream new weights directly into the pre-existing GPU memory buffers via `clEnqueueWriteBuffer` without tearing down or recreating OpenCL handles.
+* **Time Saved**: ~300 ms of driver allocation and queue drain latency eliminated per token.
+
+#### Strategy 4: Coarser Sharding (2 Shards instead of 4 Shards)
+* **Architecture**:
+  - Re-shard the 32 decoder layers into **2 shards of 16 layers** (~1.0 GB each) instead of 4 shards of 8 layers.
+  - A 1.0 GB active shard fits comfortably within constrained budgets (e.g. 2–3 GiB RSS limits).
+* **Impact**:
+  - Halves the number of shard transitions, driver pipeline flushes, and memory synchronization events from 4 per token to 2 per token.
+  - Decreases boundary overhead by 50%.
+
+#### Strategy 5: Multi-Stream / Batched Sharding (for SSD-Bound Devices)
+* **Architecture**:
+  - When the model genuinely exceeds total system RAM and must stream from an SSD, batch $B = 4$ independent user queries or generation streams together.
+  - Each shard is loaded from SSD **once** and processes all $B$ tokens simultaneously through its 8 layers before the next shard is loaded.
+* **Throughput Math**:
+  - Loading 2.0 GB from a 3.0 GB/s SSD takes ~667 ms.
+  - Computing for 4 tokens takes ~100 ms.
+  - Total cycle time = 767 ms to generate 4 tokens across streams.
+  - **Expected Aggregate Throughput: $\frac{4\text{ tokens}}{0.767\text{ s}} \approx$ 5.2 tok/sec**.
+
+---
+
+### Latency & Throughput Comparison Across Engineering Paths
+
+| Implementation Path | Memory Boundary | Major Bottleneck Addressed | Expected Latency / Token | Expected tok/sec |
+|---|---|---|---|---|
+| **Current Baseline** | SSD Page-Faulted Shards | Full stack overhead + `madvise` disk faults | ~1,700 ms | **0.59 tok/s** |
+| **Path A: Native Loop + GPU Pool** | SSD Page-Faulted Shards | Removes Python/Java IPC, Protobuf, OpenCL churn | ~750–850 ms | **1.2–1.3 tok/s** |
+| **Path B: 2 Shards + Native Loop** | SSD Page-Faulted Shards | Halves shard transitions + native loop | ~600–700 ms | **1.4–1.7 tok/s** |
+| **Path C: Tiered CPU RAM $\rightarrow$ GPU Sharding** | Model fits in RAM, exceeds GPU VRAM | Weights stay in host RAM; streamed over bus | **~130–165 ms** | **6.0–7.5 tok/s** |
+| **Path D: Tiered Sharding + Double Buffering** | Model fits in RAM, exceeds GPU VRAM | Asynchronous DMA overlap hides bus transfer | **~85–100 ms** | **10.0–11.5 tok/s** |
+| **Path E: Multi-Stream Batched SSD Sharding ($B=4$)** | Model exceeds physical RAM (SSD bound) | Amortizes SSD load over $B=4$ concurrent tokens | ~190 ms / token (effective) | **5.2 tok/s (aggregate)** |

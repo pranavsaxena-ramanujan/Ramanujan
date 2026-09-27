@@ -2920,6 +2920,135 @@ public class PythonCodeRunTest {
             kernel.contains("floor("));
         }
 
+    @Test
+    public void testGpuQ41ValueReadsHalfScaleAndRawNibbles() throws Exception {
+        String pythonCode =
+            "def q4_1_matvec_GPU_1(weights, activation, output, row):\n" +
+            "    columns = 5120\n" +
+            "    blocks_per_row = 160\n" +
+            "    total = 0.0\n" +
+            "    column = 0\n" +
+            "    while column < columns:\n" +
+            "        block_index = row * blocks_per_row + column / 32\n" +
+            "        position = column % 32\n" +
+            "        weight = GGUF_Q4_1_VALUE(weights, block_index, position)\n" +
+            "        total = total + activation[column] * weight\n" +
+            "        column = column + 1\n" +
+            "    output[row] = total\n";
+
+        RuleEngineInput rei = translatePythonToRuleEngineInput(pythonCode);
+        FunctionCall function = findGpuFunctionCall(rei, "q4_1_matvec_GPU_1");
+
+        assertNotNull(function);
+        assertFalse(rei.getCommands().stream().anyMatch(command ->
+            command.getFunctionCall() != null &&
+            "GGUF_Q4_1_VALUE".equals(command.getFunctionCall().getId())));
+        String kernel = function.getOpenClCode();
+        assertTrue(kernel.contains("vload_half(0"));
+        assertTrue(kernel.contains("vload_half(1"));
+        assertTrue(kernel.contains("as_uint(weights["));
+        assertTrue(kernel.contains("& 15u"));
+        assertTrue(kernel.contains("float weight"));
+        assertTrue(kernel.contains("int block_index"));
+        assertTrue(kernel.contains("output[(int)(row)] = total"));
+    }
+
+    @Test
+    public void testGpuQ5KValueReadsScaleMinAndFiveBitQuants() throws Exception {
+        String pythonCode =
+            "def q5_k_matvec_GPU_1(weights, activation, output, row):\n" +
+            "    columns = 6144\n" +
+            "    blocks_per_row = 24\n" +
+            "    total = 0.0\n" +
+            "    column = 0\n" +
+            "    while column < columns:\n" +
+            "        block_index = row * blocks_per_row + column / 256\n" +
+            "        position = column % 256\n" +
+            "        weight = GGUF_Q5_K_VALUE(weights, block_index, position)\n" +
+            "        total = total + activation[column] * weight\n" +
+            "        column = column + 1\n" +
+            "    output[row] = total\n";
+
+        RuleEngineInput rei = translatePythonToRuleEngineInput(pythonCode);
+        FunctionCall function = findGpuFunctionCall(rei, "q5_k_matvec_GPU_1");
+
+        assertNotNull(function);
+        assertFalse(rei.getCommands().stream().anyMatch(command ->
+            command.getFunctionCall() != null &&
+            "GGUF_Q5_K_VALUE".equals(command.getFunctionCall().getId())));
+        String kernel = function.getOpenClCode();
+        assertTrue(kernel.contains("* 44u"));
+        assertTrue(kernel.contains("__global const uchar*"));
+        assertTrue(kernel.contains("vload_half(0"));
+        assertTrue(kernel.contains("vload_half(1"));
+        assertTrue(kernel.contains("& 63u"));
+        assertTrue(kernel.contains("& 15u"));
+        assertTrue(kernel.contains("& 1u) << 4u"));
+        assertTrue(kernel.contains("int block_index"));
+    }
+
+    @Test
+    public void testGpuQ6KValueReadsSignedScaleAndSixBitQuants() throws Exception {
+        String pythonCode =
+            "def q6_k_matvec_GPU_1(weights, activation, output, row):\n" +
+            "    columns = 5120\n" +
+            "    blocks_per_row = 20\n" +
+            "    total = 0.0\n" +
+            "    column = 0\n" +
+            "    while column < columns:\n" +
+            "        block_index = row * blocks_per_row + column / 256\n" +
+            "        position = column % 256\n" +
+            "        weight = GGUF_Q6_K_VALUE(weights, block_index, position)\n" +
+            "        total = total + activation[column] * weight\n" +
+            "        column = column + 1\n" +
+            "    output[row] = total\n";
+
+        RuleEngineInput rei = translatePythonToRuleEngineInput(pythonCode);
+        FunctionCall function = findGpuFunctionCall(rei, "q6_k_matvec_GPU_1");
+
+        assertNotNull(function);
+        assertFalse(rei.getCommands().stream().anyMatch(command ->
+            command.getFunctionCall() != null &&
+            "GGUF_Q6_K_VALUE".equals(command.getFunctionCall().getId())));
+        String kernel = function.getOpenClCode();
+        assertTrue(kernel.contains("* 210u"));
+        assertTrue(kernel.contains("+ 128u"));
+        assertTrue(kernel.contains("+ 192u"));
+        assertTrue(kernel.contains("+ 208u"));
+        assertTrue(kernel.contains("as_char("));
+        assertTrue(kernel.contains("vload_half(0"));
+        assertTrue(kernel.contains("& 3u) << 4u"));
+        assertTrue(kernel.contains("int block_index"));
+    }
+
+    @Test
+    public void testGpuF32RmsnormKeepsReductionAndSqrtOnDevice() throws Exception {
+        String pythonCode =
+            "def f32_rmsnorm_GPU_1(hidden, gamma, output, work_item):\n" +
+            "    dimension = 5120\n" +
+            "    squares = 0.0\n" +
+            "    index = 0\n" +
+            "    while index < dimension:\n" +
+            "        squares = squares + hidden[index] * hidden[index]\n" +
+            "        index = index + 1\n" +
+            "    inv_rms = 1.0 / sqrt(squares / dimension + 1e-6)\n" +
+            "    index = 0\n" +
+            "    while index < dimension:\n" +
+            "        output[index] = hidden[index] * inv_rms * gamma[index]\n" +
+            "        index = index + 1\n";
+
+        RuleEngineInput rei = translatePythonToRuleEngineInput(pythonCode);
+        FunctionCall function = findGpuFunctionCall(rei, "f32_rmsnorm_GPU_1");
+
+        assertNotNull(function);
+        assertFalse(rei.getCommands().stream().anyMatch(command ->
+            command.getFunctionCall() != null && "sqrt".equals(command.getFunctionCall().getId())));
+        String kernel = function.getOpenClCode();
+        assertTrue(kernel.contains("sqrt("));
+        assertTrue(kernel.contains("output[(int)(index)]"));
+        assertTrue(kernel.contains("int dimension"));
+    }
+
     /**
      * Finds the first {@link FunctionCall} in {@code rei} whose {@code isGpu} flag is true and
      * whose ID contains the given {@code functionName}.

@@ -421,6 +421,11 @@ def run_inference(args):
     package_dir = args.package_dir.resolve()
     model_dir = args.model_dir.resolve()
     manifest = json.loads((package_dir / "model-manifest.json").read_text())
+    if (manifest.get("architectureId") != "phi3" or
+            manifest.get("sourceFormat") != "safetensors" or
+            manifest.get("status") == "weights-only"):
+        raise ValueError("run_phi3_shards requires an executable Phi-3 package; "
+                         "GGUF weight shards and IR plans are not runnable by this worker")
     shards = manifest["shards"]
     if len(shards) != 4:
         raise ValueError("expected four shards")
