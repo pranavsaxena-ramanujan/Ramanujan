@@ -48,18 +48,22 @@ PYTHONPATH=. python3 -m ramanujan_shards.gguf_ir_plan \
 The output contains `model-plan.json`, one `plan.json` per shard, and
 `gguf-metadata.json` (including tokenizer metadata). `status: planning-only`
 is intentional: this is a symbolic plan, **not** Ramanujan Python DSL, a
-compiled rule-engine protobuf. `--run` still fails; use the Qwen35 runner
+compiled rule-engine protobuf. `--run` still fails; use `run_gguf_shards.py`
 below. The Phi-3 runner has fixed 3072-dimensional F32 input and Phi-3-specific
 weight names and must not be used with this package. The `nextn`/MTP block is
 auxiliary, not part of the 64-block generation path.
 
-## Running Qwen35 on Ramanujan
+## Running GGUF models on Ramanujan
+
+`run_gguf_shards.py` runs any supported architecture (llama, qwen2, qwen3,
+phi3, gemma, qwen35); see [../GGUF_MODELS.md](../GGUF_MODELS.md). The Qwen35
+example below also works via the `run_qwen35_shards.py` alias.
 
 Build `libnative_llm` (`make native_llm` in `ramanujan-native/native/build`)
 and the developer-console fat JAR, then from `ramanujan/sharded-llm`:
 
 ```sh
-python3 run_qwen35_shards.py \
+python3 run_gguf_shards.py \
   --package ~/Desktop/ramanujan_oss/Qwen3.8-27B-Q4_1-shards \
   --metadata ~/Desktop/ramanujan_oss/Qwen3.8-27B-Q4_1-ir-plan/gguf-metadata.json \
   --prompt "The capital of France is" --max-new-tokens 8 \
@@ -67,7 +71,7 @@ python3 run_qwen35_shards.py \
 ```
 
 Each shard gets its own persistent Ramanujan worker. Generated DSL programs
-(`qwen35_programs.py`) implement token-embedding decode, the Gated DeltaNet
+(`llm_programs.py`, from the `llm_spec.py` model spec) implement token-embedding decode, the Gated DeltaNet
 layer, the gated attention layer and the Q6_K output head with argmax, all
 executed as OpenCL kernels. Layers run one at a time: the runner binds that
 layer's raw GGUF weights, returns the hidden state plus DeltaNet recurrent/conv
@@ -78,8 +82,8 @@ token with each worker under 300 MB RSS. Decoding is greedy, and
 `--max-context` bounds the KV cache.
 
 `--check-layers N` compares the hidden state after each of the first N layers
-with `qwen35_reference.py`, a NumPy port of swarmllm's llama.cpp-checked
-`ref_q38.mjs`; `--reference-token` also compares the first token's logits.
+with `llm_reference.py` (bit-identical on Qwen35 to `qwen35_reference.py`, a NumPy port of swarmllm's llama.cpp-checked
+`ref_q38.mjs`); `--reference-token` also compares the first token's logits.
 All 64 layers matched within 2e-5 relative error, and the output head chose the
 same token with a maximum logit error of 5e-5.
 

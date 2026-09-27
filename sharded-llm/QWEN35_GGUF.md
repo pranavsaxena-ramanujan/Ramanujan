@@ -14,6 +14,10 @@ The hidden state after all 64 layers matches an independent NumPy reference
 within 2e-5 relative error, and the output head selects the same token (max
 logit error 5e-5). See [Validation](#validation).
 
+The runner and program generator are architecture-generic; the same pipeline runs
+llama, qwen2, qwen3, phi3 and gemma GGUFs. See [GGUF_MODELS.md](GGUF_MODELS.md).
+This document covers the Qwen35 specifics and the shared infrastructure.
+
 Contents: [Infrastructure](#infrastructure) ·
 [GGUF → shards → IR](#converting-gguf-into-ramanujan-shards-and-ir) ·
 [How shards run](#how-the-shards-run) · [Validation](#validation) ·
@@ -24,9 +28,9 @@ Contents: [Infrastructure](#infrastructure) ·
 
 ```mermaid
 flowchart LR
-    subgraph Host["Python orchestrator: run_qwen35_shards.py"]
+    subgraph Host["Python orchestrator: run_gguf_shards.py"]
         TOK["GGUF tokenizer<br/>(qwen35 BPE)"]
-        GEN["qwen35_programs.py<br/>generates 4 DSL programs"]
+        GEN["llm_programs.py<br/>generates 4 DSL programs"]
         BIND["per-layer binding<br/>weights + state files"]
     end
     subgraph W0["Worker 0: JVM ExecuteInlineServer"]
@@ -48,10 +52,10 @@ flowchart LR
 
 | Layer | Component | Role |
 |---|---|---|
-| Orchestration | `sharded-llm/run_qwen35_shards.py` | Tokenizes input, owns the shard → worker mapping, binds each layer's tensors and state, moves the hidden state between workers, and runs the decode loop. |
-| Program generation | `converter/ramanujan_shards/qwen35_programs.py` | Emits the embedding, DeltaNet-layer, attention-layer, and output-head programs from GGUF metadata. |
+| Orchestration | `sharded-llm/run_gguf_shards.py` (`run_qwen35_shards.py` is an alias) | Tokenizes input, owns the shard → worker mapping, binds each layer's tensors and state, moves the hidden state between workers, and runs the decode loop. |
+| Program generation | `converter/ramanujan_shards/llm_spec.py`, `llm_programs.py` | Infers the layer kinds from the GGUF tensors and metadata, then emits the embedding, one program per layer kind (here DeltaNet and attention), and output-head programs. |
 | Worker | `developer-console` `ExecuteInlineServer` | A persistent JVM per shard. It compiles each program once (cached by input shapes), then executes it, returns arrays, and evicts weights on command. |
-| Translation | `middleware/translation` | Converts `_GPU_N` Python functions to OpenCL C. The `GGUF_Q4_1_VALUE`, `GGUF_Q5_K_VALUE`, and `GGUF_Q6_K_VALUE` intrinsics decode raw GGUF blocks inside the kernel. |
+| Translation | `middleware/translation` | Converts `_GPU_N` Python functions to OpenCL C. `GGUF_<type>_VALUE` intrinsics (F16, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q4_K, Q5_K, Q6_K) decode raw GGUF blocks inside the kernel. |
 | Native runtime | `ramanujan-native` `libnative_llm` | Maps binary tensor files, manages OpenCL buffers (`LOAD_MEM`, `GPU_SYNC`, `RELEASE_MEM`), dispatches kernels, and writes `RETURN` arrays to files. |
 | Storage | Shard directories | Raw GGUF tensor bytes, one `.bin` file per tensor, with SHA-256 checksums. |
 
@@ -70,7 +74,7 @@ flowchart TD
     P --> E["emit_gguf_package<br/>raw tensor bytes + manifests + SHA-256"]
     E --> V["verify_gguf<br/>checksums, coverage, byte lengths"]
     V --> I["gguf_ir_plan<br/>operator inventory + bindings + GGUF metadata"]
-    I --> Q["qwen35_programs<br/>validated shapes/encodings → 4 DSL programs"]
+    I --> Q["llm_spec + llm_programs<br/>validated shapes/encodings → 4 DSL programs"]
     Q --> T["translation<br/>DSL → RuleEngineInput + OpenCL"]
 ```
 
@@ -126,9 +130,14 @@ byte lengths and layer coverage.
 
 `gguf_ir_plan` reads the verified package and classifies each layer:
 
-- `gated_deltanet` if it has `ssm_conv1d.weight`
-- `causal_attention` if it has `attn_q.weight`
+- `gated_deltanet` if it has `ssm_conv1d.weight`, `ssm_a` and `ssm_beta.weight`
+- `causal_attention` if it has `attn_q.weight` or `attn_qkv.weight`
 - `auxiliary` for `nextn`
+- `unsupported` (with a reason, e.g. mixture of experts) otherwise
+
+This uses the same `llm_spec.mixer_for` classification as the runner, and the
+required capabilities are architecture-neutral (`llm.causal_attention`,
+`llm.gated_deltanet`).
 
 It records every tensor binding (shard, path, encoding, shape, checksum) and
 exports the original GGUF metadata, including the tokenizer, to
@@ -137,8 +146,8 @@ vocabulary at run time.
 
 ### 5. Generating the executable IR
 
-`qwen35_programs.py` turns metadata plus the package's tensor table into
-Ramanujan DSL. Before emitting anything, it checks the following, failing
+`llm_spec.build_spec` turns metadata plus the package's tensor table into a
+model spec, and `llm_programs.py` turns that spec into Ramanujan DSL. Before emitting anything, it checks the following, failing
 closed on any mismatch:
 
 - every layer of each kind has identical tensor shapes and encodings
@@ -152,8 +161,8 @@ The DeltaNet/attention interleave comes from
 | Program | Runs on | Kernels (each `_GPU_1`, one work item per output element or head) |
 |---|---|---|
 | `embed.py` | shard owning `token_embd` | `embed`: decode one Q4_1 embedding row |
-| `delta.py` | 48 DeltaNet layers | RMSNorm → QKV/Z/β/α matvecs → `dn_gate` (softplus·A, sigmoid β) → `dn_conv` (causal conv1d + SiLU; updates conv state) → `dn_l2` (per-head L2 norm) → `dn_delta` (decay, delta-rule update of the 48×128×128 recurrent state, readout) → `dn_gatenorm` (per-head RMSNorm · SiLU(z)) → Q5_K output matvec → residual → SwiGLU FFN → residual |
-| `attn.py` | 16 attention layers | RMSNorm → Q (with gate)/K/V matvecs → `attn_qnorm`/K RMSNorm → NeoX RoPE (64 of 256 dims, θ=1e7) → `kv_store` → `attn_scores` → `attn_mix` (softmax · V · sigmoid(gate)) → output matvec → residual → SwiGLU FFN → residual |
+| `kind-delta0.py` | 48 DeltaNet layers | RMSNorm → QKV/Z/β/α matvecs → `dn_gate` (softplus·A, sigmoid β) → `dn_conv` (causal conv1d + SiLU; updates conv state) → `dn_l2` (per-head L2 norm) → `dn_delta` (decay, delta-rule update of the 48×128×128 recurrent state, readout) → `dn_gatenorm` (per-head RMSNorm · SiLU(z)) → Q5_K output matvec → residual → SwiGLU FFN → residual |
+| `kind-attn0.py` | 16 attention layers | RMSNorm → Q (with gate)/K/V matvecs → `attn_qnorm`/K RMSNorm → NeoX RoPE (64 of 256 dims, θ=1e7) → `kv_store` → `attn_scores` → `attn_mix` (softmax · V · sigmoid(gate)) → output matvec → residual → SwiGLU FFN → residual |
 | `head.py` | shard owning `output.weight` | final RMSNorm → Q6_K 248320-row matvec → `argmax` |
 
 The matvec kernels read quantized weights directly. For example:
@@ -181,8 +190,8 @@ Each program ends with `GPU_SYNC` and `RETURN` for its outputs:
 
 | Program | Returns |
 |---|---|
-| `delta.py` | `h_state`, `ssm_s_state`, `ssm_conv_state` |
-| `attn.py` | `h_state`, `attn_k_cache`, `attn_v_cache` |
+| `kind-delta0.py` | `h_state`, `ssm_s_state`, `ssm_conv_state` |
+| `kind-attn0.py` | `h_state`, `attn_k_cache`, `attn_v_cache` |
 | `head.py` | `logits`, `argmax_arr` |
 
 ## How the shards run
@@ -196,7 +205,7 @@ sequenceDiagram
     participant W3 as Worker shard-03
     O->>W0: run embed.py (token row) → take h_state
     loop layers 0-15
-        O->>W0: run delta.py / attn.py → take h_state + layer state
+        O->>W0: run kind-delta0.py / kind-attn0.py → take h_state + layer state
         O->>W0: EVICT_WEIGHTS
     end
     loop layers 16-31
@@ -298,6 +307,8 @@ warm a remote worker's page cache.
 
 `qwen35_reference.py` is a NumPy port of swarmllm's `tests/reference/ref_q38.mjs`,
 a CPU reference its authors checked against llama.cpp's `llama-eval-callback`.
+The runner now checks against the generic `llm_reference.py`, which is
+bit-identical to `qwen35_reference.py` on 27B layers 0–3 over 2 tokens.
 It reads the same shard files through vectorized Q4_1/Q5_K/Q6_K decoders; tests
 check those decoders against the per-row decoders and an independent
 JavaScript GGUF decoder.
@@ -308,7 +319,8 @@ JavaScript GGUF decoder.
 | `--reference-token` | Ramanujan token 314 = reference token 314, max logit error 5.1e-5 |
 | Tokenizer | `"The"` → 760 (matches the reference); chat tokens are recognized as specials |
 | Single-operator probes (`run_q4_1_probe.py`, `run_q5_k_probe.py`, `run_q6_k_probe.py`, `run_f32_probe.py`, `run_f32_rmsnorm_probe.py`) | device output vs CPU oracle, max abs error ≤ 4e-7 |
-| Unit tests | `converter/tests` (51 tests); Java translation tests for each GGUF intrinsic |
+| Generic runner (`run_gguf_shards.py`) | `--check-layers 4`: 1.2e-6; same " 391" answer to "17 × 23"; 9.1 s/token vs 9.2 s/token for the previous Qwen35-only runner, measured back to back |
+| Unit tests | `converter/tests` (66 tests); Java translation tests for each GGUF intrinsic |
 
 ## Commands
 
@@ -327,14 +339,14 @@ PYTHONPATH=. python3 -m ramanujan_shards.gguf_ir_plan \
   --output-dir ~/Desktop/ramanujan_oss/Qwen3.8-27B-Q4_1-ir-plan
 
 # Generate (from ramanujan/sharded-llm)
-python3 run_qwen35_shards.py \
+python3 run_gguf_shards.py \
   --package ~/Desktop/ramanujan_oss/Qwen3.8-27B-Q4_1-shards \
   --metadata ~/Desktop/ramanujan_oss/Qwen3.8-27B-Q4_1-ir-plan/gguf-metadata.json \
   --prompt "The capital of France is" --max-new-tokens 8 --work-dir /tmp/qwen35-run
 
 # Parity checks
-python3 run_qwen35_shards.py ... --prompt "The capital" --check-layers 64 --work-dir /tmp/qwen35-check
-python3 run_qwen35_shards.py ... --max-new-tokens 1 --reference-token --work-dir /tmp/qwen35-head
+python3 run_gguf_shards.py ... --prompt "The capital" --check-layers 64 --work-dir /tmp/qwen35-check
+python3 run_gguf_shards.py ... --max-new-tokens 1 --reference-token --work-dir /tmp/qwen35-head
 
 # Tests
 (cd converter && PYTHONPATH=. python3 -m unittest discover -s tests)
@@ -351,7 +363,7 @@ Useful flags:
 | `--verbose` | off | Print per-layer timing |
 | `--homelab URL` | off | Run steps on `rj homelab`/`rj worker` ([Distributed](#distributed-rj-homelab-and-rj-worker)) |
 | `--resident-weights` | off | With `--homelab`, keep weights mapped between steps |
-| `--row-cache` | `~/.cache/ramanujan/qwen35-embedding-rows` | Shared token-row directory |
+| `--row-cache` | `~/.cache/ramanujan/gguf-embedding-rows` | Shared token-row directory |
 | `--prefetch-steps` | 1 (0 with `--homelab`) | Steps to read ahead into the page cache |
 | `--prefetch-threads` | 2 | Background prefetch reader threads |
 | `--java`, `--jar`, `--native-dir` | | Choose the runtime binaries |
@@ -369,7 +381,7 @@ task can carry an affinity and use the worker binary cache.
 
 ```mermaid
 sequenceDiagram
-    participant R as run_qwen35_shards.py
+    participant R as run_gguf_shards.py
     participant H as rj homelab
     participant A as rj worker A
     participant B as rj worker B
@@ -428,7 +440,7 @@ rj worker http://HOMELAB:8888 1 --native-library native_llm \
   --cache ~/.ramanujan/worker-cache --max-shards 2
 
 # Driver, on the homelab host
-python3 run_qwen35_shards.py --homelab http://localhost:8888 \
+python3 run_gguf_shards.py --homelab http://localhost:8888 \
   --package ~/Desktop/ramanujan_oss/Qwen3.8-27B-Q4_1-shards \
   --metadata ~/Desktop/ramanujan_oss/Qwen3.8-27B-Q4_1-ir-plan/gguf-metadata.json \
   --prompt "The capital of France is" --max-new-tokens 8 --work-dir /tmp/qwen35-homelab
@@ -476,10 +488,9 @@ does not reach 5 tok/s; that needs faster native kernels (see Limitations).
   weights. The remaining costs are many small OpenCL kernels per layer, scalar
   dequantization in the matvec kernels, and per-call protobuf and graph setup. The prompt is
   processed one token at a time within each layer.
-- **Architecture coverage.** The runner accepts only `qwen35` packages whose
-  per-layer encodings are F32/Q4_1/Q5_K/Q6_K. Q8_0 (present only in `nextn`)
-  has no kernel. Other GGUF architectures can be sharded and planned but
-  need their own program generator.
+- **Architecture coverage.** See [GGUF_MODELS.md](GGUF_MODELS.md) for the
+  supported architectures, quant types and tokenizers. The `nextn`/MTP block
+  is not executed.
 - **Tokenizer location.** Tokenizer metadata comes from `gguf-metadata.json`
   (the IR plan output), not from the shard package itself.
 
@@ -487,13 +498,16 @@ does not reach 5 tok/s; that needs faster native kernels (see Limitations).
 
 | Path | Purpose |
 |---|---|
-| `sharded-llm/run_qwen35_shards.py` | Four-worker Qwen35 runner (local JVMs or `--homelab`), parity checks |
+| `sharded-llm/run_gguf_shards.py` | Generic sharded GGUF runner (local JVMs or `--homelab`), parity checks; `run_qwen35_shards.py` is an alias |
+| `sharded-llm/compare_llama_cpp.py` | NumPy reference vs llama.cpp logits and greedy output |
 | `converter/ramanujan_shards/gguf_source.py` | Streaming GGUF reader (local and HTTP Range) |
 | `converter/ramanujan_shards/gguf_adapter.py`, `planner.py` | Layer grouping and byte-balanced shard planning |
 | `converter/ramanujan_shards/gguf_emitter.py`, `emit_gguf.py`, `verify_gguf.py` | Package emission and verification |
 | `converter/ramanujan_shards/gguf_ir_plan.py` | Symbolic IR plan and metadata export |
-| `converter/ramanujan_shards/qwen35_programs.py` | Executable Ramanujan DSL for Qwen35 |
-| `converter/ramanujan_shards/qwen35_reference.py` | NumPy reference and vectorized GGUF decoders |
+| `converter/ramanujan_shards/llm_spec.py`, `llm_programs.py`, `llm_package.py` | Model spec from GGUF tensors/metadata, generic DSL generator, package loader |
+| `converter/ramanujan_shards/llm_reference.py`, `llm_tokenizer.py`, `dsl_simulator.py` | Generic NumPy reference, GGUF BPE/SPM tokenizer, Python executor for generated DSL |
+| `converter/ramanujan_shards/qwen35_programs.py` | Original Qwen35-only DSL generator (superseded by `llm_programs.py`) |
+| `converter/ramanujan_shards/qwen35_reference.py` | Original Qwen35 NumPy reference (llama.cpp-checked port) |
 | `converter/ramanujan_shards/qwen35_tokenizer.py` | GGUF `qwen35` BPE tokenizer |
 | `converter/ramanujan_shards/gguf_q4_1.py`, `gguf_q5_k.py`, `gguf_q6_k.py`, `gguf_f32_*.py` | Per-format CPU oracles and single-operator programs |
 | `middleware/translation/.../GpuFunctionBodyConverter.java` | `GGUF_*_VALUE` intrinsics → OpenCL |

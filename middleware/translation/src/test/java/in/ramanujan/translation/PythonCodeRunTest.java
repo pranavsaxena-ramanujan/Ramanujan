@@ -3021,6 +3021,78 @@ public class PythonCodeRunTest {
         assertTrue(kernel.contains("int block_index"));
     }
 
+    private String ggufIntrinsicKernel(String intrinsic, int blockSize) throws Exception {
+        String pythonCode =
+            "def gguf_matvec_GPU_1(weights, activation, output, row):\n" +
+            "    total = 0.0\n" +
+            "    column = 0\n" +
+            "    while column < 512:\n" +
+            "        block_index = row * " + (512 / blockSize) + " + column / " + blockSize + "\n" +
+            "        position = column % " + blockSize + "\n" +
+            "        weight = " + intrinsic + "(weights, block_index, position)\n" +
+            "        total = total + activation[column] * weight\n" +
+            "        column = column + 1\n" +
+            "    output[row] = total\n";
+        RuleEngineInput rei = translatePythonToRuleEngineInput(pythonCode);
+        FunctionCall function = findGpuFunctionCall(rei, "gguf_matvec_GPU_1");
+        assertNotNull(function);
+        assertFalse(rei.getCommands().stream().anyMatch(command ->
+            command.getFunctionCall() != null &&
+            intrinsic.equals(command.getFunctionCall().getId())));
+        String kernel = function.getOpenClCode();
+        assertFalse(kernel.contains(intrinsic));
+        assertTrue(kernel.contains("float weight"));
+        return kernel;
+    }
+
+    @Test
+    public void testGpuByteBlockGgufIntrinsicsUseBlockLayouts() throws Exception {
+        String q4_0 = ggufIntrinsicKernel("GGUF_Q4_0_VALUE", 32);
+        assertTrue(q4_0.contains("* 18u"));
+        assertTrue(q4_0.contains("- 8)"));
+
+        String q5_0 = ggufIntrinsicKernel("GGUF_Q5_0_VALUE", 32);
+        assertTrue(q5_0.contains("* 22u"));
+        assertTrue(q5_0.contains("+ 6u +"));
+        assertTrue(q5_0.contains("& 7u)) & 1u) << 4u)"));
+        assertTrue(q5_0.contains("- 16)"));
+
+        String q5_1 = ggufIntrinsicKernel("GGUF_Q5_1_VALUE", 32);
+        assertTrue(q5_1.contains("* 24u"));
+        assertTrue(q5_1.contains("+ 8u +"));
+        assertTrue(q5_1.contains("vload_half(1"));
+
+        String q8_0 = ggufIntrinsicKernel("GGUF_Q8_0_VALUE", 32);
+        assertTrue(q8_0.contains("* 34u"));
+        assertTrue(q8_0.contains("as_char("));
+
+        String q4_k = ggufIntrinsicKernel("GGUF_Q4_K_VALUE", 256);
+        assertTrue(q4_k.contains("* 144u"));
+        assertTrue(q4_k.contains("& 63u"));
+        assertTrue(q4_k.contains("+ 16u +"));
+        assertTrue(q4_k.contains("vload_half(1"));
+
+        String f16 = ggufIntrinsicKernel("GGUF_F16_VALUE", 2);
+        assertTrue(f16.contains("* 2u +"));
+        assertTrue(f16.contains("__global const half*"));
+    }
+
+    @Test
+    public void testGpuByteBlockGgufIntrinsicsAcceptInlineModuloArguments() throws Exception {
+        String[] intrinsics = {"GGUF_Q4_0_VALUE", "GGUF_Q5_0_VALUE", "GGUF_Q5_1_VALUE", "GGUF_Q8_0_VALUE",
+            "GGUF_Q4_K_VALUE", "GGUF_F16_VALUE"};
+        int[] blocks = {32, 32, 32, 32, 256, 2};
+        for (int k = 0; k < intrinsics.length; k++) {
+            String pythonCode =
+                "def embed_GPU_1(emb_row, out, i):\n" +
+                "    out[i] = " + intrinsics[k] + "(emb_row, i / " + blocks[k] + ", i % " + blocks[k] + ")\n";
+            FunctionCall function = findGpuFunctionCall(translatePythonToRuleEngineInput(pythonCode), "embed_GPU_1");
+            assertNotNull(intrinsics[k], function);
+            assertFalse(intrinsics[k], function.getOpenClCode().contains(intrinsics[k]));
+            assertTrue(intrinsics[k], function.getOpenClCode().contains("% " + blocks[k]));
+        }
+    }
+
     @Test
     public void testGpuF32RmsnormKeepsReductionAndSqrtOnDevice() throws Exception {
         String pythonCode =

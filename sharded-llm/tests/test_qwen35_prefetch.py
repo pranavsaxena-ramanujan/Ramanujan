@@ -5,7 +5,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-import run_qwen35_shards as runner  # noqa: E402
+import run_gguf_shards as runner  # noqa: E402
 
 
 class RecordingPrefetcher(runner.WeightPrefetcher):
@@ -20,7 +20,7 @@ class RecordingPrefetcher(runner.WeightPrefetcher):
 
 
 def _runner(prefetch_steps, layers=3, head=True):
-    instance = runner.Qwen35Runner.__new__(runner.Qwen35Runner)
+    instance = runner.GgufRunner.__new__(runner.GgufRunner)
     instance.args = SimpleNamespace(prefetch_steps=prefetch_steps)
     instance.prefetcher = RecordingPrefetcher()
     instance.cycle = [("layer", layer) for layer in range(layers)] + ([("head", None)] if head else [])

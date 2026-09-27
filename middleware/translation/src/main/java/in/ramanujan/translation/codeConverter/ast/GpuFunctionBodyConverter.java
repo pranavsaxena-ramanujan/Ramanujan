@@ -504,6 +504,10 @@ public class GpuFunctionBodyConverter {
                 return "(vload_half(0, " + scale + ") * ((float)" + subscale + ") *"
                     + " ((float)((int)" + quant + " - 32)))";
             }
+            String ggufValue = convertGgufByteBlockValue(calledName, call);
+            if (ggufValue != null) {
+                return ggufValue;
+            }
             // Guard: self-recursion is not permitted in GPU kernel or device-function code.
             if (calledName != null && calledName.equals(currentGeneratingFuncName)) {
                 throw new IllegalArgumentException(
@@ -554,6 +558,75 @@ public class GpuFunctionBodyConverter {
      * @return the complete OpenCL C device function source, followed by two newlines
      * @throws IllegalArgumentException if a recursive self-call is found in the body
      */
+    /**
+     * GGUF_{TYPE}_VALUE(weights, block, position) for byte-addressed ggml block layouts.
+     * {@code weights} is the raw tensor file loaded as a float array; {@code block} is the
+     * global block index and {@code position} the element within the block. Returns
+     * {@code null} when {@code calledName} is not one of these intrinsics.
+     */
+    private String convertGgufByteBlockValue(String calledName, CallNode call) {
+        if (calledName == null || call.getArgs().size() != 3) {
+            return null;
+        }
+        String weights = convertExpr(call.getArgs().get(0));
+        String block = "((uint)(" + convertExpr(call.getArgs().get(1)) + "))";
+        String position = "((uint)(" + convertExpr(call.getArgs().get(2)) + "))";
+        String bytes = "((__global const uchar*)(" + weights + "))";
+        if ("GGUF_F16_VALUE".equals(calledName)) {
+            return "vload_half(" + block + " * 2u + " + position + ", ((__global const half*)("
+                + weights + ")))";
+        }
+        int blockBytes;
+        if ("GGUF_Q4_0_VALUE".equals(calledName)) {
+            blockBytes = 18;
+        } else if ("GGUF_Q5_0_VALUE".equals(calledName)) {
+            blockBytes = 22;
+        } else if ("GGUF_Q5_1_VALUE".equals(calledName)) {
+            blockBytes = 24;
+        } else if ("GGUF_Q8_0_VALUE".equals(calledName)) {
+            blockBytes = 34;
+        } else if ("GGUF_Q4_K_VALUE".equals(calledName)) {
+            blockBytes = 144;
+        } else {
+            return null;
+        }
+        String base = "(" + block + " * " + blockBytes + "u)";
+        String halves = "((__global const half*)(&" + bytes + "[" + base + "]))";
+        String d = "vload_half(0, " + halves + ")";
+        // 4-bit quant in the low (position < 16) or high nibble of byte qs[position & 15].
+        String nibble = "((" + bytes + "[" + base + " + @OFFSETu + (" + position + " & 15u)] >> (("
+            + position + " >> 4u) * 4u)) & 15u)";
+        // Fifth bit: bit `position` of the little-endian 32-bit qh word.
+        String highBit = "(((" + bytes + "[" + base + " + @OFFSETu + (" + position + " >> 3u)] >> ("
+            + position + " & 7u)) & 1u) << 4u)";
+        if ("GGUF_Q4_0_VALUE".equals(calledName)) {
+            return "(" + d + " * ((float)((int)" + nibble.replace("@OFFSET", "2") + " - 8)))";
+        }
+        if ("GGUF_Q5_0_VALUE".equals(calledName)) {
+            return "(" + d + " * ((float)((int)(" + nibble.replace("@OFFSET", "6") + " | "
+                + highBit.replace("@OFFSET", "2") + ") - 16)))";
+        }
+        if ("GGUF_Q5_1_VALUE".equals(calledName)) {
+            return "(" + d + " * ((float)(" + nibble.replace("@OFFSET", "8") + " | "
+                + highBit.replace("@OFFSET", "4") + ")) + vload_half(1, " + halves + "))";
+        }
+        if ("GGUF_Q8_0_VALUE".equals(calledName)) {
+            return "(" + d + " * ((float)as_char(" + bytes + "[" + base + " + 2u + " + position + "])))";
+        }
+        // Q4_K: d, dmin, 12 bytes of packed 6-bit scales/mins, then 128 bytes of nibbles.
+        String group = "(" + position + " >> 5u)";
+        String scales = bytes + "[" + base + " + ";
+        String scale = "(" + group + " < 4u ? (" + scales + "4u + " + group + "] & 63u)"
+            + " : ((" + scales + "8u + " + group + "] & 15u) | ((" + scales + group + "] >> 6u) << 4u)))";
+        String minimum = "(" + group + " < 4u ? (" + scales + "8u + " + group + "] & 63u)"
+            + " : ((" + scales + "8u + " + group + "] >> 4u) | ((" + scales + "4u + " + group
+            + "] >> 6u) << 4u)))";
+        String quant = "((" + scales + "16u + (" + group + " >> 1u) * 32u + (" + position
+            + " & 31u)] >> ((" + group + " & 1u) * 4u)) & 15u)";
+        return "(" + d + " * ((float)" + scale + ") * ((float)" + quant + ") - vload_half(1, "
+            + halves + ") * ((float)" + minimum + "))";
+    }
+
     private String convertHelperFunction(FunctionDefNode helper) {
         // Save per-conversion state so helper conversion does not corrupt kernel conversion.
         Set<String> savedParamNames            = this.paramNames;

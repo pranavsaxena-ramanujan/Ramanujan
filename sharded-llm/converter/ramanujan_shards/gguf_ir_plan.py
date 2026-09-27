@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Optional, Union
 
 from .gguf_source import GGUFSourceReader
+from .llm_spec import mixer_for
 
 
 _LAYER = re.compile(r"^blk\.([0-9]+)\.(.+)$")
@@ -53,21 +54,24 @@ def build_ir_plan(package_dir: Path) -> dict:
                 raise ValueError("non-contiguous layer tensors in {0}".format(shard["shardId"]))
             next_layer = manifest["layerEnd"]
         for index, names in sorted(by_layer.items()):
-            if any(name.startswith("nextn.") for name in names):
-                kind = "auxiliary"
-            elif "ssm_conv1d.weight" in names:
-                kind = "gated_deltanet"
-                required.add("qwen35.gated_deltanet")
-            elif "attn_q.weight" in names:
-                kind = "causal_attention"
-                required.add("qwen35.causal_attention")
+            layer = {"index": index,
+                     "tensors": ["blk.{0}.{1}".format(index, name) for name in sorted(names)]}
+            mixer = ("auxiliary" if any(name.startswith("nextn.") for name in names)
+                     else mixer_for(names))
+            if mixer == "gated_deltanet":
+                layer.update(operator="gated_deltanet", state="recurrent_and_conv")
+                required.add("llm.gated_deltanet")
+            elif mixer == "attention":
+                layer.update(operator="causal_attention", state="kv_cache")
+                required.add("llm.causal_attention")
+            elif mixer == "auxiliary":
+                layer.update(operator="auxiliary", state="none")
             else:
-                kind = "unknown"
-                required.add("architecture.{0}.block".format(package["architectureId"]))
-            layers.append({"index": index, "operator": kind,
-                           "state": ("recurrent_and_conv" if kind == "gated_deltanet" else
-                                     "kv_cache" if kind == "causal_attention" else "none"),
-                           "tensors": ["blk.{0}.{1}".format(index, name) for name in sorted(names)]})
+                reason = mixer.split(":", 1)[1]
+                layer.update(operator="unsupported", state="none", reason=reason)
+                required.add("architecture.{0}.{1}".format(
+                    package["architectureId"], re.sub(r"[^a-z0-9]+", "_", reason.lower()).strip("_")))
+            layers.append(layer)
         if any(tensor["encoding"] != "gguf-f32" for tensor in tensors.values()):
             required.add("gguf.quantized_tensor_decode")
         stages.append({"shardId": shard["shardId"],

@@ -14,7 +14,7 @@ class GGUFIRPlanTest(unittest.TestCase):
             root = Path(directory)
             (root / "model-manifest.json").write_text(json.dumps({
                 "sourceFormat": "gguf", "status": "weights-only", "partial": False,
-                "architectureId": "qwen35", "metadata": {"layer_count": "3", "tensor_count": "4"},
+                "architectureId": "qwen35", "metadata": {"layer_count": "3", "tensor_count": "6"},
                 "shards": [{"shardId": "shard-00", "manifestPath": "shard-00/manifest.json"}],
             }), encoding="utf-8")
             shard = root / "shard-00"
@@ -27,13 +27,15 @@ class GGUFIRPlanTest(unittest.TestCase):
                     for name, encoding in (
                         ("token_embd.weight", "gguf-q4_1"),
                         ("blk.0.ssm_conv1d.weight", "gguf-q4_1"),
+                        ("blk.0.ssm_a", "gguf-f32"),
+                        ("blk.0.ssm_beta.weight", "gguf-q4_1"),
                         ("blk.1.attn_q.weight", "gguf-q4_1"),
                         ("blk.2.nextn.eh_proj.weight", "gguf-f32"),
                     )
                 },
                 "checksums": {"weights/" + name + ".bin": "sha256:" + "0" * 64
                               for name in ("token_embd.weight", "blk.0.ssm_conv1d.weight",
-                                           "blk.1.attn_q.weight", "blk.2.nextn.eh_proj.weight")},
+                                           "blk.0.ssm_a", "blk.0.ssm_beta.weight", "blk.1.attn_q.weight", "blk.2.nextn.eh_proj.weight")},
             }), encoding="utf-8")
 
             plan = build_ir_plan(root)
@@ -41,7 +43,9 @@ class GGUFIRPlanTest(unittest.TestCase):
             self.assertEqual("planning-only", plan["status"])
             self.assertEqual(["gated_deltanet", "causal_attention", "auxiliary"],
                              [layer["operator"] for layer in plan["stages"][0]["layers"]])
-            self.assertEqual(4, len(plan["tensorBindings"]))
+            self.assertEqual(6, len(plan["tensorBindings"]))
+            self.assertIn("llm.gated_deltanet", plan["requiredCapabilities"])
+            self.assertIn("llm.causal_attention", plan["requiredCapabilities"])
             with self.assertRaisesRegex(RuntimeError, "no executable Ramanujan GGUF backend"):
                 require_executable(plan)
             with self.assertRaisesRegex(RuntimeError, "no executable Ramanujan GGUF backend"):
@@ -54,6 +58,31 @@ class GGUFIRPlanTest(unittest.TestCase):
                 (root / "plan" / "shard-00" / "plan.json").read_text(encoding="utf-8"))["status"])
             with self.assertRaisesRegex(ValueError, "already exists"):
                 write_ir_plan(root, root / "plan")
+
+    def test_classifies_layers_by_tensors_for_any_architecture(self):
+        names = ("token_embd.weight", "blk.0.attn_q.weight", "blk.1.attn_q.weight", "blk.1.ffn_gate_inp.weight")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "model-manifest.json").write_text(json.dumps({
+                "sourceFormat": "gguf", "status": "weights-only", "partial": False,
+                "architectureId": "llama", "metadata": {"layer_count": "2", "tensor_count": "4"},
+                "shards": [{"shardId": "shard-00", "manifestPath": "shard-00/manifest.json"}],
+            }), encoding="utf-8")
+            (root / "shard-00").mkdir()
+            (root / "shard-00" / "manifest.json").write_text(json.dumps({
+                "shardId": "shard-00", "layerStart": 0, "layerEnd": 2,
+                "tensorFiles": {name: {"encoding": "gguf-q4_0", "path": "weights/" + name + ".bin",
+                                       "shape": [32], "bytes": 18, "ggmlType": 2} for name in names},
+                "checksums": {"weights/" + name + ".bin": "sha256:" + "0" * 64 for name in names},
+            }), encoding="utf-8")
+
+            layers = build_ir_plan(root)["stages"][0]["layers"]
+            required = build_ir_plan(root)["requiredCapabilities"]
+
+            self.assertEqual(["causal_attention", "unsupported"], [layer["operator"] for layer in layers])
+            self.assertEqual("mixture-of-experts layers", layers[1]["reason"])
+            self.assertIn("llm.causal_attention", required)
+            self.assertIn("architecture.llama.mixture_of_experts_layers", required)
 
     def test_rejects_unrelated_gguf_before_writing(self):
         with tempfile.TemporaryDirectory() as directory:

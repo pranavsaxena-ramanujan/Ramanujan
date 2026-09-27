@@ -8,7 +8,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-import run_qwen35_shards as runner  # noqa: E402
+import run_gguf_shards as runner  # noqa: E402
 
 
 class FakeHomelab(BaseHTTPRequestHandler):
