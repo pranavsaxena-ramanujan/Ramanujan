@@ -10,6 +10,11 @@ output:  " Paris.\nThe capital of Germany is"
 speed:   ~7.6 s/token (greedy, SSD-bound), every worker below 1.3 GB RSS
 ```
 
+With `--runtime native` ([NATIVE_LLM.md](NATIVE_LLM.md)), the same shards run
+on the dedicated OpenCL LLM runtime at ~5.0 s/token. That run streams the
+weights and bypasses the page cache, and it gives the same answer to
+"17 × 23" (`--check-layers 4`: 3.1e-7).
+
 The hidden state after all 64 layers matches an independent NumPy reference
 within 2e-5 relative error, and the output head selects the same token (max
 logit error 5e-5). See [Validation](#validation).
@@ -329,6 +334,7 @@ JavaScript GGUF decoder.
 (cd middleware/translation && mvn -q -DskipTests install)
 (cd developer-console && mvn -q -DskipTests package)
 (cd ramanujan-native/native/build && make native_llm)
+(cd ramanujan-native/native/build && make ramanujan_llm)   # --runtime native
 
 # Convert, verify, plan (from ramanujan/sharded-llm/converter)
 PYTHONPATH=. python3 -m ramanujan_shards.emit_gguf \
@@ -367,8 +373,10 @@ Useful flags:
 | `--prefetch-steps` | 1 (0 with `--homelab`) | Steps to read ahead into the page cache |
 | `--prefetch-threads` | 2 | Background prefetch reader threads |
 | `--java`, `--jar`, `--native-dir` | | Choose the runtime binaries |
+| `--runtime {dsl,native}` | `dsl` | `native` uses `libramanujan_llm` ([NATIVE_LLM.md](NATIVE_LLM.md)) |
+| `--weights`, `--stream-depth`, `--stream-threads` | `auto`, 2, 2 | Native runtime weight residency and streaming |
 
-`--work-dir` must not exist yet; it holds the bindings, state, hidden states,
+With `--runtime dsl`, `--work-dir` is required and must not exist yet; it holds the bindings, state, hidden states,
 and worker workspaces for one session.
 
 ## Distributed: `rj homelab` and `rj worker`
@@ -377,7 +385,10 @@ With `--homelab URL`, the runner submits every step to the developer-console
 homelab server instead of starting local JVMs. The steps are embed, each layer
 per token, and the head. `rj worker` processes on any machine execute them with
 their own platform native library. The homelab plumbing is generic: any REI
-task can carry an affinity and use the worker binary cache.
+task can carry an affinity and use the worker binary cache. With
+`--runtime native`, each stage step is instead one `POST /llm/step`, and the
+worker keeps a native session per stage, so no state files move between
+steps ([NATIVE_LLM.md](NATIVE_LLM.md#design)).
 
 ```mermaid
 sequenceDiagram
@@ -452,6 +463,7 @@ python3 run_gguf_shards.py --homelab http://localhost:8888 \
 | `--cache DIR` | `~/.ramanujan/worker-cache` | Persistent binary cache and per-task state |
 | `--max-shards N` | unlimited | Most affinities (shards) this worker accepts |
 | `--shared-filesystem` | off | Read the server's paths directly (same machine or shared mount) |
+| `--llm-sessions N` | 8 | Native LLM stage sessions kept open (`--runtime native`) |
 
 **Measured** (one 8 GB M3 MacBook Air running the homelab and two workers).
 Worker A was capped at 1 shard, fetched and cached shard-00 (3.6 GB), and got
@@ -482,7 +494,8 @@ does not reach 5 tok/s; that needs faster native kernels (see Limitations).
   untested.
 - **Greedy text completion.** There is no sampling, and no Jinja chat
   template. Raw `<|im_start|>` markup in the prompt is tokenized correctly.
-- **Throughput.** About 7.6 s/token on one 8 GB machine, dominated by SSD
+- **Throughput.** On the DSL runtime, about 7.6 s/token on one 8 GB machine
+  (native runtime: ~5.0 s/token), dominated by SSD
   reads of roughly 16 GB of weights per token. With weights resident, a layer
   takes 17-24 ms against a ~2.5 ms memory-bandwidth bound for ~250 MB of
   weights. The remaining costs are many small OpenCL kernels per layer, scalar
@@ -499,6 +512,10 @@ does not reach 5 tok/s; that needs faster native kernels (see Limitations).
 | Path | Purpose |
 |---|---|
 | `sharded-llm/run_gguf_shards.py` | Generic sharded GGUF runner (local JVMs or `--homelab`), parity checks; `run_qwen35_shards.py` is an alias |
+| `sharded-llm/native_runner.py`, `NATIVE_LLM.md` | `--runtime native` driver (local ctypes or `/llm/step`) and its documentation |
+| `converter/ramanujan_shards/llm_graph.py`, `native_llm.py` | Stage graph JSON and ctypes binding for `libramanujan_llm` |
+| `ramanujan-native/native/llm/` | Native LLM runtime: OpenCL kernels, sessions, weight streaming, C API, JNI |
+| `rule-engine/.../LlmSession.java`, `developer-console/.../LlmTaskHandler.java` | JNI session and the worker's `/llm/step` handler |
 | `sharded-llm/compare_llama_cpp.py` | NumPy reference vs llama.cpp logits and greedy output |
 | `converter/ramanujan_shards/gguf_source.py` | Streaming GGUF reader (local and HTTP Range) |
 | `converter/ramanujan_shards/gguf_adapter.py`, `planner.py` | Layer grouping and byte-balanced shard planning |

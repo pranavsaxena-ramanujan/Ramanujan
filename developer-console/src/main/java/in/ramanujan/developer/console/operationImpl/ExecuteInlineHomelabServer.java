@@ -108,12 +108,20 @@ public class ExecuteInlineHomelabServer extends ExecuteInline {
         final DagElement dagElement;
         final KernelRun  kernelRun;
         final String     responseJson; // full OpenPingHttpResponse JSON to return to worker
+        // Set for native LLM stage tasks (/llm/*): completed with the worker's /task/complete payload.
+        final CompletableFuture<Map<String, Object>> llmResult;
 
         PendingTask(String uuid, DagElement dagElement, KernelRun kernelRun, String responseJson) {
+            this(uuid, dagElement, kernelRun, responseJson, null);
+        }
+
+        PendingTask(String uuid, DagElement dagElement, KernelRun kernelRun, String responseJson,
+                    CompletableFuture<Map<String, Object>> llmResult) {
             this.uuid         = uuid;
             this.dagElement   = dagElement;
             this.kernelRun    = kernelRun;
             this.responseJson = responseJson;
+            this.llmResult    = llmResult;
         }
     }
 
@@ -468,6 +476,8 @@ public class ExecuteInlineHomelabServer extends ExecuteInline {
         createdServer.createContext("/binary/fetch",      this::handleBinaryFetch);
         createdServer.createContext("/binary/stat",       this::handleBinaryStat);
         createdServer.createContext("/orchestrator/uploadBinary", this::handleUploadBinary);
+        createdServer.createContext("/llm/step",          ex -> handleLlm(ex, "step"));
+        createdServer.createContext("/llm/close",         ex -> handleLlm(ex, "close"));
         createdServer.setExecutor(Executors.newCachedThreadPool());
         createdServer.start();
         System.err.println("[Homelab] HTTP server listening on :" + port);
@@ -504,6 +514,67 @@ public class ExecuteInlineHomelabServer extends ExecuteInline {
             err.put("requestId", requestId);
             err.put("message", e.getMessage() != null ? e.getMessage() : e.toString());
             sendJson(ex, 500, MAPPER.writeValueAsString(err));
+        }
+    }
+
+    /**
+     * Native LLM stage call from a pipeline driver (sharded-llm native_runner.py). The body is
+     * {affinity, session, graph?, files?, tokens | hidden (base64 float32), n, pos}; it becomes a
+     * task for the worker owning {@code affinity}, which keeps the stage session between calls.
+     * Blocks until the worker reports and returns {status, output (base64 float32), info, worker}.
+     */
+    @SuppressWarnings("unchecked")
+    private void handleLlm(HttpExchange ex, String op) throws IOException {
+        Map<String, Object> result = new LinkedHashMap<>();
+        try {
+            Map<String, Object> req = MAPPER.readValue(readAllBytes(ex.getRequestBody()), Map.class);
+            Object affinity = req.get("affinity");
+            if (affinity == null || req.get("session") == null) {
+                sendJson(ex, 400, "{\"status\":\"ERROR\",\"error\":\"affinity and session are required\"}");
+                return;
+            }
+            if (req.get("files") instanceof List) {
+                for (Object file : (List<Object>) req.get("files")) {
+                    if (file instanceof String && new File((String) file).isFile()) fetchableBinaryFiles.add((String) file);
+                }
+            }
+            req.remove("files");
+            req.put("op", op);
+            long timeoutSeconds = req.get("timeout") instanceof Number ? ((Number) req.get("timeout")).longValue() : 1800;
+            String taskUuid = UUID.randomUUID().toString();
+            Map<String, Object> data = new LinkedHashMap<>();
+            data.put("uuid", taskUuid);
+            data.put("llm", req);
+            Map<String, Object> envelope = new LinkedHashMap<>();
+            envelope.put("status", "SUCCESS");
+            envelope.put("data", data);
+            CompletableFuture<Map<String, Object>> done = new CompletableFuture<>();
+            PendingTask task = new PendingTask(taskUuid, null, null, MAPPER.writeValueAsString(envelope), done);
+            inflight.put(taskUuid, task);
+            taskQueue.add(task, String.valueOf(affinity));
+            Map<String, Object> payload;
+            try {
+                payload = done.get(timeoutSeconds, TimeUnit.SECONDS);
+            } catch (TimeoutException e) {
+                inflight.remove(taskUuid);
+                sendJson(ex, 504, "{\"status\":\"ERROR\",\"error\":\"no worker completed the llm task in time\"}");
+                return;
+            }
+            if (payload.get("error") != null) {
+                result.put("status", "ERROR");
+                result.put("error", payload.get("error"));
+                result.put("worker", payload.get("hostId"));
+                sendJson(ex, 500, MAPPER.writeValueAsString(result));
+                return;
+            }
+            result.put("status", "SUCCESS");
+            if (payload.get("data") instanceof Map) result.putAll((Map<String, Object>) payload.get("data"));
+            result.put("worker", payload.get("hostId"));
+            sendJson(ex, 200, MAPPER.writeValueAsString(result));
+        } catch (Exception e) {
+            result.put("status", "ERROR");
+            result.put("error", e.getMessage() != null ? e.getMessage() : e.toString());
+            sendJson(ex, 500, MAPPER.writeValueAsString(result));
         }
     }
 
@@ -748,7 +819,7 @@ public class ExecuteInlineHomelabServer extends ExecuteInline {
             }
 
             PendingTask task = inflight.get(uuid);
-            if (task == null) {
+            if (task == null || task.kernelRun == null) {
                 consumeBody(ex);
                 sendJson(ex, 404, "{\"status\":\"ERROR\",\"message\":\"Unknown task uuid: " + uuid + "\"}");
                 return;
@@ -819,7 +890,7 @@ public class ExecuteInlineHomelabServer extends ExecuteInline {
         PendingTask task;
         try {
             task = taskQueue.poll(hostId, affinityLimit, 900);
-            if (task != null && task.kernelRun.affinity != null) {
+            if (task != null && task.kernelRun != null && task.kernelRun.affinity != null) {
                 System.err.println("[Homelab] affinity " + task.kernelRun.affinity + " -> worker " + hostId);
             }
         } catch (InterruptedException e) {
@@ -857,6 +928,10 @@ public class ExecuteInlineHomelabServer extends ExecuteInline {
                 PendingTask task = inflight.remove(uuid);
                 if (task == null) {
                     System.err.println("[Homelab] received unknown uuid: " + uuid);
+                    return;
+                }
+                if (task.llmResult != null) {
+                    task.llmResult.complete(payload);
                     return;
                 }
                 Object error = payload.get("error");

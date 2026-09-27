@@ -316,7 +316,7 @@ class GgufRunner:
             self._embed(token, directory)
             directories.append(directory)
         if on_layer is not None:
-            on_layer(-1, directories)
+            on_layer(-1, [np.fromfile(directory / "h_state.bin", "<f4") for directory in directories])
         for layer in range(self.last_layer + 1):
             spec = self.layer_inputs[layer]
             self._prefetch(("layer", layer))
@@ -336,7 +336,7 @@ class GgufRunner:
                                   "tokens": len(tokens), "seconds": round(time.monotonic() - started, 2)}),
                       flush=True)
             if on_layer is not None:
-                on_layer(layer, directories)
+                on_layer(layer, [np.fromfile(directory / "h_state.bin", "<f4") for directory in directories])
         self.position += len(tokens)
         return directories
 
@@ -365,14 +365,13 @@ def _compare(reference, runner, tokens):
     hidden = [reference.embed(token) for token in tokens]
     report = []
 
-    def on_layer(layer, directories):
+    def on_layer(layer, actuals):
         if layer >= 0:
             states.setdefault(layer, reference.new_state(layer))
             for offset in range(len(tokens)):
                 hidden[offset] = reference.layer(layer, hidden[offset], states[layer], offset)
         errors = []
-        for offset, directory in enumerate(directories):
-            actual = np.fromfile(directory / "h_state.bin", "<f4")
+        for offset, actual in enumerate(actuals):
             errors.append(float(np.max(np.abs(actual - hidden[offset])) / max(1e-6, np.max(np.abs(hidden[offset])))))
         entry = {"event": "reference-check", "layer": layer, "maxRelativeError": max(errors)}
         report.append(entry)
@@ -388,7 +387,7 @@ def parse_args():
     parser.add_argument("--prompt", default="The capital of France is")
     parser.add_argument("--max-new-tokens", type=int, default=8)
     parser.add_argument("--max-context", type=int, default=128)
-    parser.add_argument("--work-dir", type=Path, required=True)
+    parser.add_argument("--work-dir", type=Path, help="scratch directory (required by --runtime dsl)")
     parser.add_argument("--java", type=Path, default=Path(
         "/Users/pranav/Library/Java/JavaVirtualMachines/corretto-1.8.0_402/Contents/Home/bin/java"))
     parser.add_argument("--jar", type=Path, default=Path("../developer-console/target/developer-console-1.0-SNAPSHOT-fat.jar"))
@@ -408,6 +407,16 @@ def parse_args():
                         help="layer/head steps to read ahead into the page cache while the current "
                              "step computes (default 1 locally, 0 with --homelab)")
     parser.add_argument("--prefetch-threads", type=int, default=2)
+    parser.add_argument("--runtime", choices=["dsl", "native"], default="dsl",
+                        help="dsl: generated DSL programs on the Ramanujan engine; native: the OpenCL LLM "
+                             "runtime (libramanujan_llm), one session per pipeline stage")
+    parser.add_argument("--weights", choices=["auto", "resident", "stream"], default="auto",
+                        help="native runtime: keep stage weights on the device, or stream them per step "
+                             "(auto: resident when they fit in half of device and system memory)")
+    parser.add_argument("--stream-depth", type=int, default=2,
+                        help="native runtime: layers uploaded ahead while streaming")
+    parser.add_argument("--stream-threads", type=int, default=2,
+                        help="native runtime: loader threads reading streamed layers in parallel")
     semantics = parser.add_argument_group(
         "architecture semantics", "facts GGUF does not store; needed only for architectures outside "
         "the llm_spec.ARCHITECTURES registry, or to override it")
@@ -419,6 +428,8 @@ def parse_args():
     args = parser.parse_args()
     if args.prefetch_steps is None:
         args.prefetch_steps = 0 if args.homelab else 1
+    if args.runtime == "dsl" and args.work_dir is None:
+        parser.error("--work-dir is required with --runtime dsl")
     if args.resident_weights and not args.homelab:
         parser.error("--resident-weights requires --homelab")
     args.stop_after_layer = args.check_layers - 1 if args.check_layers else None
@@ -427,7 +438,11 @@ def parse_args():
 
 def main():
     args = parse_args()
-    runner = GgufRunner(args)
+    if args.runtime == "native":
+        from native_runner import NativeGgufRunner
+        runner = NativeGgufRunner(args)
+    else:
+        runner = GgufRunner(args)
     spec = runner.spec
     tokens = runner.tokenizer.encode(args.prompt)
     print(json.dumps({"event": "model", "architecture": spec.architecture, "layers": len(spec.layers),
@@ -467,7 +482,7 @@ def main():
             generated.append(token)
             print(json.dumps({"event": "token", "id": token,
                               "text": runner.tokenizer.decode([token]),
-                              "seconds": round(time.monotonic() - started, 1)}), flush=True)
+                              "seconds": round(time.monotonic() - started, 3)}), flush=True)
             if token in runner.stop_ids or step == args.max_new_tokens - 1:
                 break
             directories = runner.forward([token])

@@ -36,6 +36,8 @@ import java.util.concurrent.locks.ReentrantReadWriteLock;
  *                          (default ~/.ramanujan/worker-cache)
  *   --max-shards N         most affinity groups (model shards) this worker accepts
  *   --shared-filesystem    read binary arrays at the server's paths instead of fetching
+ *   --llm-sessions N       native LLM stage sessions kept open (default 8; least recently
+ *                          used is closed first). /llm/step tasks run on libramanujan_llm.
  *
  * Examples:
  *   java -jar developer-console.jar worker
@@ -57,6 +59,7 @@ public class ExecuteInlineWorker implements Operation {
     private int affinityLimit = Integer.MAX_VALUE;
     private WorkerBinaryCache binaryCache;
     private Path taskRoot;
+    private LlmTaskHandler llmTasks;
 
     @Override
     public void execute(List<String> args) throws IOException {
@@ -65,6 +68,7 @@ public class ExecuteInlineWorker implements Operation {
         int numThreads = Runtime.getRuntime().availableProcessors();
         String cacheDir = Paths.get(System.getProperty("user.home"), ".ramanujan", "worker-cache").toString();
         boolean sharedFilesystem = false;
+        int llmSessions = 8;
 
         List<String> positional = new ArrayList<>();
         for (int i = 1; i < args.size(); i++) {
@@ -82,6 +86,10 @@ public class ExecuteInlineWorker implements Operation {
                     break;
                 case "--shared-filesystem":
                     sharedFilesystem = true;
+                    break;
+                case "--llm-sessions":
+                    llmSessions = Integer.parseInt(requireValue(args, ++i, arg));
+                    if (llmSessions < 1) throw new IllegalArgumentException("--llm-sessions must be >= 1");
                     break;
                 default:
                     if (arg.startsWith("--")) throw new IllegalArgumentException("unknown worker option " + arg);
@@ -106,6 +114,7 @@ public class ExecuteInlineWorker implements Operation {
             taskRoot = Paths.get(cacheDir).toAbsolutePath().resolve("tasks");
             Files.createDirectories(taskRoot);
         }
+        llmTasks = new LlmTaskHandler(binaryCache, llmSessions);
 
         System.out.println("LOCAL_WORKER_READY");
         System.out.println("LOCAL_WORKER_URL " + serverUrl);
@@ -145,6 +154,10 @@ public class ExecuteInlineWorker implements Operation {
                 if (dataObj == null) continue; // no pending tasks
 
                 Map<String, Object> taskData = (Map<String, Object>) dataObj;
+                if (taskData.get("llm") instanceof Map) {
+                    runLlmTask(serverUrl, (String) taskData.get("uuid"), (Map<String, Object>) taskData.get("llm"));
+                    continue;
+                }
                 String uuid           = (String) taskData.get("uuid");
                 String firstCommandId = (String) taskData.get("firstCommandId");
                 Object reiObj         = taskData.get("ruleEngineInput");
@@ -260,6 +273,28 @@ public class ExecuteInlineWorker implements Operation {
                 t.printStackTrace();
             }
         }
+    }
+
+    /** Runs a native LLM stage step (or session close) and reports it to /task/complete. */
+    private void runLlmTask(String serverUrl, String uuid, Map<String, Object> task) throws Exception {
+        Map<String, Object> results = new HashMap<>();
+        String error = null;
+        long start = System.currentTimeMillis();
+        try {
+            results = llmTasks.handle(task);
+        } catch (Exception | LinkageError e) {
+            error = e.getClass().getSimpleName() + ": " + e.getMessage();
+            System.err.println("[Worker] llm " + task.get("op") + " failed for session " + task.get("session") + ": " + error);
+        }
+        System.err.println("[Worker] llm " + task.get("op") + " session=" + task.get("session") + " pos=" + task.get("pos")
+                + " n=" + task.get("n") + " done in " + (System.currentTimeMillis() - start) + "ms"
+                + " (open sessions " + llmTasks.openSessions() + ")");
+        Map<String, Object> payload = new LinkedHashMap<>();
+        payload.put("uuid", uuid);
+        payload.put("hostId", hostId);
+        payload.put("data", results);
+        if (error != null) payload.put("error", error);
+        postJson(serverUrl + "/task/complete", MAPPER.writeValueAsString(payload));
     }
 
     private static String requireValue(List<String> args, int index, String option) {

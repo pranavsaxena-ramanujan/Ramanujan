@@ -89,6 +89,15 @@ ramanujan-ws/
         libnative.so       # Ubuntu, instead of libnative.dylib
 ```
 
+Optionally, for sharded LLM inference with `--runtime native`, also build the
+dedicated LLM runtime and copy it beside the JAR on every `rj worker` host
+(see [sharded-llm/NATIVE_LLM.md](../sharded-llm/NATIVE_LLM.md)):
+
+```sh
+cmake --build ramanujan-native/native/build --target ramanujan_llm
+cp ramanujan-native/native/build/libramanujan_llm.dylib "$RAMANUJAN_WS/"   # .so on Ubuntu
+```
+
 Install the `rj` command by adding this alias to `~/.zshrc` or `~/.bashrc`, then
 reload that file:
 

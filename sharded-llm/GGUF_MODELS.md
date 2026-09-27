@@ -6,6 +6,10 @@ pipeline is specific to one model. The layer structure is read from the GGUF
 tensor names and shapes. Hyperparameters come from the GGUF metadata. A small
 registry supplies only the facts GGUF does not store.
 
+`--runtime native` runs the same packages on `libramanujan_llm`, a dedicated
+OpenCL LLM runtime. On small models it is 56–75x faster; see
+[NATIVE_LLM.md](NATIVE_LLM.md). The table below is the default DSL runtime.
+
 Validated end to end on an 8 GB Apple M3 (4 shards, greedy decoding):
 
 | Model | Arch | Quants in file | `--check-layers` (all layers, OpenCL vs NumPy) | Output ("The capital of France is") | Decode |
@@ -132,6 +136,9 @@ python3 run_gguf_shards.py --package $M-shards --metadata $M-ir-plan/gguf-metada
 # OpenCL vs NumPy, every layer; then NumPy vs llama.cpp (pip install llama-cpp-python gguf)
 python3 run_gguf_shards.py ... --check-layers 22 --work-dir /tmp/gguf-check
 python3 compare_llama_cpp.py --gguf $M.gguf --package $M-shards --metadata $M-ir-plan/gguf-metadata.json --greedy-tokens 10
+# Native runtime (no --work-dir; see NATIVE_LLM.md)
+python3 run_gguf_shards.py --runtime native --package $M-shards --metadata $M-ir-plan/gguf-metadata.json \
+  --prompt "The capital of France is" --max-new-tokens 10
 # Tests
 (cd converter && python3 -m unittest discover -s tests)
 ```
@@ -151,6 +158,7 @@ fused-tensor order and missing biases.
 - **Throughput.** Same per-token cost model as Qwen35: sequential layers, many
   small kernels, scalar dequantization. Small models are bound by per-kernel
   launch and protobuf overhead (~0.65 s/token for 0.5B–1.1B), not by weight
-  bandwidth.
+  bandwidth. The native runtime removes that overhead (8–12 ms/token,
+  [NATIVE_LLM.md](NATIVE_LLM.md)).
 - **Sampling and templates.** Greedy text completion only, with no chat
   template.

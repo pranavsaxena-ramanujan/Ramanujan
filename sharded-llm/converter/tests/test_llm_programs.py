@@ -152,6 +152,10 @@ class GenericProgramSimulationTest(unittest.TestCase):
     def tearDown(self):
         self.directory.cleanup()
 
+    def check(self, model, **options):
+        """Runs `model` and compares it with the reference; subclasses swap the executor."""
+        return _simulate(self, model, **options)
+
     def test_llama_norm_rope_with_frequency_factors(self):
         dim, heads, kv, hd, ffn = 64, 4, 2, 16, 128
         layout = _globals(dim, 40)
@@ -160,7 +164,7 @@ class GenericProgramSimulationTest(unittest.TestCase):
             layout.update(_attention_layout(layer, dim, heads, kv, hd, ffn))
         model = _Model(self.path, "llama", _hyper(dim, heads, kv, 2, **{"rope.dimension_count": hd}),
                        layout, "gguf-q4_0")
-        spec = _simulate(self, model)
+        spec = self.check(model)
         self.assertEqual("norm", spec.semantics.rope_style)
         self.assertEqual("rope_freqs.weight", spec.rope_freqs)
 
@@ -171,7 +175,7 @@ class GenericProgramSimulationTest(unittest.TestCase):
             layout.update(_attention_layout(layer, dim, heads, kv, hd, ffn, bias=True))
         model = _Model(self.path, "qwen2", _hyper(dim, heads, kv, 2, **{"rope.freq_base": 1e6}),
                        layout, "gguf-q5_0")
-        spec = _simulate(self, model)
+        spec = self.check(model)
         self.assertEqual("token_embd.weight", spec.head_roles["output"])
 
     def test_qwen3_qk_norm_f16(self):
@@ -181,7 +185,7 @@ class GenericProgramSimulationTest(unittest.TestCase):
             layout.update(_attention_layout(layer, dim, heads, kv, hd, ffn, qk_norm=True))
         model = _Model(self.path, "qwen3", _hyper(dim, heads, kv, 2, **{"attention.key_length": hd}),
                        layout, "gguf-f16")
-        _simulate(self, model)
+        self.check(model)
 
     def test_phi3_fused_qkv_and_gate_up(self):
         dim, heads, kv, hd, ffn = 64, 4, 4, 16, 64
@@ -190,7 +194,7 @@ class GenericProgramSimulationTest(unittest.TestCase):
             layout.update(_attention_layout(layer, dim, heads, kv, hd, ffn, qkv="fused",
                                             ffn_layout="fused_gate_up"))
         model = _Model(self.path, "phi3", _hyper(dim, heads, kv, 2), layout, "gguf-q5_1")
-        spec = _simulate(self, model)
+        spec = self.check(model)
         self.assertEqual("fused", spec.kind(0).flag("qkv"))
 
     def test_gemma_gelu_embedding_scale_and_wide_heads(self):
@@ -201,7 +205,7 @@ class GenericProgramSimulationTest(unittest.TestCase):
         model = _Model(self.path, "gemma", _hyper(dim, heads, kv, 2, **{"attention.key_length": hd,
                                                                          "attention.value_length": hd}),
                        layout, "gguf-q4_1")
-        spec = _simulate(self, model)
+        spec = self.check(model)
         self.assertAlmostEqual(8.0, spec.embed_multiplier)
 
     def test_unknown_architecture_with_post_norms_plain_ffn_and_overrides(self):
@@ -212,7 +216,7 @@ class GenericProgramSimulationTest(unittest.TestCase):
                                             norms=("ffn_norm", "post_attention_norm", "post_ffw_norm")))
         model = _Model(self.path, "mystery", _hyper(dim, heads, kv, 2, **{"rope.dimension_count": 8}),
                        layout, "gguf-q8_0")
-        spec = _simulate(self, model, overrides={"rope_style": "neox", "activation": "gelu"})
+        spec = self.check(model, overrides={"rope_style": "neox", "activation": "gelu"})
         self.assertTrue(spec.assumptions)
         self.assertTrue(spec.kind(0).flag("post_attn_norm"))
 
@@ -236,7 +240,7 @@ class GenericProgramSimulationTest(unittest.TestCase):
                                                 "nextn_predict_layers": 1, "full_attention_interval": 2})
         metadata.update({"ssm." + key: value for key, value in ssm.items()})
         model = _Model(self.path, "qwen35", metadata, layout, "gguf-q4_1")
-        spec = _simulate(self, model, tokens=(3, 7, 11))
+        spec = self.check(model, tokens=(3, 7, 11))
         self.assertEqual(["gated_deltanet", "attention"], [spec.kind(layer).mixer for layer in range(2)])
         self.assertTrue(spec.kind(1).flag("q_gate"))
 
@@ -247,7 +251,7 @@ class GenericProgramSimulationTest(unittest.TestCase):
         layout["blk.0.ffn_down.weight"] = ([dim, ffn], "gguf-q6_k")
         layout["blk.0.attn_v.weight"] = ([kv * hd, dim], "gguf-q5_k")
         model = _Model(self.path, "llama", _hyper(dim, heads, kv, 1), layout, "gguf-q4_k")
-        _simulate(self, model, tokens=(3, 5))
+        self.check(model, tokens=(3, 5))
 
 
 class SpecValidationTest(unittest.TestCase):

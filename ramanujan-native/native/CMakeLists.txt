@@ -265,6 +265,29 @@ target_compile_definitions(native_llm PRIVATE RAMANUJAN_LLM_OPTIMIZED=1)
 target_link_libraries(native_llm PRIVATE protobuf::libprotobuf)
 set_target_properties(native_llm PROPERTIES OUTPUT_NAME "native_llm")
 
+# Native LLM runtime (libramanujan_llm): OpenCL kernels for decoder-only GGUF pipeline stages,
+# used by sharded-llm (ctypes) and rj workers (JNI LlmSession). Independent of the DSL engine.
+if(GPU_ENABLED)
+    set(RJLLM_KERNELS_INC "${CMAKE_CURRENT_BINARY_DIR}/rjllm/kernels_cl.inc")
+    add_custom_command(
+        OUTPUT "${RJLLM_KERNELS_INC}"
+        COMMAND ${CMAKE_COMMAND} -DINPUT=${CMAKE_CURRENT_SOURCE_DIR}/llm/kernels.cl
+                -DOUTPUT=${RJLLM_KERNELS_INC} -P ${CMAKE_CURRENT_SOURCE_DIR}/llm/embed_kernels.cmake
+        DEPENDS llm/kernels.cl llm/embed_kernels.cmake
+        COMMENT "Embedding LLM OpenCL kernels")
+    add_library(ramanujan_llm SHARED llm/runtime.cpp llm/jni.cpp llm/rjllm.h llm/json.hpp "${RJLLM_KERNELS_INC}")
+    target_include_directories(ramanujan_llm PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/rjllm" llm)
+    set_target_properties(ramanujan_llm PROPERTIES CXX_VISIBILITY_PRESET hidden OUTPUT_NAME "ramanujan_llm")
+    find_package(Threads REQUIRED)
+    target_link_libraries(ramanujan_llm PRIVATE Threads::Threads)
+    if(ANDROID)
+        target_include_directories(ramanujan_llm PRIVATE ${openclheaders_SOURCE_DIR})
+        target_link_libraries(ramanujan_llm PRIVATE dl log)
+    else()
+        target_link_libraries(ramanujan_llm PRIVATE OpenCL::OpenCL)
+    endif()
+endif()
+
 ## Debug build target
 #add_library(native_debug SHARED ${SOURCE_FILES})
 #target_link_libraries(native_debug PRIVATE protobuf::libprotobuf)
