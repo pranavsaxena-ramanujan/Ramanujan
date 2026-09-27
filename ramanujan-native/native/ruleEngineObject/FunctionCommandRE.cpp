@@ -422,6 +422,32 @@ static void returnIdleGpuBuffer(cl_mem buffer, size_t bytes) {
   s_idleGpuPool.bytes += bytes;
 }
 
+#ifdef RAMANUJAN_LLM_OPTIMIZED
+// native_llm keeps one device buffer per cached (immutable, mmapped) weight array for
+// the life of the binary cache, instead of creating and releasing it on every run.
+struct WeightBufferCache {
+  std::mutex mutex;
+  std::unordered_map<const float *, std::pair<cl_mem, size_t>> buffers;
+};
+static WeightBufferCache s_weightBuffers;
+
+static void releaseWeightBuffers() {
+  std::lock_guard<std::mutex> lock(s_weightBuffers.mutex);
+  if (s_weightBuffers.buffers.empty())
+    return;
+  if (s_clCtx.queue)
+    clFinish(s_clCtx.queue);
+  for (const auto &entry : s_weightBuffers.buffers)
+    clReleaseMemObject(entry.second.first);
+  s_weightBuffers.buffers.clear();
+}
+
+static const bool s_weightBufferHookInstalled = [] {
+  ArrayValue::releaseCachedGpuBuffers = releaseWeightBuffers;
+  return true;
+}();
+#endif
+
 // ── Shared program cache (cl_program is thread-safe after clBuildProgram) ──
 // Compile each source string only once; threads then create their own kernels.
 // The program pointer is *also* memoised on the FunctionCommandRE instance
@@ -1150,7 +1176,14 @@ RuleEngineInputUnits *GPUFunctionCommandRE::process() {
       RJ_GPU_LOG("[GPU] clEnqueueNDRangeKernel '%s' failed: %d\n",
                  gpuKernelName.c_str(), gpuErr);
     } else {
+#ifdef RAMANUJAN_LLM_OPTIMIZED
+      // The queue is in-order and every host access goes through a blocking
+      // GPU_SYNC/GPU_LOAD or RELEASE_MEM's clFinish, so kernels can be batched.
+      // clFlush only submits them without waiting for completion.
+      gpuErr = clFlush(s_clCtx.queue);
+#else
       gpuErr = clFinish(s_clCtx.queue);
+#endif
       if (gpuErr != CL_SUCCESS) {
         RJ_GPU_LOG("[GPU] clFinish after '%s' failed: %d\n",
                    gpuKernelName.c_str(), gpuErr);
@@ -1692,7 +1725,12 @@ RuleEngineInputUnits *RELEASE_MEM::process() {
 #ifdef GPU_ENABLED
   if (targetArray != nullptr) {
     ArrayValue *arrayValue = targetArray->arrayValue.arrayValue;
-    if (arrayValue != nullptr && arrayValue->gpuBuffer != nullptr) {
+    if (arrayValue != nullptr && arrayValue->gpuBufferShared) {
+      // Cached weight buffer: detach only; it is released with the binary cache.
+      arrayValue->gpuBuffer = nullptr;
+      arrayValue->gpuBufferBytes = 0;
+      arrayValue->gpuBufferShared = false;
+    } else if (arrayValue != nullptr && arrayValue->gpuBuffer != nullptr) {
       // GPU kernel dispatch is async/non-blocking (see GPU_SYNC design), so
       // the kernels that read this buffer may still be in flight. Drain the
       // queue first — releasing an in-use buffer here would free memory the
@@ -1723,6 +1761,34 @@ RuleEngineInputUnits *LOAD_MEM::process() {
         return nextUnit;
       }
       size_t needed = (size_t)arrayValue->totalSize * sizeof(float);
+#ifdef RAMANUJAN_LLM_OPTIMIZED
+      if (arrayValue->isCachedVal) {
+        std::lock_guard<std::mutex> lock(s_weightBuffers.mutex);
+        auto found = s_weightBuffers.buffers.find(arrayValue->val);
+        if (found != s_weightBuffers.buffers.end() && found->second.second == needed) {
+          arrayValue->gpuBuffer = found->second.first;
+          arrayValue->gpuBufferBytes = needed;
+          arrayValue->gpuBufferShared = true;
+          return nextUnit;
+        }
+        cl_int err;
+        cl_mem buf = clCreateBuffer(s_clCtx.context, CL_MEM_READ_WRITE | CL_MEM_USE_HOST_PTR,
+                                    needed, arrayValue->val, &err);
+        if (err != CL_SUCCESS) {
+          RJ_GPU_LOG("[LOAD_MEM] cached weight clCreateBuffer failed: %d\n", err);
+          return nextUnit;
+        }
+        if (found != s_weightBuffers.buffers.end()) {
+          clReleaseMemObject(found->second.first);
+          s_weightBuffers.buffers.erase(found);
+        }
+        s_weightBuffers.buffers.emplace(arrayValue->val, std::make_pair(buf, needed));
+        arrayValue->gpuBuffer = buf;
+        arrayValue->gpuBufferBytes = needed;
+        arrayValue->gpuBufferShared = true;
+        return nextUnit;
+      }
+#endif
       if (gpuPoolEnabled()) {
         cl_mem reused = takeIdleGpuBuffer(needed);
         if (reused != nullptr) {

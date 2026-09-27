@@ -46,7 +46,12 @@ void ArrayValue::clearResidentState() {
     s_residentState.clear();
 }
 
+void (*ArrayValue::releaseCachedGpuBuffers)() = nullptr;
+
 void ArrayValue::clearBinaryCache() {
+    if (releaseCachedGpuBuffers != nullptr) {
+        releaseCachedGpuBuffers();
+    }
     std::lock_guard<std::mutex> lock(s_binaryMutex);
     for (const auto& entry : s_binaryCache) {
 #ifndef _WIN32

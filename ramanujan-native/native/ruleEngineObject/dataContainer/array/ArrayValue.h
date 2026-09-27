@@ -54,6 +54,8 @@ public:
     // Any GPU kernel that needs this array as input can reuse it without re-uploading.
     void*  gpuBuffer      = nullptr;
     size_t gpuBufferBytes = 0;
+    // True when gpuBuffer is owned by the process-wide weight buffer cache (RELEASE_MEM must not free it).
+    bool   gpuBufferShared = false;
     
     // Optimized default constructor - no allocations
     ArrayValue() : array(nullptr), dimensions(nullptr), dimensionSize(0), 
@@ -133,6 +135,9 @@ public:
     ArrayValue(Array* array , std::string originalArrayId);
 
     static void clearBinaryCache();
+    // Installed by the GPU backend when it caches device buffers over cached binaries;
+    // clearBinaryCache() calls it before unmapping so no buffer outlives its host memory.
+    static void (*releaseCachedGpuBuffers)();
     static void adviseBinaryCacheIdle();
     static void clearResidentState();
 

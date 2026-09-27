@@ -94,6 +94,7 @@ class RamanujanServer:
         self.profile = profile
         self.gpu_pool = gpu_pool
         self.process = None
+        self.stdout_pending = b""
         self.stderr_tail = collections.deque(maxlen=80)
 
     def start(self):
@@ -127,6 +128,7 @@ class RamanujanServer:
             bufsize=1,
             env=env,
         )
+        self.stdout_pending = b""
         self.monitor.add("ramanujan-jvm", self.process.pid)
         threading.Thread(target=self._drain_stderr, daemon=True).start()
         self._wait_for("SERVER_READY", 90)
@@ -180,16 +182,32 @@ class RamanujanServer:
                         self.process.returncode, "".join(self.stderr_tail)
                     )
                 )
-            ready, _, _ = select.select([self.process.stdout], [], [], 0.25)
-            if not ready:
+            line = self._next_line(0.25)
+            if line is None:
                 continue
-            line = self.process.stdout.readline().rstrip()
             if (line.startswith("KERNEL_ERROR") or line.startswith("SHARD_ERROR")
                     or line.startswith("Unknown command")):
                 raise RuntimeError(line + "\n" + "".join(self.stderr_tail))
             if (prefix and line.startswith(expected)) or line == expected:
                 return
         raise TimeoutError("timed out waiting for {0}".format(expected))
+
+    def _next_line(self, wait):
+        # Read the raw pipe with our own buffer: select() cannot see lines already
+        # buffered inside a TextIOWrapper, so readline() after select() can stall
+        # when the JVM writes several lines at once.
+        if b"\n" not in self.stdout_pending:
+            ready, _, _ = select.select([self.process.stdout], [], [], wait)
+            if not ready:
+                return None
+            chunk = os.read(self.process.stdout.fileno(), 65536)
+            if not chunk:
+                return None
+            self.stdout_pending += chunk
+            if b"\n" not in self.stdout_pending:
+                return None
+        line, self.stdout_pending = self.stdout_pending.split(b"\n", 1)
+        return line.decode("utf-8", "replace").rstrip()
 
     def _drain_stderr(self):
         for line in self.process.stderr:

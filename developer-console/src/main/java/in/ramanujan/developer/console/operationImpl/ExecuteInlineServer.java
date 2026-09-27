@@ -66,8 +66,18 @@ public class ExecuteInlineServer extends ExecuteInline {
         }
     }
 
-    // Keyed by program path and input shapes; holds every registered shard program, else one entry.
-    private final Map<String, CompiledProgram> compiledPrograms = new HashMap<>();
+    // Unregistered runs keep a few recent programs so alternating kernels (embed, layer types, head)
+    // are not recompiled on every switch.
+    static final int MAX_UNREGISTERED_PROGRAMS = 8;
+
+    // Keyed by program path and input shapes; holds every registered shard program, else the
+    // most recently used MAX_UNREGISTERED_PROGRAMS entries.
+    private final Map<String, CompiledProgram> compiledPrograms = new LinkedHashMap<String, CompiledProgram>(16, 0.75f, true) {
+        @Override
+        protected boolean removeEldestEntry(Map.Entry<String, CompiledProgram> eldest) {
+            return registeredShardPrograms == null && size() > MAX_UNREGISTERED_PROGRAMS;
+        }
+    };
     private String nextShardKernel = null;
     private boolean lastRunSucceeded = true;
     private Set<Path> registeredShardPrograms = null;
@@ -328,9 +338,6 @@ public class ExecuteInlineServer extends ExecuteInline {
             System.err.println("[Server] compiled in " + (System.currentTimeMillis() - t0)
                     + "ms  DAG=" + (dagList.size() + 1));
 
-            if (registeredShardPrograms == null) {
-                compiledPrograms.clear();
-            }
             compiledPrograms.put(programKey,
                     new CompiledProgram(firstDag, dagList, variableMap, arrayMap));
         }
@@ -370,11 +377,19 @@ public class ExecuteInlineServer extends ExecuteInline {
         }
 
         ExecutorImpl.setStores(varStore, arrStore);
-        // Hint GC to release large stub strings and old computation objects from this kernel.
-        // Without this, hundreds of MB of zero-grid strings accumulate causing GC storms.
-        if (!"true".equalsIgnoreCase(System.getenv("RAMANUJAN_RESIDENT_KV"))) {
+        // Large stub strings from earlier kernels can pile up into GC storms, so collect
+        // eagerly once the heap is under pressure; a full GC on every run costs several ms.
+        if (!"true".equalsIgnoreCase(System.getenv("RAMANUJAN_RESIDENT_KV")) && heapUnderPressure()) {
             System.gc();
         }
+    }
+
+    static final double GC_HEAP_FRACTION = 0.6;
+
+    private static boolean heapUnderPressure() {
+        Runtime runtime = Runtime.getRuntime();
+        long used = runtime.totalMemory() - runtime.freeMemory();
+        return used > runtime.maxMemory() * GC_HEAP_FRACTION;
     }
 
     // -------------------------------------------------------------------------

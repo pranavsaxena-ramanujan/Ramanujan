@@ -7,7 +7,7 @@ as generated Ramanujan DSL compiled to OpenCL kernels. On an 8 GB Apple M3:
 ```
 prompt:  "The capital of France is"
 output:  " Paris.\nThe capital of Germany is"
-speed:   ~16 s/token (greedy), every worker below 300 MB RSS
+speed:   ~11.7 s/token (greedy, SSD-bound), every worker below 800 MB RSS
 ```
 
 The hidden state after all 64 layers matches an independent NumPy reference
@@ -249,8 +249,32 @@ shard. Measured peak RSS per worker was 170-280 MB.
 every prompt token runs in order before weights are evicted, which carries the
 recurrent state and KV cache forward while loading each layer once. Decode then
 feeds one token per step through the same path, and the head's Ramanujan
-`argmax` picks the next token. A layer run takes 0.4-0.75 s, and 64 layers plus
-the head come to about 16 s per token.
+`argmax` picks the next token. A decode layer step takes about 0.17 s, and 64
+layers plus the head come to about 11.7 s per token.
+
+**Native runtime optimizations** (`libnative_llm`, built with
+`RAMANUJAN_LLM_OPTIMIZED`):
+
+- The local server keeps compiled programs in an LRU cache instead of
+  recompiling a layer program on every call.
+- `System.gc()` runs only when the heap is more than 60% full.
+- Weight arrays that come from the mmapped binary cache get one OpenCL
+  `USE_HOST_PTR` buffer, reused across runs and released before unmapping.
+- Kernel launches call `clFlush` instead of `clFinish`. Host reads still
+  synchronize through `GPU_SYNC` and `RELEASE_MEM`.
+
+Measured on the 8 GB M3 (layers 0-3 resident, warm, median):
+
+| Program | Before | After |
+|---|---|---|
+| embed | 28 ms | 1 ms |
+| Gated DeltaNet layer | 38-75 ms | 24 ms |
+| attention layer | 74-89 ms | 17 ms |
+
+For full 64-layer generation, prefill plus first token fell from ~50 s to
+22.4 s, and decode from ~16 s to 11.7 s/token. Compute is now about 1.3 s of
+each token. The rest is re-reading ~250 MB of weights per layer from the SSD,
+because 16 GB of weights cannot stay in 8 GB of RAM.
 
 ## Validation
 
@@ -407,6 +431,9 @@ shard-00. Worker B used `--shared-filesystem` and got shards 01-03.
 | default (evict per step) | " Paris.\n" | 50.8 s | ~16 s/token (0.06 tok/s) |
 | `--resident-weights` | " Paris.\n" | 62.8 s | ~100 s/token |
 
+These homelab numbers were measured before the native runtime optimizations
+above.
+
 Distribution adds little overhead. Native execution is 150-210 ms of each
 ~250 ms layer step, so decode speed matches the single-machine runner. Resident
 weights are slower here only because 16 GB of weights cannot stay mapped in
@@ -423,12 +450,11 @@ does not reach 5 tok/s; that needs faster native kernels (see Limitations).
   untested.
 - **Greedy text completion.** There is no sampling, and no Jinja chat
   template. Raw `<|im_start|>` markup in the prompt is tokenized correctly.
-- **Throughput.** About 16 s/token, locally or through the homelab. Native
-  layer execution (150-210 ms against a ~2.5 ms memory-bandwidth bound for
-  ~250 MB of weights) dominates. The costs are many small OpenCL kernels per
-  layer, scalar dequantization in the matvec kernels, per-call protobuf and
-  graph setup, and SSD reads of roughly 16 GB of weights per token on an 8 GB
-  machine. The prompt is
+- **Throughput.** About 11.7 s/token on one 8 GB machine, dominated by SSD
+  reads of roughly 16 GB of weights per token. With weights resident, a layer
+  takes 17-24 ms against a ~2.5 ms memory-bandwidth bound for ~250 MB of
+  weights. The remaining costs are many small OpenCL kernels per layer, scalar
+  dequantization in the matvec kernels, and per-call protobuf and graph setup. The prompt is
   processed one token at a time within each layer.
 - **Architecture coverage.** The runner accepts only `qwen35` packages whose
   per-layer encodings are F32/Q4_1/Q5_K/Q6_K. Q8_0 (present only in `nextn`)
