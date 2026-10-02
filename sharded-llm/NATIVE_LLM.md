@@ -16,8 +16,10 @@ Measured on one 8 GB Apple M3 (greedy decode, 4 shards):
 | Qwen3.8 27B Q4_1 | 3.1e-7 (first 4 layers) | "\n\nTo solve 17" ("What is 17 * 23?") | 7.6–9.1 s/token | 4.94–4.98 s/token (streamed) | 5.05–5.1 s/token |
 
 - **Small models: about 56–75x faster** than the DSL path when running
-  locally. The first 16 greedy tokens match llama.cpp on both models, and
-  Qwen2.5 answers " 391" to "What is 17 * 23?".
+  locally. The first 16 greedy tokens match llama.cpp on both models. Asked
+  "What is 17 * 23?", Qwen2.5 works through 17 × 20 = 340 and has not
+  printed the final product after 110 tokens. TinyLlama emits end-of-text
+  immediately.
 - **Homelab:** gives identical tokens, but each stage hop adds ~8 ms
   (HTTP, JSON, and the worker's long poll). The 0.5B head stage also returns
   600 KB of base64 logits per token.
