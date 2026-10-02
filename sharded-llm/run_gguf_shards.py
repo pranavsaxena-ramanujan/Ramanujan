@@ -21,7 +21,7 @@ from pathlib import Path
 
 import numpy as np
 
-from converter.ramanujan_shards.llm_package import load_model
+from converter.ramanujan_shards.llm_package import add_model_arguments, load_model_from_args
 from converter.ramanujan_shards.llm_programs import (
     generate_embed_program, generate_head_program, generate_layer_program, layer_inputs, layer_roles,
     layer_states)
@@ -164,9 +164,7 @@ class HomelabWorker:
 class GgufRunner:
     def __init__(self, args):
         self.args = args
-        overrides = {"rope_style": args.rope_style, "activation": args.activation,
-                     "embed_scale": args.embed_scale}
-        self.spec, self.shards, self.tensors, metadata = load_model(args.package, args.metadata, overrides)
+        self.spec, self.shards, self.tensors, metadata = load_model_from_args(args)
         self.tokenizer = load_tokenizer(metadata)
         self.stop_ids = set(self.tokenizer.stop_ids)
         self.work = Path(args.work_dir).resolve()
@@ -417,13 +415,7 @@ def parse_args():
                         help="native runtime: layers uploaded ahead while streaming")
     parser.add_argument("--stream-threads", type=int, default=2,
                         help="native runtime: loader threads reading streamed layers in parallel")
-    semantics = parser.add_argument_group(
-        "architecture semantics", "facts GGUF does not store; needed only for architectures outside "
-        "the llm_spec.ARCHITECTURES registry, or to override it")
-    semantics.add_argument("--rope-style", choices=["norm", "neox"],
-                           help="norm rotates adjacent pairs (llama); neox rotates halves (qwen, phi3, gemma)")
-    semantics.add_argument("--activation", choices=["silu", "gelu"])
-    semantics.add_argument("--embed-scale", choices=["none", "sqrt_dim"])
+    add_model_arguments(parser)
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()
     if args.prefetch_steps is None:

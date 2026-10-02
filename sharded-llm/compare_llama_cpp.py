@@ -12,7 +12,7 @@ import time
 
 import numpy as np
 
-from converter.ramanujan_shards.llm_package import load_model
+from converter.ramanujan_shards.llm_package import add_model_arguments, load_model_from_args
 from converter.ramanujan_shards.llm_reference import LlmReference
 from converter.ramanujan_shards.llm_tokenizer import load_tokenizer
 
@@ -26,15 +26,20 @@ def main():
     parser.add_argument("--greedy-tokens", type=int, default=0,
                         help="also print llama.cpp's greedy continuation of this many tokens")
     parser.add_argument("--threads", type=int, default=4)
+    parser.add_argument("--gpu-layers", type=int, default=0,
+                        help="llama.cpp layers to offload (-1 = all, e.g. Metal). The CPU backend rounds "
+                             "activations to 8 bits, so GPU logits are a much tighter comparison")
+    add_model_arguments(parser)
     args = parser.parse_args()
     from llama_cpp import Llama
 
-    spec, _, tensors, metadata = load_model(args.package, args.metadata)
+    spec, _, tensors, metadata = load_model_from_args(args)
     tokenizer = load_tokenizer(metadata)
     ids = tokenizer.encode(args.prompt)
-    llm = Llama(model_path=args.gguf, n_ctx=max(64, len(ids) + args.greedy_tokens + 1), n_gpu_layers=0,
+    llm = Llama(model_path=args.gguf, n_ctx=max(64, len(ids) + args.greedy_tokens + 1), n_gpu_layers=args.gpu_layers,
                 logits_all=True, verbose=False, n_threads=args.threads)
-    expected_ids = llm.tokenize(args.prompt.encode("utf-8"), add_bos=tokenizer.add_bos, special=True)
+    # add_bos=True lets llama.cpp apply the model's own BOS rule, so a wrong tokenizer default shows up here.
+    expected_ids = llm.tokenize(args.prompt.encode("utf-8"), add_bos=True, special=True)
     print(json.dumps({"event": "tokens", "architecture": spec.architecture, "ours": ids,
                       "llama.cpp": expected_ids, "match": ids == expected_ids}), flush=True)
     llm.eval(ids)

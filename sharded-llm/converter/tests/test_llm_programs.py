@@ -301,6 +301,18 @@ class SpecValidationTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "residual_scale"):
             build_spec(metadata, tensors)
 
+    def test_rejects_unrecognized_architecture_metadata_unless_accepted(self):
+        metadata, tensors = self._tensors()
+        metadata["llama.attention.clamp_kqv"] = 8.0
+        metadata["tokenizer.ggml.add_space_prefix"] = True
+        with self.assertRaisesRegex(ValueError, "unrecognized metadata llama.attention.clamp_kqv"):
+            build_spec(metadata, tensors)
+        build_spec(metadata, tensors, accept_metadata=["llama.attention.clamp_kqv"])
+        metadata, tensors = self._tensors()
+        metadata["llama.attention.causal"] = False
+        with self.assertRaisesRegex(ValueError, "non-causal"):
+            build_spec(metadata, tensors)
+
     def test_groups_rows_that_are_not_float_aligned(self):
         with self.assertRaisesRegex(ValueError, "float-word aligned"):
             tensor_columns({"shape": [1, 256], "encoding": "gguf-q6_k"})

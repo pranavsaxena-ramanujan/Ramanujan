@@ -16,7 +16,7 @@ import uuid
 import numpy as np
 
 from converter.ramanujan_shards.llm_graph import graph_files, plan_stages, stage_graph
-from converter.ramanujan_shards.llm_package import load_model
+from converter.ramanujan_shards.llm_package import load_model_from_args
 from converter.ramanujan_shards.llm_tokenizer import load_tokenizer
 from converter.ramanujan_shards.native_llm import NativeStage
 
@@ -89,9 +89,7 @@ class NativeGgufRunner:
 
     def __init__(self, args):
         self.args = args
-        overrides = {"rope_style": args.rope_style, "activation": args.activation,
-                     "embed_scale": args.embed_scale}
-        self.spec, self.shards, self.tensors, metadata = load_model(args.package, args.metadata, overrides)
+        self.spec, self.shards, self.tensors, metadata = load_model_from_args(args)
         self.tokenizer = load_tokenizer(metadata)
         self.stop_ids = set(self.tokenizer.stop_ids)
         last = args.stop_after_layer

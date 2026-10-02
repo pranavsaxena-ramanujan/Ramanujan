@@ -83,6 +83,26 @@ ARCHITECTURES = {
 }
 
 
+# "{arch}.*" metadata keys that build_spec implements, rejects, or that cannot change text-only
+# decoding. Any other key may carry semantics the runtime would silently ignore (e.g. OLMo's
+# clamp_kqv), so build_spec rejects it unless the caller explicitly accepts it.
+KNOWN_METADATA = {
+    "context_length", "embedding_length", "block_count", "feed_forward_length", "vocab_size",
+    "attention.head_count", "attention.head_count_kv", "attention.key_length", "attention.value_length",
+    "attention.layer_norm_rms_epsilon", "attention.layer_norm_epsilon", "attention.scale",
+    "attention.sliding_window", "attention.causal",
+    "rope.dimension_count", "rope.freq_base", "rope.scaling.type", "rope.scaling.factor",
+    "rope.scaling.original_context_length", "rope.scaling.finetuned",
+    # Multimodal RoPE sections: every section gets the same position for text, so plain RoPE.
+    "rope.dimension_sections",
+    "final_logit_softcapping", "attn_logit_softcapping", "embedding_scale", "residual_scale", "logit_scale",
+    "nextn_predict_layers", "full_attention_interval",
+    "ssm.conv_kernel", "ssm.state_size", "ssm.group_count", "ssm.time_step_rank", "ssm.inner_size",
+    # MoE models are rejected by their ffn_gate_inp tensors; dense GGUFs may still carry these.
+    "expert_count", "expert_used_count",
+}
+
+
 @dataclass(frozen=True)
 class KindSpec:
     """One distinct layer shape; every layer of a kind runs the same program."""
@@ -180,17 +200,28 @@ def _int(value, name):
     return value
 
 
-def build_spec(metadata, tensors, overrides=None):
+def build_spec(metadata, tensors, overrides=None, accept_metadata=()):
     """Build a ModelSpec from GGUF metadata and a {name: {"shape", "encoding"}} tensor map.
 
     ``overrides`` may set Semantics fields (rope_style, activation, embed_scale); they are
-    required knowledge for architectures that are not in ARCHITECTURES.
+    required knowledge for architectures that are not in ARCHITECTURES. ``accept_metadata``
+    lists "{arch}.*" keys outside KNOWN_METADATA that the caller has verified are harmless.
     """
     arch = metadata.get("general.architecture")
     if not arch:
         raise ValueError("GGUF metadata has no general.architecture")
     key = lambda name: "{0}.{1}".format(arch, name)
     get = lambda name, default=None: metadata.get(key(name), default)
+    prefix = arch + "."
+    unknown = sorted(name for name in metadata if name.startswith(prefix)
+                     and name[len(prefix):] not in KNOWN_METADATA and name not in set(accept_metadata))
+    if unknown:
+        raise ValueError("unrecognized metadata {0}: it may change the model's math, which the runtime "
+                         "would ignore. Check the output against llama.cpp (compare_llama_cpp.py) and pass "
+                         "--accept-metadata KEY for each key that is harmless".format(", ".join(unknown)))
+    if get("attention.causal", True) is not True:
+        raise ValueError("{0} is false: non-causal (encoder) attention is not supported".format(
+            key("attention.causal")))
     assumptions = []
     semantics = ARCHITECTURES.get(arch)
     if semantics is None:

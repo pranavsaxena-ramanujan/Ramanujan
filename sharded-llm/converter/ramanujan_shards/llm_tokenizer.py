@@ -26,6 +26,10 @@ BPE_PRE_TOKENIZERS = {
     "qwen2": (_QWEN2, True, False),
     "qwen35": (_QWEN35, True, False),
 }
+# BPE pre-tokenizers that llama.cpp gives add_bos=true when tokenizer.ggml.add_bos_token is absent
+# (llama-vocab.cpp); SPM ("llama") vocabularies always default to true, other BPE ones to false.
+_BPE_PRE_ADD_BOS = {"llama3", "llama-v3", "llama-bpe", "falcon3", "falcon-h1", "pixtral", "midm-2.0", "lfm2",
+                    "jina-v5-nano", "tekken", "chameleon"}
 # llama.cpp treats these control tokens as end-of-generation in addition to eos/eot.
 _END_OF_GENERATION = {"<|eot_id|>", "<|im_end|>", "<|end|>", "<end_of_turn>", "<|endoftext|>", "<EOT>",
                       "<|end_of_text|>", "<|eom_id|>", "<|return|>", "<|call|>"}
@@ -39,7 +43,8 @@ class GgufTokenizer:
         self.ids = {token: i for i, token in enumerate(self.tokens)}
         self.bos = metadata.get("tokenizer.ggml.bos_token_id")
         self.eos = metadata.get("tokenizer.ggml.eos_token_id")
-        self.add_bos = bool(metadata.get("tokenizer.ggml.add_bos_token", self.model == "llama"))
+        default_bos = self.model == "llama" or metadata.get("tokenizer.ggml.pre") in _BPE_PRE_ADD_BOS
+        self.add_bos = bool(metadata.get("tokenizer.ggml.add_bos_token", default_bos))
         self.add_eos = bool(metadata.get("tokenizer.ggml.add_eos_token", False))
         self.stop_ids = {i for i in (self.eos, metadata.get("tokenizer.ggml.eot_token_id"),
                                      metadata.get("tokenizer.ggml.eom_token_id")) if i is not None}

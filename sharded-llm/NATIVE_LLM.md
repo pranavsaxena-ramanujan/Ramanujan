@@ -4,29 +4,64 @@
 for decoder-only LLMs, instead of generating Ramanujan DSL for every layer. It
 takes the same shard packages and model spec as the DSL path (see
 [GGUF_MODELS.md](GGUF_MODELS.md)), so any model the translator accepts
-(llama, qwen2, qwen3, qwen35, phi3, gemma, and unregistered architectures with
-overrides) runs on it without model-specific code.
+(llama, qwen2, qwen3, qwen35, phi3, gemma, and unregistered llama-style
+architectures such as `ernie4_5` and `internlm2`) runs on it without
+model-specific code.
 
-Measured on one 8 GB Apple M3 (greedy decode, 4 shards):
+### Speed against llama.cpp
 
-| Model | `--check-layers` (all layers) | Output | DSL runtime | Native local | Native via `rj homelab` |
-|---|---|---|---|---|---|
-| Qwen2.5 0.5B Q4_K_M | 5.8e-6 max rel. error (DSL: 2.3e-5) | " Paris. It is the largest city in Europe and the second larg" | ~650 ms/token | 8.2–8.9 ms/token | 40 ms/token |
-| TinyLlama 1.1B Q4_K_M | | " Paris.\n\n2. B.C. The capital of ancient Rome was Rome." | ~700 ms/token | 11.2–11.7 ms/token | 48 ms/token |
-| Qwen3.8 27B Q4_1 | 3.1e-7 (first 4 layers) | "\n\nTo solve 17" ("What is 17 * 23?") | 7.6–9.1 s/token | 4.94–4.98 s/token (streamed) | 5.05–5.1 s/token |
+Measured on one 8 GB Apple M3. Prompt "The capital of France is", 10 greedy
+tokens, 4 shards. Each cell is decode ms/token (the average after the first
+token), with tokens/s in brackets.
 
-- **Small models: about 56–75x faster** than the DSL path when running
-  locally. The first 16 greedy tokens match llama.cpp on both models. Asked
-  "What is 17 * 23?", Qwen2.5 works through 17 × 20 = 340 and has not
-  printed the final product after 110 tokens. TinyLlama emits end-of-text
-  immediately.
-- **Homelab:** gives identical tokens, but each stage hop adds ~8 ms
-  (HTTP, JSON, and the worker's long poll). The 0.5B head stage also returns
-  600 KB of base64 logits per token.
-- **27B:** needs 16 GB of weights read per token on an 8 GB machine, so it is
-  bound by SSD reads and gains only ~1.5x. Faster decode needs the weights
-  resident, which means spreading the shards across machines with enough
-  combined RAM.
+- **llama.cpp:** llama-cpp-python 0.3.35, after one warm-up run, with a
+  timestamp taken when each token's logits are read. `llama_decode` returns
+  before the GPU finishes, so timing only the decode call undercounts.
+- **Ramanujan:** `run_gguf_shards.py --runtime native`, either local or via one
+  `rj homelab` and one `rj worker --shared-filesystem` on the same machine.
+  The worker owns all 4 shards, so every token makes 4 HTTP hops.
+
+| Model | Arch | llama.cpp Metal | llama.cpp CPU (4 threads) | Ramanujan local | Ramanujan via `rj homelab` | Ramanujan output (10 tokens) |
+|---|---|---|---|---|---|---|
+| ERNIE 4.5 0.3B Q4_K_M | `ernie4_5` (unregistered) | 6.08 (164) | 4.48 (223)\* | 6.89 (145) | 33.8 (30) | "...\n\nA. FRANCE\n\n" |
+| Qwen2.5 0.5B Q4_K_M | `qwen2` | 6.52 (153) | 7.54 (133)\* | 8.22 (122) | 38.7 (26) | " Paris. It is the largest city in Europe and" |
+| Qwen3 0.6B Q4_K_M | `qwen3` | 6.92 (145) | 7.54 (133) | 10.1 (99) | 39.8 (25) | " Paris. The capital of France is also the capital" |
+| Llama 3.2 1B Instruct Q4_K_M | `llama` | 10.5 (96) | 13.1 (76) | 12.9 (78) | 44.6 (22) | " Paris. The Eiffel Tower is a famous" |
+| TinyLlama 1.1B Q4_K_M | `llama` | 9.27 (108) | 10.8 (92) | 13.8 (73) | 28.3 (35) | " Paris.\n\n2. B.C." |
+| InternLM2.5 1.8B Q4_K_M | `internlm2` (unregistered) | 14.5 (69) | 17.7 (56) | 16.9 (59) | 42.7 (23) | " Paris. The French language is spoken in France and" |
+| Gemma 1.1 2B Q4_K_M | `gemma` | 19.3 (52) | 26.4 (38) | 23.2 (43) | 80.4 (12) | " Paris.\n\nThe statement is false.\n\nThe" |
+| Phi-3 mini 4k Q4 | `phi3` | 30.3 (33) | 38.4 (26)\* | 34.3 (29) | 50.2 (20) | " Paris.\n<\|assistant\|> That's correct! Paris" |
+| Qwen3.8 27B Q4_1 | `qwen35` | does not fit | 20,389 (0.05) | 5,185 (0.19) | 5,243 (0.19) | " Paris.\nThe capital of Germany is Berlin." |
+
+All 10 tokens are identical across every column except the cells marked
+\*. There, llama.cpp's CPU backend diverges (at token 0, 8 and 4) because it
+rounds activations to 8 bits inside its matmuls. llama.cpp on Metal matches
+Ramanujan on every model.
+
+- **Ramanujan local vs llama.cpp Metal:** 1.13–1.49x slower on the small
+  models. Compared with llama.cpp CPU it is about even, and faster on the 1.8B
+  to 3.8B models.
+- **27B:** on an 8 GB machine, 16 GB of weights are read per token. Ramanujan
+  streams them with its own loader threads at 5.2 s/token. llama.cpp
+  memory-maps the file and spends its time in page faults at 20.4 s/token, so
+  Ramanujan is **3.9x faster**. llama.cpp on Metal cannot hold the model
+  (the working-set limit is ~5.7 GB).
+- **Homelab adds 15–57 ms/token.** The extra cost grows with vocabulary size,
+  because the head stage returns the full logits as base64 JSON:
+  - +15 ms for TinyLlama and Phi-3 (32k vocabulary)
+  - +30 ms for Qwen and Llama 3.2 (128k–152k)
+  - +57 ms for Gemma (256k)
+
+  On the 27B the overhead is 1%. Returning only the chosen token from the head
+  would remove most of it on small models (see Limitations).
+- **First token:** local runs take 45–211 ms, and that includes the prompt
+  prefill. Via homelab it is 178 ms–1.2 s, because the first step also makes
+  the worker open its sessions and upload weights.
+- **DSL path:** the same small models take 650–700 ms/token and the 27B
+  7.6–9.1 s/token. The native runtime is 56–75x faster on small models.
+
+`--check-layers` error and llama.cpp agreement per model are in
+[GGUF_MODELS.md](GGUF_MODELS.md).
 
 ## Design
 
@@ -173,9 +208,11 @@ It also checks position-mismatch errors and `reset()`.
 - **Device.** Only OpenCL is supported, and it has been validated only on Apple
   M3 GPUs. Linux, Android and Windows builds are untested. Page-cache bypass is
   macOS-only.
-- **Homelab overhead.** Each stage hop costs ~8 ms, and full logits travel as
-  JSON/base64. The driver samples greedily, so returning the argmax (or top-k)
-  from the head would remove most of that.
+- **Homelab overhead.** Each stage hop costs ~3 ms (HTTP, queue, the worker's
+  long poll). The head hop also returns the full logits as base64 JSON: 4 bytes
+  per vocabulary entry before base64, so 128 KB for a 32k vocabulary and 1 MB
+  for Gemma's 256k. The driver samples greedily, so
+  returning the argmax (or top-k) from the head would remove most of that.
 - **No recovery.** A lost session is not rebuilt; the generation must restart
   from position 0.
 - **Coverage.** Same as the translator ([GGUF_MODELS.md](GGUF_MODELS.md#supported-pieces)).

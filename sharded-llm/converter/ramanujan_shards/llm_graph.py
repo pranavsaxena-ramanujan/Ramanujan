@@ -61,6 +61,9 @@ def hyper(spec):
 
 def stage_graph(spec, tensors, stage, max_context, weights="auto", stream_depth=2, stream_threads=2):
     """JSON-ready graph for one stage from plan_stages."""
+    if spec.sliding_window and max_context > spec.sliding_window:
+        # The runtime attends over the whole context, which is exact only within the window.
+        raise ValueError("context {0} exceeds the sliding window {1}".format(max_context, spec.sliding_window))
     graph = {"format": GRAPH_FORMAT, "hyper": hyper(spec), "max_context": int(max_context),
              "weights": weights, "stream_depth": int(stream_depth), "stream_threads": int(stream_threads),
              "layers": []}

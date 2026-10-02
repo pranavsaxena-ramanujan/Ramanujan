@@ -122,6 +122,12 @@ class StagePlanTest(unittest.TestCase):
                          [(s["shard"], s["embed"], s["layers"], s["head"])
                           for s in plan_stages(_Spec, tensors, last_layer=1)])
 
+    def test_context_beyond_sliding_window_is_rejected(self):
+        class _Spec:
+            sliding_window = 64
+        with self.assertRaisesRegex(ValueError, "sliding window 64"):
+            stage_graph(_Spec, {}, {"embed": False, "layers": [], "head": False}, 128)
+
     def test_graph_files_lists_each_weight_once(self):
         graph = {"embed": {"file": "/a"}, "layers": [{"tensors": {"x": {"file": "/b"}, "y": {"file": "/a"}}}],
                  "head": {"output": {"file": "/a"}, "output_norm": {"file": "/c"}}}
