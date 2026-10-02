@@ -5,6 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Ramanujan Computing</title>
   <link rel="stylesheet" href="/styles.css">
+  <script src="/ide.js" defer></script>
   <script src="/app.js" defer></script>
 </head>
 <body>
@@ -16,13 +17,34 @@
     <section id="workspace" hidden>
       <div class="workspace">
         <aside class="card rooms"><h2>Your rooms</h2><div id="room-list"></div><form id="room-form"><label>New cluster name<input id="room-name" placeholder="My home lab" maxlength="120" required></label><button class="primary" type="submit">+ Create room</button></form><div id="join-details" hidden><h3>Invite your devices</h3><p>Save this secret now. It is only shown once.</p><label>Room ID<input id="new-room-id" readonly></label><label>Join secret<input id="new-room-secret" readonly type="password"></label><button id="show-secret" type="button">Show / hide secret</button><small>Enter these in the desktop client or Android app. Keep the management key private.</small></div></aside>
-        <section class="card chat">
-          <div class="chat-header"><div><h2 id="selected-room">Choose or create a room</h2><small id="room-id-label"></small></div><label>Model<select id="model-select"><option value="">No model configured</option></select></label></div>
-          <div id="messages" class="messages" aria-live="polite"><div class="empty"><p>Connect a device to this room, then ask a question.</p></div></div>
-          <form id="chat-form"><label class="sr-only" for="question">Ask a question</label><div class="composer"><textarea id="question" placeholder="Ask your cluster a question..." rows="2" maxlength="16000" required></textarea><button class="primary" id="send" type="submit">Send &rarr;</button></div></form>
-        </section>
-        <section class="card devices"><div class="section-title"><h2>Connected devices</h2><button id="refresh-devices">Refresh</button></div><p>Install a client and enter the room ID and join secret.</p><div id="device-list">Select a room to see its devices.</div></section>
-        <details class="card jobs"><summary>Advanced: submit a compute DAG</summary><form id="job-form"><label>Python computation<textarea id="job-code" rows="5" placeholder="Write a Ramanujan-supported Python computation" required></textarea></label><button type="submit">Run on this cluster</button></form><pre id="job-result"></pre></details>
+        <div class="main-column">
+          <div class="room-head"><div><h2 id="selected-room">Choose or create a room</h2><small id="room-id-label"></small></div>
+            <div class="tabs" role="tablist" aria-label="Sections"><button id="tab-chat" class="tab" type="button" role="tab" aria-selected="true" aria-controls="chat-panel">LLM Chat</button><button id="tab-code" class="tab" type="button" role="tab" aria-selected="false" aria-controls="code-panel">Code execution</button></div></div>
+          <section id="chat-panel" class="card chat" role="tabpanel" aria-labelledby="tab-chat">
+            <div class="chat-header"><h3>LLM Chat</h3><label>Model<select id="model-select"><option value="">No model configured</option></select></label></div>
+            <div id="messages" class="messages" aria-live="polite"><div class="empty"><p>Connect a device to this room, then ask a question.</p></div></div>
+            <form id="chat-form"><label class="sr-only" for="question">Ask a question</label><div class="composer"><textarea id="question" placeholder="Ask your cluster a question..." rows="2" maxlength="16000" required></textarea><button class="primary" id="send" type="submit">Send &rarr;</button></div></form>
+          </section>
+          <section id="code-panel" class="card ide" role="tabpanel" aria-labelledby="tab-code" hidden>
+            <div class="ide-toolbar">
+              <button id="upload-files" type="button">Upload files</button><button id="upload-folder" type="button">Upload folder</button><button id="new-file" type="button">New file</button>
+              <input id="upload-files-input" type="file" accept=".py,text/x-python" multiple hidden><input id="upload-folder-input" type="file" webkitdirectory multiple hidden>
+              <label class="entry-label">Main file<select id="entry-select"></select></label>
+              <button id="run-code" class="primary" type="button">&#9654; Run on cluster</button>
+            </div>
+            <div class="ide-body">
+              <aside class="explorer" aria-label="Files"><div class="explorer-head">Explorer</div><ul id="file-tree"></ul></aside>
+              <div class="editor-area">
+                <div id="editor-tabs" class="editor-tabs" role="tablist" aria-label="Open files"></div>
+                <div id="editor-empty" class="editor-empty" hidden>Open a file from the explorer.</div>
+                <div id="code-surface" class="code-surface"><pre id="code-gutter" class="code-gutter" aria-hidden="true"></pre><div class="code-wrap"><pre id="code-highlight" class="code-highlight" aria-hidden="true"></pre><textarea id="code-editor" spellcheck="false" autocapitalize="off" autocomplete="off" wrap="off" aria-label="Code editor"></textarea></div></div>
+              </div>
+            </div>
+            <div class="ide-panel"><div class="panel-head"><span>Output</span><span id="run-status" class="run-status"></span></div><div id="run-output" class="run-output" aria-live="polite"></div></div>
+            <div class="statusbar"><span id="status-main"></span><span id="status-files"></span><span class="statusbar-right" id="status-position"></span><span>Python</span></div>
+          </section>
+          <section class="card devices"><div class="section-title"><h2>Connected devices</h2><button id="refresh-devices">Refresh</button></div><p>Install a client and enter the room ID and join secret.</p><div id="device-list">Select a room to see its devices.</div></section>
+        </div>
       </div>
     </section>
     <section class="downloads"><div><div class="section-title"><h2>Download the client</h2><button id="refresh-downloads" type="button">Refresh downloads</button></div><p>Install it on any idle device and join a room.</p></div><div id="downloads" class="download-grid"></div><p class="footnote">Available now for macOS on Apple Silicon. Windows, Linux and Android are coming soon.</p></section>

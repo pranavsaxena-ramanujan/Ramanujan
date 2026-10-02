@@ -178,6 +178,67 @@ test('general DAGs use existing middleware submission and cluster-scoped status'
   assert.equal(calls[1].target.searchParams.get('clusterId'), room.clusterId);
 });
 
+test('multi-file projects are forwarded with the chosen main file and validated', async t => {
+  const calls = [];
+  const f = await fixture(t, {
+    middlewareUrl: 'http://middleware.test:8080',
+    fetchImpl: async (url, init) => {
+      calls.push({ target: new URL(url), init });
+      return new Response(JSON.stringify({ status: '200 OK', data: { asyncId: 'multi-id' } }), { headers: { 'content-type': 'application/json' } });
+    }
+  });
+  const owner = await f.register();
+  const room = await f.room(owner);
+  const route = `/api/clusters/${room.roomId}/jobs`;
+  const files = { 'app.py': 'from pkg.ops import add\nx = add(1, 2)\n', 'pkg/ops.py': 'def add(a, b):\n    return a + b\n' };
+  const submitted = await f.request(route, { files, entryPoint: 'app.py' }, owner);
+  assert.equal(submitted.status, 202);
+  const body = JSON.parse(calls[0].init.body);
+  assert.deepEqual(body.files, files);
+  assert.equal(body.entryPoint, 'app.py');
+  assert.equal(body.code, undefined);
+  assert.equal(body.clusterId, room.clusterId);
+  for (const bad of [
+    { files, entryPoint: 'missing.py' },
+    { files: { '../escape.py': 'x = 1' }, entryPoint: '../escape.py' },
+    { files: { '/abs.py': 'x = 1' }, entryPoint: '/abs.py' },
+    { files: { 'notes.txt': 'x' }, entryPoint: 'notes.txt' },
+    { files: { 'main.py': 'f = open(\'x\')' }, entryPoint: 'main.py' },
+    { files: {}, entryPoint: 'main.py' }
+  ]) assert.equal((await f.request(route, bad, owner)).status, 400, JSON.stringify(bad));
+  assert.equal(calls.length, 1);
+});
+
+test('rejected programs return a readable reason and stale jobs do not break the job list', async t => {
+  let mode = 'reject';
+  const f = await fixture(t, {
+    middlewareUrl: 'http://middleware.test:8080',
+    fetchImpl: async url => {
+      const target = new URL(url);
+      if (target.pathname === '/run' && mode === 'reject') {
+        return new Response(JSON.stringify({ status: '500 Internal Server Error', data: { stackTrace: [{ className: 'x' }],
+          message: 'Compilation error at line null character null: Error parsing Python code: Compilation error at line null character null: Function argument must be a variable name' } }),
+          { status: 500, headers: { 'content-type': 'application/json' } });
+      }
+      if (target.pathname === '/run') return new Response(JSON.stringify({ status: '200 OK', data: { asyncId: 'lost-id' } }), { headers: { 'content-type': 'application/json' } });
+      return new Response(JSON.stringify({ status: '500', data: null }), { status: 500, headers: { 'content-type': 'application/json' } });
+    }
+  });
+  const owner = await f.register();
+  const room = await f.room(owner);
+  const route = `/api/clusters/${room.roomId}/jobs`;
+  const rejected = await f.request(route, { files: { 'main.py': 'x = f(1 + 2)\n' }, entryPoint: 'main.py' }, owner);
+  assert.equal(rejected.status, 422);
+  assert.equal(rejected.data.error, 'Function argument must be a variable name');
+  assert.equal(JSON.stringify(rejected.data).includes('stackTrace'), false);
+  mode = 'accept';
+  assert.equal((await f.request(route, { code: 'x = 1' }, owner)).status, 202);
+  const jobs = await f.request(route, null, owner);
+  assert.equal(jobs.status, 200);
+  assert.deepEqual(jobs.data.map(job => job.status).sort(), ['FAILED', 'FAILED']);
+  assert.match(jobs.data.map(job => JSON.parse(job.result_json).error).join(' '), /no longer tracks this job/);
+});
+
 test('binary relay preserves Content-Length for worker integrity checks', async t => {
   const bytes = Buffer.from('weights-bytes');
   const f = await fixture(t, { fetchImpl: async () => new Response(bytes, { headers: {

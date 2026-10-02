@@ -12,6 +12,32 @@ const ownerRoutes = new Set(['/llm/chain', '/llm/step', '/llm/close']);
 const platforms = new Set(['windows', 'linux', 'macos', 'android']);
 const dummyHash = '00000000000000000000000000000000:' + '00'.repeat(64);
 
+const projectPath = /^(?!.*(?:^|\/)\.\.?(?:\/|$))[A-Za-z0-9_][A-Za-z0-9_.-]*(?:\/[A-Za-z0-9_][A-Za-z0-9_.-]*)*\.py$/;
+
+// A multi-file Python project: relative .py paths mapped to source, plus the file to run.
+/** Turns a middleware rejection (which embeds a Java exception) into a short message for the program author. */
+function programError(result) {
+  const raw = String(result?.data?.message || result?.error || result?.message || '');
+  const cleaned = raw.replace(/Compilation error at line null character null:\s*/g, '')
+    .replace(/Error parsing Python code:\s*/g, '').trim();
+  return cleaned ? cleaned.slice(0, 600) : 'The cluster could not run this program.';
+}
+function pythonProject(files, entryPoint) {
+  if (!files || typeof files !== 'object' || Array.isArray(files)) throw new HttpError(400, 'files must map file paths to source code');
+  const entries = Object.entries(files);
+  if (!entries.length || entries.length > 100) throw new HttpError(400, 'Submit between 1 and 100 Python files');
+  let total = 0;
+  for (const [name, source] of entries) {
+    if (name.length > 200 || !projectPath.test(name)) throw new HttpError(400, `Invalid file path: ${name.slice(0, 200)}`);
+    if (typeof source !== 'string') throw new HttpError(400, `File ${name} must contain text`);
+    total += source.length;
+  }
+  if (total > 2000000) throw new HttpError(400, 'Project is larger than 2 MB');
+  if (typeof entryPoint !== 'string' || !Object.hasOwn(files, entryPoint)) throw new HttpError(400, 'Choose which file is the main file');
+  if (!files[entryPoint].trim()) throw new HttpError(400, 'The main file is empty');
+  return { files, entryPoint };
+}
+
 function createApp({ store, publicUrl, orchestratorUrl, middlewareUrl, homelabUrl, modelRoot, releasesDir, models = [], infer, production = false, fetchImpl = fetch }) {
   const app = express();
   const publicOrigin = new URL(publicUrl).origin;
@@ -185,21 +211,30 @@ function createApp({ store, publicUrl, orchestratorUrl, middlewareUrl, homelabUr
   }));
   app.post('/api/clusters/:roomId/jobs', asyncRoute(async (req, res) => {
     const room = await roomForOwner(req);
-    const code = text(req.body.code, 'Code', 1000000);
-    if (JSON.stringify(req.body).includes('binaryFile') || /\b(?:open|load_binary)\s*\(/.test(code)) throw new HttpError(400, 'Local file inputs are not accepted by this endpoint');
+    if (JSON.stringify(req.body).includes('binaryFile')) throw new HttpError(400, 'Local file inputs are not accepted by this endpoint');
     if (req.body.csvInformationList?.length) throw new HttpError(400, 'CSV inputs require an administrator-provided model package; submit code without local file inputs');
+    const program = req.body.files !== undefined ? pythonProject(req.body.files, req.body.entryPoint)
+      : { code: text(req.body.code, 'Code', 1000000) };
+    const sources = program.files ? Object.values(program.files) : [program.code];
+    if (sources.some(source => /\b(?:open|load_binary)\s*\(/.test(source))) throw new HttpError(400, 'Local file inputs are not accepted by this endpoint');
     const id = crypto.randomUUID();
     await store.createJob(id, room.id);
     try {
       const response = await fetchImpl(new URL('/run?debug=false', middleware), {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ code, csvInformationList: [], clusterId: room.id }),
+        body: JSON.stringify({ ...program, csvInformationList: [], clusterId: room.id }),
         signal: AbortSignal.timeout(15 * 60 * 1000), redirect: 'error'
       });
       const result = await response.json();
       const accepted = response.ok && typeof result.data?.asyncId === 'string';
-      await store.finishJob(id, accepted ? 'QUEUED' : 'FAILED', result);
-      res.status(accepted ? 202 : 502).json({ id, status: accepted ? 'QUEUED' : 'FAILED', result });
+      if (!accepted) {
+        const error = programError(result);
+        await store.finishJob(id, 'FAILED', { error });
+        res.status(/compil|pars|syntax|not supported|must be/i.test(error) ? 422 : 502).json({ id, status: 'FAILED', error });
+        return;
+      }
+      await store.finishJob(id, 'QUEUED', result);
+      res.status(202).json({ id, status: 'QUEUED', result });
     } catch (error) {
       await store.finishJob(id, 'FAILED', { error: 'Execution service unavailable or timed out' });
       throw error;
@@ -214,8 +249,18 @@ function createApp({ store, publicUrl, orchestratorUrl, middlewareUrl, homelabUr
       const target = new URL('/status', middleware);
       target.searchParams.set('uuid', previous.data.asyncId);
       target.searchParams.set('clusterId', room.id);
-      const response = await fetchImpl(target, { signal: AbortSignal.timeout(30000), redirect: 'error' });
-      if (!response.ok) throw new HttpError(502, 'Middleware could not retrieve this cluster job');
+      let response;
+      try {
+        response = await fetchImpl(target, { signal: AbortSignal.timeout(30000), redirect: 'error' });
+      } catch {
+        continue;
+      }
+      if (!response.ok) {
+        const lost = { ...previous, error: 'The execution service no longer tracks this job (it may have restarted). Run it again.' };
+        await store.finishJob(job.id, 'FAILED', lost);
+        job.status = 'FAILED'; job.result_json = JSON.stringify(lost);
+        continue;
+      }
       const result = await response.json();
       const upstream = result.data?.taskStatus;
       const status = ['SUCCESS', 'COMPLETED'].includes(upstream) ? 'SUCCESS' :

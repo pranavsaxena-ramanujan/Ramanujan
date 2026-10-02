@@ -51,7 +51,7 @@ async function selectRoom(room) {
   if (pending) throw new Error('Wait for the current answer before changing rooms.');
   selectedRoom = room; $('selected-room').textContent = room.name; $('room-id-label').textContent = `Room ID: ${room.room_id}`;
   document.querySelectorAll('.room-button').forEach(button => button.classList.toggle('active', button.dataset.id === room.id));
-  renderChat(); await devices();
+  renderChat(); ide.setRoom(room.room_id); await devices();
 }
 async function loadWorkspace() {
   const rooms = await api('/api/clusters');
@@ -101,23 +101,37 @@ $('chat-form').addEventListener('submit', safe(async () => {
   } catch (error) { history.push({ role: 'error', text: error.message }); }
   finally { pending = false; $('send').disabled = false; $('send').textContent = 'Send \u2192'; renderChat(); }
 }));
-$('job-form').addEventListener('submit', safe(async () => {
+const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+async function runCode(project) {
   if (!selectedRoom) throw new Error('Select a room first.');
-  $('job-result').textContent = 'Running on your cluster...';
-  try {
-    const endpoint = roomPath('jobs');
-    const result = await api(endpoint, { code: $('job-code').value });
-    $('job-result').textContent = JSON.stringify(result, null, 2);
-    for (let attempt = 0; result.status === 'QUEUED' && attempt < 300; attempt++) {
-      await new Promise(resolve => setTimeout(resolve, 2000));
-      const job = (await api(endpoint)).find(item => item.id === result.id);
-      if (!job) throw new Error('Submitted job no longer exists.');
-      $('job-result').textContent = JSON.stringify({ status: job.status, result: JSON.parse(job.result_json) }, null, 2);
-      if (['SUCCESS', 'FAILED'].includes(job.status)) return;
-    }
+  const endpoint = roomPath('jobs');
+  const submitted = await api(endpoint, project);
+  const deadline = Date.now() + 60 * 60 * 1000;
+  for (let failures = 0; Date.now() < deadline;) {
+    await sleep(2000);
+    let job;
+    try { job = (await api(endpoint)).find(item => item.id === submitted.id); failures = 0; }
+    catch (error) { if (++failures >= 5) throw error; continue; }
+    if (!job) throw new Error('This run no longer exists.');
+    if (!['SUCCESS', 'FAILED'].includes(job.status)) continue;
+    const detail = JSON.parse(job.result_json || '{}');
+    return { status: job.status, result: detail.latest?.data?.result,
+      error: detail.error || (job.status === 'FAILED' ? 'Your devices reported a failure while running this program.' : undefined) };
   }
-  catch (error) { $('job-result').textContent = error.message; throw error; }
-}));
+  throw new Error('Stopped waiting after an hour. The run may still finish on your devices.');
+}
+const ide = createCodeWorkspace({ run: runCode, notice });
+function showSection(name) {
+  for (const [tab, panel] of [['tab-chat', 'chat-panel'], ['tab-code', 'code-panel']]) {
+    const active = tab === `tab-${name}`;
+    $(tab).setAttribute('aria-selected', String(active));
+    $(panel).hidden = !active;
+  }
+  localStorage.setItem('ramanujan-section', name);
+}
+$('tab-chat').addEventListener('click', () => showSection('chat'));
+$('tab-code').addEventListener('click', () => showSection('code'));
+showSection(localStorage.getItem('ramanujan-section') === 'code' ? 'code' : 'chat');
 async function loadDownloads() {
   const labels = { macos: 'macOS', windows: 'Windows', linux: 'Linux', android: 'Android' };
   const releases = await api('/api/downloads');

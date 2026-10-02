@@ -99,6 +99,37 @@ The driver passes the token only in an HTTP authorization header, never a
 URL or command-line argument. The gateway derives `clusterId` from the key
 and room instead of trusting caller-supplied cluster or device identifiers.
 
+## Code execution
+
+The **Code execution** tab is a small VS Code-style editor (`public/ide.js`,
+no external scripts, so it works under the portal's `default-src 'self'`
+CSP). Upload `.py` files or a whole folder (`__pycache__` and non-Python
+files are skipped), create, rename or delete files, edit them in tabs with
+Python highlighting, and choose the **Main file**. Files are kept in this
+browser's local storage per room; they are sent only when you press **Run on
+cluster** (Ctrl/Cmd + Enter). The output panel shows the program's final
+top-level variables and arrays.
+
+The editor calls the same job API, which also accepts single-file `code`:
+
+```http
+POST /api/clusters/ROOM_ID/jobs
+Authorization: Bearer MANAGEMENT_KEY
+
+{"files": {"main.py": "from pkg.ops import add\nx = add(1, 2)\n",
+           "pkg/ops.py": "def add(a, b):\n    c = a + b\n    return c\n"},
+ "entryPoint": "main.py"}
+```
+
+Paths must be relative `.py` paths (no `..`), at most 100 files and 2 MB in
+total, and `entryPoint` must be one of them. File inputs (`open`,
+`load_binary`) are rejected. Programs the translator cannot compile get a
+`422` with a readable `error`. `GET` on the same route lists jobs and refreshes
+running ones; a job the middleware no longer knows about (for example after
+it restarts) is marked `FAILED` instead of breaking the list. Programs use the
+interpreter's Python subset: for example, prefer `while` loops, and pass or
+return plain names or constants (`y = x * x` then `return y`).
+
 ## Production database and downloads
 
 Set `DB_HOST`, `DB_PORT` (optional), `DB_USER`, `DB_NAME`, `DB_PASSWORD` and,
