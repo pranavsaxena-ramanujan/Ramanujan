@@ -279,3 +279,173 @@ test('missing native backend endpoint is not reported as a device library failur
   assert.equal(response.status, 503);
   assert.match(response.data.error, /cannot answer questions right now/);
 });
+
+test('chat sends the validated conversation history and reports dropped turns', async t => {
+  const requests = [];
+  const f = await fixture(t, { models: [{ id: 'tiny', name: 'Tiny' }],
+    infer: async request => { requests.push(request); return { text: 'Ada', droppedTurns: 2 }; } });
+  const owner = await f.register();
+  const room = await f.room(owner);
+  const joined = await f.request('/api/devices/join', { roomId: room.roomId, joinSecret: room.joinSecret, name: 'Mac', platform: 'macos' });
+  await f.store.touchDevice(joined.data.deviceId);
+  const route = `/api/clusters/${room.roomId}/chat`;
+  const messages = [{ role: 'user', content: 'My name is Ada.' }, { role: 'assistant', content: 'Hi Ada!', extra: 1 }, { role: 'user', content: 'Who am I?' }];
+  const answer = await f.request(route, { model: 'tiny', messages }, owner);
+  assert.equal(answer.status, 200);
+  assert.deepEqual(answer.data, { id: answer.data.id, answer: 'Ada', droppedTurns: 2 });
+  assert.deepEqual(requests[0].messages, messages.map(({ role, content }) => ({ role, content })));
+  for (const bad of [[], [{ role: 'assistant', content: 'x' }], messages.slice(0, 2), [{ role: 'user', content: 'a' }, { role: 'user', content: 'b' }, { role: 'user', content: 'c' }],
+    [{ role: 'user', content: 'a' }, { role: 'assistant', content: 'b' }, { role: 'user', content: '  ' }], [{ role: 'user', content: 5 }]]) {
+    assert.equal((await f.request(route, { model: 'tiny', messages: bad }, owner)).status, 400, JSON.stringify(bad));
+  }
+  assert.equal(requests.length, 1);
+  const legacy = await f.request(route, { model: 'tiny', question: 'Hello' }, owner);
+  assert.equal(legacy.status, 200);
+  assert.deepEqual(requests[1].messages, [{ role: 'user', content: 'Hello' }]);
+});
+
+async function modelFixture(t, download) {
+  const { createModelManager } = require('../user-models');
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'rj-user-models-'));
+  t.after(() => fs.rm(dir, { recursive: true, force: true }));
+  const conversions = [];
+  let store;
+  const lazyStore = new Proxy({}, { get: (target, name) => (...args) => store[name](...args) });
+  const userModels = createModelManager({ store: lazyStore, dir, reserveBytes: 0, download,
+    convert: async ({ gguf, shards, plan }) => {
+      conversions.push(gguf);
+      if ((await fs.readFile(gguf)).includes('broken')) throw new Error('unsupported architecture: mystery');
+      await fs.mkdir(shards); await fs.writeFile(path.join(shards, 'shard-00'), 'weights');
+      await fs.mkdir(plan);
+      await fs.writeFile(path.join(plan, 'gguf-metadata.json'), JSON.stringify({ 'general.architecture': 'llama',
+        'llama.context_length': 512, 'tokenizer.chat_template': '<|start_header_id|>' }));
+    } });
+  const requests = [];
+  const f = await fixture(t, { userModels, infer: async request => { requests.push(request); return 'ok'; } });
+  store = f.store;
+  await userModels.init();
+  return { ...f, dir, userModels, conversions, requests };
+}
+async function upload(f, owner, body, name = 'My model') {
+  const response = await fetch(`${f.base}/api/models/upload?name=${encodeURIComponent(name)}`, { method: 'POST',
+    headers: { 'Content-Type': 'application/octet-stream', Authorization: `Bearer ${owner}` }, body });
+  return { status: response.status, data: await response.json() };
+}
+async function waitForModel(f, owner, id) {
+  for (let i = 0; i < 100; i++) {
+    const model = (await f.request('/api/models', null, owner)).data.find(item => item.id === id);
+    if (!model || ['READY', 'FAILED'].includes(model.status)) return model;
+    await new Promise(resolve => setTimeout(resolve, 20));
+  }
+  throw new Error('model did not finish');
+}
+
+test('owners upload GGUF models that are converted, private to them and usable for chat', async t => {
+  const f = await modelFixture(t);
+  const owner = await f.register();
+  const other = await f.register();
+  const rejected = await upload(f, owner, 'not a gguf at all');
+  assert.equal(rejected.status, 400);
+  assert.match(rejected.data.error, /not a GGUF/);
+  assert.deepEqual((await f.request('/api/models', null, owner)).data, []);
+  assert.deepEqual(await fs.readdir(f.dir), []);
+
+  const created = await upload(f, owner, 'GGUF\u0003rest-of-model');
+  assert.equal(created.status, 201);
+  assert.equal(created.data.status, 'QUEUED');
+  const ready = await waitForModel(f, owner, created.data.id);
+  assert.equal(ready.status, 'READY');
+  assert.equal(ready.architecture, 'llama');
+  assert.equal(ready.chatFormat, 'llama3');
+  assert.equal(ready.sizeBytes, 18);
+  await assert.rejects(fs.stat(path.join(f.dir, created.data.id, 'model.gguf')));
+  assert.deepEqual((await f.request('/api/models', null, other)).data, []);
+  assert.equal((await f.request(`/api/models/${created.data.id}`, null, other, 'DELETE')).status, 404);
+
+  const room = await f.room(owner);
+  const joined = await f.request('/api/devices/join', { roomId: room.roomId, joinSecret: room.joinSecret, name: 'Mac', platform: 'macos' });
+  await f.store.touchDevice(joined.data.deviceId);
+  assert.equal((await f.request(`/api/clusters/${room.roomId}/chat`, { model: created.data.id, question: 'Hi' }, owner)).status, 200);
+  const model = f.requests[0].model;
+  assert.equal(model.package, path.join(f.dir, created.data.id, 'shards'));
+  assert.equal(model.chatFormat, 'llama3');
+  assert.equal(model.maxContext, 512);
+  assert.equal(model.maxNewTokens, 128);
+
+  const shard = path.join(f.dir, created.data.id, 'shards', 'shard-00');
+  const gateway = `/api/clusters/${room.roomId}/homelab/llm/step`;
+  assert.equal((await f.request(gateway, { files: [shard] }, owner)).status, 200);
+  const otherRoom = await f.room(other);
+  assert.equal((await f.request(`/api/clusters/${otherRoom.roomId}/homelab/llm/step`, { files: [shard] }, other)).status, 403);
+
+  assert.equal((await f.request(`/api/models/${created.data.id}`, null, owner, 'DELETE')).status, 200);
+  await assert.rejects(fs.stat(path.join(f.dir, created.data.id)));
+  assert.equal((await f.request(`/api/clusters/${room.roomId}/chat`, { model: created.data.id, question: 'Hi' }, owner)).status, 503);
+
+  const broken = await upload(f, owner, 'GGUF broken');
+  const failed = await waitForModel(f, owner, broken.data.id);
+  assert.equal(failed.status, 'FAILED');
+  assert.match(failed.detail, /unsupported architecture/);
+});
+
+test('URL imports download only public HTTPS models', async t => {
+  const { Readable } = require('node:stream');
+  const downloads = [];
+  const f = await modelFixture(t, async url => {
+    downloads.push(url);
+    if (url.includes('missing')) throw new Error('The model URL returned HTTP 404');
+    return { stream: Readable.from([Buffer.from('GGUF'), Buffer.from('-weights')]), size: 12 };
+  });
+  const owner = await f.register();
+  for (const url of ['http://example.com/model.gguf', 'https://127.0.0.1/model.gguf', 'https://[::1]/model.gguf',
+    'https://10.1.2.3/m.gguf', 'https://user:pw@example.com/m.gguf', 'https://localhost/m.gguf', 'file:///etc/passwd', 'not a url']) {
+    assert.equal((await f.request('/api/models', { url }, owner)).status, 400, url);
+  }
+  assert.deepEqual(downloads, []);
+  const created = await f.request('/api/models', { url: 'https://huggingface.co/org/repo/resolve/main/Tiny-Q4_K_M.gguf' }, owner);
+  assert.equal(created.status, 202);
+  assert.equal(created.data.name, 'Tiny-Q4_K_M');
+  assert.equal((await waitForModel(f, owner, created.data.id)).status, 'READY');
+  const missing = await f.request('/api/models', { url: 'https://example.com/missing.gguf', name: 'Missing' }, owner);
+  const failed = await waitForModel(f, owner, missing.data.id);
+  assert.equal(failed.status, 'FAILED');
+  assert.match(failed.detail, /HTTP 404/);
+});
+
+test('public address checks block private, loopback and mapped networks', () => {
+  const { isPublicAddress } = require('../user-models');
+  for (const address of ['127.0.0.1', '10.0.0.8', '172.20.1.1', '192.168.1.1', '169.254.169.254', '100.64.0.1', '0.0.0.0',
+    '::1', '::', 'fe80::1', 'fd00::1', '::ffff:127.0.0.1', '::ffff:10.0.0.1', 'not-an-ip']) {
+    assert.equal(isPublicAddress(address), false, address);
+  }
+  for (const address of ['8.8.8.8', '104.16.1.1', '2606:4700::1111']) assert.equal(isPublicAddress(address), true, address);
+});
+
+test('deleting a converting model stops the conversion and a restart fails unfinished models', async t => {
+  const { createModelManager } = require('../user-models');
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'rj-user-models-'));
+  t.after(() => fs.rm(dir, { recursive: true, force: true }));
+  const store = createStore({ LOCAL_DB: ':memory:' });
+  t.after(() => store.pool.end());
+  let started;
+  const converting = new Promise(resolve => { started = resolve; });
+  const manager = createModelManager({ store, dir, reserveBytes: 0, convert: ({ shards, signal }) => new Promise((resolve, reject) => {
+    fs.mkdir(shards).then(() => started());
+    signal.addEventListener('abort', () => reject(new Error('killed')));
+  }) });
+  await manager.init();
+  await store.createOwner({ id: 'o1', email: 'o1@local.invalid', passwordHash: 'x' });
+  const { Readable } = require('node:stream');
+  const model = await manager.upload('o1', 'Slow', Readable.from([Buffer.from('GGUF-data')]), 9);
+  await converting;
+  assert.equal((await manager.list('o1'))[0].status, 'CONVERTING');
+  await manager.remove('o1', model.id);
+  assert.deepEqual(await manager.list('o1'), []);
+  assert.deepEqual(await fs.readdir(dir), []);
+
+  await store.createModel({ id: crypto.randomUUID(), ownerId: 'o1', name: 'Half', source: 'url', sourceUrl: 'https://x.test/a.gguf', status: 'DOWNLOADING' });
+  await createModelManager({ store, dir, reserveBytes: 0 }).init();
+  const [interrupted] = await manager.list('o1');
+  assert.equal(interrupted.status, 'FAILED');
+  assert.match(interrupted.detail, /restart/);
+});

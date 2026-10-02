@@ -53,7 +53,28 @@ class SqlStore {
     const [rows] = await this.pool.execute('SELECT id,status,result_json,created_at FROM cluster_job WHERE cluster_id = ? ORDER BY created_at DESC LIMIT 50', [clusterId]);
     return rows;
   }
+  createModel(m) {
+    return this.pool.execute('INSERT INTO owner_model (id,owner_id,name,source,source_url,status) VALUES (?,?,?,?,?,?)',
+      [m.id, m.ownerId, m.name, m.source, m.sourceUrl ?? null, m.status]);
+  }
+  async ownerModels(ownerId) {
+    const [rows] = await this.pool.execute('SELECT * FROM owner_model WHERE owner_id = ? ORDER BY created_at DESC', [ownerId]);
+    return rows;
+  }
+  ownerModel(id, ownerId) { return this.one('SELECT * FROM owner_model WHERE id = ? AND owner_id = ?', [id, ownerId]); }
+  async modelsWithStatus(statuses) {
+    const [rows] = await this.pool.execute(`SELECT * FROM owner_model WHERE status IN (${statuses.map(() => '?').join(',')})`, statuses);
+    return rows;
+  }
+  updateModel(id, fields) {
+    const columns = Object.keys(fields);
+    if (columns.some(column => !modelColumns.has(column))) throw new Error('Unknown model column');
+    return this.pool.execute(`UPDATE owner_model SET ${columns.map(column => `${column} = ?`).join(',')} WHERE id = ?`,
+      [...columns.map(column => fields[column] ?? null), id]);
+  }
+  deleteModel(id) { return this.pool.execute('DELETE FROM owner_model WHERE id = ?', [id]); }
 }
+const modelColumns = new Set(['status', 'progress', 'detail', 'size_bytes', 'architecture', 'chat_format', 'generation_prefix', 'context_length']);
 
 function createStore(env = process.env) {
   if (env.LOCAL_DB) {

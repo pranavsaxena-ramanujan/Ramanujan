@@ -12,6 +12,7 @@ import concurrent.futures
 import hashlib
 import json
 import os
+import sys
 import threading
 import time
 import urllib.error
@@ -28,6 +29,7 @@ from converter.ramanujan_shards.llm_programs import (
 from converter.ramanujan_shards.llm_reference import LlmReference, row_bytes
 from converter.ramanujan_shards.llm_spec import tensor_columns
 from converter.ramanujan_shards.llm_tokenizer import load_tokenizer
+from converter.ramanujan_shards.chat_prompt import fit_chat_prompt, read_chat_turns
 from run_phi3_shards import RamanujanServer, RssMonitor, _mark_csv_older_than_binary, _write_csv, _write_values
 
 
@@ -383,6 +385,9 @@ def parse_args():
     parser.add_argument("--package", required=True, type=Path)
     parser.add_argument("--metadata", required=True, type=Path, help="gguf-metadata.json from gguf_ir_plan")
     parser.add_argument("--prompt", default="The capital of France is")
+    parser.add_argument("--prompt-turns", metavar="FILE",
+                        help="JSON {turns, suffix, prefix} with rendered chat turns ('-' for stdin); the "
+                             "oldest turns are dropped until the prompt fits --max-context")
     parser.add_argument("--max-new-tokens", type=int, default=8)
     parser.add_argument("--max-context", type=int, default=128)
     parser.add_argument("--work-dir", type=Path, help="scratch directory (required by --runtime dsl)")
@@ -430,13 +435,27 @@ def parse_args():
 
 def main():
     args = parse_args()
+    chat = None
+    if args.prompt_turns:
+        source = sys.stdin.read() if args.prompt_turns == "-" else Path(args.prompt_turns).read_text(encoding="utf-8")
+        chat = read_chat_turns(source)
+        metadata = json.loads(args.metadata.read_text(encoding="utf-8"))
+        try:  # fail fast, before any shard is loaded
+            fit_chat_prompt(load_tokenizer(metadata), *chat, budget=args.max_context - args.max_new_tokens)
+        except ValueError as error:
+            raise SystemExit(str(error))
     if args.runtime == "native":
         from native_runner import NativeGgufRunner
         runner = NativeGgufRunner(args)
     else:
         runner = GgufRunner(args)
     spec = runner.spec
-    tokens = runner.tokenizer.encode(args.prompt)
+    if chat is not None:
+        args.prompt, tokens, dropped = fit_chat_prompt(
+            runner.tokenizer, *chat, budget=args.max_context - args.max_new_tokens)
+        print(json.dumps({"event": "prompt-fit", "droppedTurns": dropped}), flush=True)
+    else:
+        tokens = runner.tokenizer.encode(args.prompt)
     print(json.dumps({"event": "model", "architecture": spec.architecture, "layers": len(spec.layers),
                       "kinds": {k.id: k.mixer for k in spec.kinds.values()}, "shards": len(runner.shards),
                       "assumptions": spec.assumptions}), flush=True)

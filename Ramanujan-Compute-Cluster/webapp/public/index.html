@@ -21,7 +21,16 @@
           <div class="room-head"><div><h2 id="selected-room">Choose or create a room</h2><small id="room-id-label"></small></div>
             <div class="tabs" role="tablist" aria-label="Sections"><button id="tab-chat" class="tab" type="button" role="tab" aria-selected="true" aria-controls="chat-panel">LLM Chat</button><button id="tab-code" class="tab" type="button" role="tab" aria-selected="false" aria-controls="code-panel">Code execution</button></div></div>
           <section id="chat-panel" class="card chat" role="tabpanel" aria-labelledby="tab-chat">
-            <div class="chat-header"><h3>LLM Chat</h3><label>Model<select id="model-select"><option value="">No model configured</option></select></label></div>
+            <div class="chat-header"><h3>LLM Chat</h3><div class="chat-tools"><label>Model<select id="model-select"><option value="">No model configured</option></select></label><button id="manage-models" type="button" aria-expanded="false" aria-controls="models-panel">Your models</button><button id="new-chat" type="button">New chat</button></div></div>
+            <div id="models-panel" class="models-panel" hidden>
+              <h3>Bring your own GGUF</h3>
+              <p>Add a GGUF model for all of your rooms. The server converts it once; your devices fetch the parts they need when you chat.</p>
+              <div class="model-forms">
+                <form id="model-upload-form"><label>Upload a .gguf file<input id="model-file" type="file" accept=".gguf" required></label><label>Name (optional)<input id="model-upload-name" maxlength="120" placeholder="Uses the file name"></label><button class="primary" type="submit" id="model-upload">Upload</button><progress id="model-upload-progress" max="1" value="0" hidden></progress><small id="model-upload-status"></small></form>
+                <form id="model-url-form"><label>Or import from a URL<input id="model-url" type="url" placeholder="https://huggingface.co/.../resolve/main/model.gguf" required></label><label>Name (optional)<input id="model-url-name" maxlength="120" placeholder="Uses the file name"></label><button class="primary" type="submit">Import</button></form>
+              </div>
+              <div id="model-list" class="model-list"></div>
+            </div>
             <div id="messages" class="messages" aria-live="polite"><div class="empty"><p>Connect a device to this room, then ask a question.</p></div></div>
             <form id="chat-form"><label class="sr-only" for="question">Ask a question</label><div class="composer"><textarea id="question" placeholder="Ask your cluster a question..." rows="2" maxlength="16000" required></textarea><button class="primary" id="send" type="submit">Send &rarr;</button></div></form>
           </section>

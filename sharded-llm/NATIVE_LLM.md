@@ -209,6 +209,13 @@ rj homelab 8888
 rj worker http://HOMELAB:8888 2 --cache ~/.ramanujan/worker-cache --max-shards 2
 python3 run_gguf_shards.py --runtime native --homelab http://localhost:8888 --package ... --metadata ... --prompt ...
 
+# Multi-turn: rendered chat turns (alternating, ending with the user turn) on stdin; the oldest
+# user/assistant pairs are dropped until prompt + --max-new-tokens fits --max-context
+echo '{"turns": ["<|im_start|>user\nHi, I am Ada.<|im_end|>\n", "<|im_start|>assistant\nHello Ada!<|im_end|>\n",
+  "<|im_start|>user\nWhat is my name?<|im_end|>\n"], "suffix": "<|im_start|>assistant\n"}' |
+  python3 run_gguf_shards.py --runtime native --package $M-shards --metadata $M-ir-plan/gguf-metadata.json \
+  --prompt-turns - --max-new-tokens 16 --max-context 512    # prints {"event":"prompt-fit","droppedTurns":N}
+
 # Tests
 (cd converter && python3 -m unittest discover -s tests -p "test_native_llm.py")   # native vs NumPy parity
 python3 -m unittest tests.test_native_homelab

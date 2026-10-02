@@ -38,3 +38,20 @@ CREATE TABLE IF NOT EXISTS cluster_job (
   created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
   FOREIGN KEY (cluster_id) REFERENCES compute_cluster(id)
 );
+CREATE TABLE IF NOT EXISTS owner_model (
+  id CHAR(36) PRIMARY KEY,
+  owner_id CHAR(36) NOT NULL,
+  name VARCHAR(120) NOT NULL,
+  source VARCHAR(8) NOT NULL,
+  source_url VARCHAR(2048) NULL,
+  status VARCHAR(16) NOT NULL,
+  progress DOUBLE NOT NULL DEFAULT 0,
+  detail VARCHAR(600) NULL,
+  size_bytes BIGINT NULL,
+  architecture VARCHAR(64) NULL,
+  chat_format VARCHAR(16) NULL,
+  generation_prefix VARCHAR(200) NULL,
+  context_length INT NULL,
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (owner_id) REFERENCES cluster_owner(id) ON DELETE CASCADE
+);

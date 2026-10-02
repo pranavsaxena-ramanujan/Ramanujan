@@ -57,8 +57,8 @@ LOCAL_DB="$HOME/.ramanujan/cluster-portal.sqlite" npm start
 
 See `models.example.json`. Catalog entries identify the shard package and
 `gguf-metadata.json`, both inside `MODEL_ROOT`. Weight paths submitted to the
-LLM gateway are checked against that root after resolving symlinks.
-Models are not uploaded or downloaded through the chat UI.
+LLM gateway are checked against that root (or the requesting owner's own
+models, below) after resolving symlinks.
 
 Select a room and model, join/start a device client, and ask a question.
 The server runs the existing `sharded-llm/run_gguf_shards.py --runtime native`
@@ -67,22 +67,59 @@ devices, not in the Node.js portal. One inference request per cluster runs
 at a time; missing workers, lost native sessions and runtime failures are
 reported as errors.
 
-Questions are independent, with a visible session-local transcript.
-This is greedy generation, not streaming or a multi-turn conversation.
-An administrator can set `promptTemplate` containing `{question}` for a
-model's chat syntax; the example uses Qwen's template. `maxContext`
-(default 1024) and `maxNewTokens` (default 128) bound generation, and output
-is cut at the first `stopSequences` entry (default: common end-of-turn tokens
-such as `<|im_end|>`). Large models need small budgets: the example's
-Qwen3.8 27B entry (empty `<think>` block to skip reasoning, 24 new tokens)
-answered in 30-55 s on one 8 GB Apple M3 at ~5 s/token, streaming 16 GB of
-weights from SSD per token. A non-shared device caches every shard it owns, so
-a single device needs ~16 GB of free disk for that model. That first download
-happens inside the first chat request, so the entry sets `requestTimeout`
-(seconds per request, default 120, max 1800) to 1800. The existing runtime's
+### Conversations
+
+Chat is multi-turn. The browser sends the room's transcript
+(`messages: [{role: "user" | "assistant", content}]`, alternating and ending
+with the new question; failed questions are left out). The server renders it
+with the model's chat format and the driver (`--prompt-turns -`) drops the
+oldest exchanges until the prompt plus `maxNewTokens` fits in `maxContext`.
+The reply reports `droppedTurns`, and the UI notes when that happened.
+**New chat** clears the room's transcript, which lives only in the browser tab.
+A single `question` is still accepted.
+
+Catalog entries choose a `chatFormat`: `chatml`, `llama3`, `gemma`, `phi3`,
+`zephyr`, `mistral` or `plain` (the default). `generationPrefix` overrides the
+text that starts the reply. Templates never include a BOS token; the GGUF
+tokenizer adds it. A legacy `promptTemplate` containing `{question}` is mapped
+to its chat format when it starts with that format's user turn, keeping the
+text after the turn as the generation prefix (the example's Qwen3.8 entry
+keeps its empty `<think>` block). Other templates stay single-turn.
+
+Generation is greedy, not streamed. `maxContext` (default 1024) and
+`maxNewTokens` (default 128) bound it, and output is cut at the format's
+end-of-turn tokens (or `stopSequences`). Large models need small budgets: the
+example's Qwen3.8 27B entry (24 new tokens) answered in 30-55 s on one 8 GB
+Apple M3 at ~5 s/token, streaming 16 GB of weights from SSD per token. A
+non-shared device caches every shard it owns, so a single device needs ~16 GB
+of free disk for that model. That first download happens inside the first
+chat request, so the entry sets `requestTimeout` (seconds per request,
+default 120, max 1800) to 1800. The existing runtime's
 architecture/quantization limits still apply. See
 [`GGUF_MODELS.md`](../../sharded-llm/GGUF_MODELS.md) and
 [`NATIVE_LLM.md`](../../sharded-llm/NATIVE_LLM.md).
+
+### Bring your own GGUF
+
+**Your models** in the chat header adds a GGUF for every room owned by the
+same management key, either by uploading the file from the browser or by
+pasting an `https://` URL (for example a Hugging Face `/resolve/main/...gguf`
+link) that the server downloads. There is no size limit, but the server
+refuses a model when its disk would drop below a 2 GB reserve (a model needs
+about twice its GGUF size while converting, then about its size). Models are
+converted one at a time with the converter in `sharded-llm/converter`
+(`emit_gguf` with 4 shards, then `gguf_ir_plan`). The GGUF is deleted after
+a successful conversion, and the chat format comes from the GGUF's
+`tokenizer.chat_template`. Unsupported architectures or quantizations show
+the converter's error.
+
+Files live in `USER_MODEL_DIR` (default `~/.ramanujan/portal-models`), one
+directory per model, recorded in the `owner_model` table. Each owner sees
+only their own models and the gateway only serves a model's files to its
+owner. URL downloads follow at most five redirects and refuse private,
+loopback and link-local addresses on every hop, including after DNS
+resolution. A portal restart marks unfinished uploads, downloads and
+conversions as failed. Set `USER_MODELS=off` to disable the feature.
 
 For direct CLI inference, put the private management key in the process
 environment as `RAMANUJAN_PORTAL_TOKEN` and use:

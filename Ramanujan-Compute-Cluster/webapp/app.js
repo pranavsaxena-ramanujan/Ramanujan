@@ -38,7 +38,7 @@ function pythonProject(files, entryPoint) {
   return { files, entryPoint };
 }
 
-function createApp({ store, publicUrl, orchestratorUrl, middlewareUrl, homelabUrl, modelRoot, releasesDir, models = [], infer, production = false, fetchImpl = fetch }) {
+function createApp({ store, publicUrl, orchestratorUrl, middlewareUrl, homelabUrl, modelRoot, releasesDir, models = [], userModels, infer, production = false, fetchImpl = fetch }) {
   const app = express();
   const publicOrigin = new URL(publicUrl).origin;
   if (production && !publicUrl.startsWith('https://')) throw new Error('Production PUBLIC_URL must use HTTPS');
@@ -122,7 +122,7 @@ function createApp({ store, publicUrl, orchestratorUrl, middlewareUrl, homelabUr
     await store.createDevice({ id, clusterId: room.id, tokenHash: digest(value), name, platform });
     res.status(201).json({ deviceId: id, clusterId: room.id, workerUrl: `${publicOrigin}/worker/${value}` });
   }));
-  async function validateModelFiles(body) {
+  async function validateModelFiles(body, ownerId) {
     const candidates = new Set();
     function walk(value, key) {
       if (key === 'file' && typeof value === 'string') candidates.add(value);
@@ -134,8 +134,8 @@ function createApp({ store, publicUrl, orchestratorUrl, middlewareUrl, homelabUr
     }
     walk(body);
     if (!candidates.size) return;
-    if (!modelRoot) throw new HttpError(503, 'MODEL_ROOT must be configured before opening LLM sessions');
-    const root = await fs.realpath(modelRoot);
+    if (!modelRoot && !userModels) throw new HttpError(503, 'MODEL_ROOT must be configured before opening LLM sessions');
+    const root = modelRoot ? await fs.realpath(modelRoot) : null;
     for (const candidate of candidates) {
       let real;
       try { real = await fs.realpath(candidate); }
@@ -143,10 +143,11 @@ function createApp({ store, publicUrl, orchestratorUrl, middlewareUrl, homelabUr
         if (error.code === 'ENOENT') throw new HttpError(400, 'Model file not found on the server');
         throw error;
       }
-      if (!real.startsWith(root + path.sep) || !(await fs.stat(real)).isFile()) throw new HttpError(403, 'Model files must be inside MODEL_ROOT');
+      const allowed = (root && real.startsWith(root + path.sep)) || (userModels && await userModels.ownsFile(ownerId, real));
+      if (!allowed || !(await fs.stat(real)).isFile()) throw new HttpError(403, 'Model files must be inside MODEL_ROOT or one of your models');
     }
   }
-  async function relay(req, res, route, clusterId, deviceId) {
+  async function relay(req, res, route, clusterId, deviceId, ownerId) {
     const target = new URL(route, backend);
     const deviceUuidQuery = route.startsWith('/pings/') || route.startsWith('/binary/');
     for (const [key, value] of new URL(req.originalUrl, publicOrigin).searchParams) {
@@ -163,7 +164,7 @@ function createApp({ store, publicUrl, orchestratorUrl, middlewareUrl, homelabUr
       if (req.is('application/json')) {
         const payload = { ...req.body, clusterId };
         if (deviceId) payload.hostId = deviceId;
-        if (!deviceId) await validateModelFiles(payload);
+        if (!deviceId) await validateModelFiles(payload, ownerId);
         body = JSON.stringify(payload);
         headers['Content-Type'] = 'application/json';
       } else {
@@ -207,7 +208,7 @@ function createApp({ store, publicUrl, orchestratorUrl, middlewareUrl, homelabUr
     const route = '/' + req.params[0];
     if (!ownerRoutes.has(route)) throw new HttpError(404, 'Owner endpoint not found');
     if (!['GET', 'POST'].includes(req.method)) throw new HttpError(405, 'Method not allowed');
-    await relay(req, res, route, room.id);
+    await relay(req, res, route, room.id, undefined, room.owner_id);
   }));
   app.post('/api/clusters/:roomId/jobs', asyncRoute(async (req, res) => {
     const room = await roomForOwner(req);
@@ -272,13 +273,58 @@ function createApp({ store, publicUrl, orchestratorUrl, middlewareUrl, homelabUr
     res.json(jobs);
   }));
   app.get('/api/models', asyncRoute(async (req, res) => {
-    await owner(req);
-    res.json(models.map(({ id, name }) => ({ id, name })));
+    const ownerId = await owner(req);
+    const catalog = models.map(({ id, name }) => ({ id, name, status: 'READY' }));
+    res.json(userModels ? [...catalog, ...await userModels.list(ownerId)] : catalog);
   }));
+  function requireUserModels() {
+    if (!userModels) throw new HttpError(503, 'Adding models is not enabled on this server');
+    return userModels;
+  }
+  app.post('/api/models/upload', asyncRoute(async (req, res) => {
+    const ownerId = await owner(req);
+    const manager = requireUserModels();
+    if (req.is('application/json')) throw new HttpError(415, 'Upload the GGUF file as application/octet-stream');
+    const name = text(req.query.name, 'Model name');
+    const size = Number(req.get('content-length'));
+    res.status(201).json(await manager.upload(ownerId, name, req, Number.isFinite(size) && size > 0 ? size : null));
+  }));
+  app.post('/api/models', asyncRoute(async (req, res) => {
+    const ownerId = await owner(req);
+    const manager = requireUserModels();
+    const url = text(req.body.url, 'Model URL', 2048);
+    let fallback = '';
+    try { fallback = decodeURIComponent(new URL(url).pathname.split('/').pop()).replace(/\.gguf$/i, '').trim(); } catch { /* invalid URLs are rejected below */ }
+    const name = text(req.body.name || fallback.slice(0, 120) || 'Model', 'Model name');
+    res.status(202).json(await manager.importUrl(ownerId, name, url));
+  }));
+  app.delete('/api/models/:id', asyncRoute(async (req, res) => {
+    const ownerId = await owner(req);
+    await requireUserModels().remove(ownerId, req.params.id);
+    res.json({ success: true });
+  }));
+  /** Validates a chat transcript: alternating user/assistant turns ending with the new question. */
+  function chatMessages(body) {
+    if (body.messages === undefined) return [{ role: 'user', content: text(body.question, 'Question', 16000) }];
+    const messages = body.messages;
+    if (!Array.isArray(messages) || !messages.length || messages.length > 99) throw new HttpError(400, 'messages must hold between 1 and 99 chat turns');
+    let total = 0;
+    messages.forEach((message, index) => {
+      const role = index % 2 === 0 ? 'user' : 'assistant';
+      if (!message || message.role !== role) throw new HttpError(400, 'Chat turns must alternate user and assistant, starting with user');
+      if (typeof message.content !== 'string' || message.content.length > 16000) throw new HttpError(400, 'Each chat turn must be text of at most 16000 characters');
+      total += message.content.length;
+    });
+    if (messages.length % 2 === 0) throw new HttpError(400, 'The last chat turn must be the user\'s question');
+    if (!messages.at(-1).content.trim()) throw new HttpError(400, 'Question is required');
+    if (total > 200000) throw new HttpError(400, 'This conversation is too long; start a new chat');
+    return messages.map(({ role, content }) => ({ role, content }));
+  }
   app.post('/api/clusters/:roomId/chat', asyncRoute(async (req, res) => {
     const room = await roomForOwner(req);
-    const question = text(req.body.question, 'Question', 16000);
-    const model = models.find(item => item.id === req.body.model);
+    const messages = chatMessages(req.body);
+    const question = messages.at(-1).content;
+    const model = models.find(item => item.id === req.body.model) || await userModels?.resolve(room.owner_id, req.body.model);
     if (!model || !infer) throw new HttpError(503, 'No model configured for inference');
     if (activeChats.has(room.id)) throw new HttpError(409, 'This cluster is answering another question');
     const devices = await store.devices(room.id);
@@ -293,16 +339,17 @@ function createApp({ store, publicUrl, orchestratorUrl, middlewareUrl, homelabUr
     const id = crypto.randomUUID();
     try {
       await store.createJob(id, room.id);
-      const answer = await infer({ model, question, roomId: room.room_id, apiToken: sessionToken(req), publicUrl: publicOrigin });
-      await store.finishJob(id, 'SUCCESS', { question, model: model.id, answer });
-      res.json({ id, answer });
+      const result = await infer({ model, messages, roomId: room.room_id, apiToken: sessionToken(req), publicUrl: publicOrigin });
+      const { text: answer, droppedTurns = 0 } = typeof result === 'string' ? { text: result } : result;
+      await store.finishJob(id, 'SUCCESS', { question, model: model.id, answer, turns: messages.length, droppedTurns });
+      res.json({ id, answer, droppedTurns });
     } catch (error) {
       await store.finishJob(id, 'FAILED', { error: error.message });
       if (error.code === 'INFERENCE_BACKEND_NOT_READY') {
         throw new HttpError(503, 'The service cannot answer questions right now. Please try again later.');
       }
       if (error.code === 'PROMPT_TOO_LONG') {
-        throw new HttpError(400, 'Question is too long for this model\'s context window. Please shorten it.');
+        throw new HttpError(400, 'Question is too long for this model\'s context window. Please shorten it or start a new chat.');
       }
       throw new HttpError(502, 'No answer was produced. Check that a device in this room is running the client.');
     } finally { activeChats.delete(room.id); }
