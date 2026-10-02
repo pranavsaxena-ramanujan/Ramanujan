@@ -46,14 +46,22 @@ Ramanujan on every model.
   memory-maps the file and spends its time in page faults at 20.4 s/token, so
   Ramanujan is **3.9x faster**. llama.cpp on Metal cannot hold the model
   (the working-set limit is ~5.7 GB).
-- **Homelab adds 15–57 ms/token.** The extra cost grows with vocabulary size,
-  because the head stage returns the full logits as base64 JSON:
-  - +15 ms for TinyLlama and Phi-3 (32k vocabulary)
-  - +30 ms for Qwen and Llama 3.2 (128k–152k)
-  - +57 ms for Gemma (256k)
+- **Homelab adds 15–57 ms/token** on small models. Measured on Gemma (76 ms
+  via homelab, 23 ms local):
+  - **GPU idle gaps: +21 ms.** Locally, the 5 stage steps of a token run back
+    to back. Through homelab, each step waits a few ms for HTTP first, and
+    the GPU clocks down while idle. GPU time per token rises from 24.5 ms to
+    45.4 ms. The same happens locally with an artificial 4 ms pause before
+    each stage (24.5 → 48.9 ms).
+  - **Head logits: ~16 ms.** The head returns all 256k logits as base64 JSON
+    (1 MB). That is why the overhead grows with vocabulary size: about +15 ms
+    for TinyLlama and Phi-3 (32k), +30 ms for Qwen and Llama 3.2
+    (128k–152k), and +57 ms for Gemma.
+  - **Hops: ~3 ms each.** HTTP, the task queue and the worker's long poll,
+    for 5 hops per token (shard-00 holds both the embedding stage and the
+    head).
 
-  On the 27B the overhead is 1%. Returning only the chosen token from the head
-  would remove most of it on small models (see Limitations).
+  On the 27B the overhead is 1%.
 - **First token:** local runs take 45–211 ms, and that includes the prompt
   prefill. Via homelab it is 178 ms–1.2 s, because the first step also makes
   the worker open its sessions and upload weights.
@@ -208,11 +216,12 @@ It also checks position-mismatch errors and `reset()`.
 - **Device.** Only OpenCL is supported, and it has been validated only on Apple
   M3 GPUs. Linux, Android and Windows builds are untested. Page-cache bypass is
   macOS-only.
-- **Homelab overhead.** Each stage hop costs ~3 ms (HTTP, queue, the worker's
-  long poll). The head hop also returns the full logits as base64 JSON: 4 bytes
-  per vocabulary entry before base64, so 128 KB for a 32k vocabulary and 1 MB
-  for Gemma's 256k. The driver samples greedily, so
-  returning the argmax (or top-k) from the head would remove most of that.
+- **Homelab overhead.** On small models, homelab is 2–4x slower than local
+  (see the breakdown above). Two fixes would remove most of it:
+  - Return only the argmax (or top-k) from the head instead of the full
+    logits. The driver samples greedily, so it needs nothing more.
+  - When one worker owns consecutive stages, run them as one task. That
+    removes the hops and keeps the GPU busy between stages.
 - **No recovery.** A lost session is not rebuilt; the generation must restart
   from position 0.
 - **Coverage.** Same as the translator ([GGUF_MODELS.md](GGUF_MODELS.md#supported-pieces)).
