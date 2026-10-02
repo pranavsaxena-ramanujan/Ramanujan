@@ -121,6 +121,26 @@ loopback and link-local addresses on every hop, including after DNS
 resolution. A portal restart marks unfinished uploads, downloads and
 conversions as failed. Set `USER_MODELS=off` to disable the feature.
 
+Set `MODEL_CACHE_BUCKET` to an existing private Cloud Storage bucket to
+persist converted shard packages and IR plans. The portal uses Application
+Default Credentials (the VM's attached service account on Compute Engine),
+not a checked-in key. Grant that account object access only on this bucket.
+Packages are stored under `models/<model-id>/`; the manifest is published
+last and a model becomes READY only after storage succeeds. If the local
+package is missing, the next chat restores it with CRC32C and size checks.
+Deleting a model deletes its cloud objects too. The original GGUF is not
+retained. Cloud Storage is durable backing, not the worker's hot cache;
+devices still cache their assigned files locally. Without this setting,
+local-only behavior is unchanged.
+
+For small Cloud SQL instances, set `RAMANUJAN_DB_POOL_SIZE` on the middleware
+process (default 4). Keep the middleware listener on `127.0.0.1` when the
+portal shares its VM. Apply the cluster-routing and native-inference SQL
+migrations once, then the portal's `schema.sql`, without replacing existing
+tables. Keep SQL credentials in protected runtime files outside the checkout.
+For private testing, use SSH tunneling for browser access; a public deployment
+requires HTTPS.
+
 For direct CLI inference, put the private management key in the process
 environment as `RAMANUJAN_PORTAL_TOKEN` and use:
 

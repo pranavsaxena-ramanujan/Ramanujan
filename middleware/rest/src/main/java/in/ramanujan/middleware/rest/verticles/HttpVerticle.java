@@ -81,7 +81,6 @@ public class HttpVerticle extends AbstractVerticle {
 
     @Override
     public void start(Future<Void> startFuture) throws Exception {
-        if (ConfigurationGetter.getDBType() != QueryExecutor.DB_TYPE.IN_MEM) connectionCreator.init(context);
         QueryExecutor.DBConfig dbConfig = new QueryExecutor.DBConfig(ConfigurationGetter.getString(Config.DB_URL),
                 ConfigurationGetter.getString(Config.DB_USER), ConfigurationGetter.getString(Config.DB_PASSWORD),
                 ConfigurationGetter.getString(Config.DB_NAME));

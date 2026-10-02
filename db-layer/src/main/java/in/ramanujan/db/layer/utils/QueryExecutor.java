@@ -22,6 +22,7 @@ import io.vertx.sqlclient.PreparedQuery;
 import io.vertx.sqlclient.Tuple;
 import lombok.AllArgsConstructor;
 import lombok.Data;
+import lombok.ToString;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Component;
 
@@ -41,6 +42,7 @@ public class QueryExecutor {
     public static class DBConfig {
         private String jdbcUrl;
         private String username;
+        @ToString.Exclude
         private String password;
         private String dbName;
     }
@@ -88,22 +90,14 @@ public class QueryExecutor {
             config.setUsername(dbConfig.getUsername());
             config.setPassword(dbConfig.getPassword());
 
-            int maxPool = 100 * Runtime.getRuntime().availableProcessors();
+            String poolSize = System.getenv("RAMANUJAN_DB_POOL_SIZE");
+            int maxPool = poolSize == null ? 4 : Integer.parseInt(poolSize);
+            if (maxPool < 1 || maxPool > 100) {
+                throw new IllegalArgumentException("RAMANUJAN_DB_POOL_SIZE must be between 1 and 100");
+            }
             config.setMaximumPoolSize(maxPool);
             config.setConnectionTimeout(5000);
             dataSource = new HikariDataSource(config);
-
-            int connectionsMade = maxPool;
-            while(connectionsMade > 0) {
-                try {
-                    Connection connection = dataSource.getConnection();
-                    connection.close();
-                    connectionsMade--;
-                } catch (SQLException e) {
-                    logger.error("Failed to connect to the database: " + dbConfig.getDbName() + ". Retrying...", e);
-
-                }
-            }
 
             logger.info("Database connection pool initialized with " + maxPool + " connections for database: " + dbConfig.getDbName());
 

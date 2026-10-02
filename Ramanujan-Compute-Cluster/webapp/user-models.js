@@ -130,7 +130,7 @@ function publicModel(row) {
     architecture: row.architecture || undefined, chatFormat: row.chat_format || undefined, createdAt: row.created_at };
 }
 
-function createModelManager({ store, dir, converterDir, python = 'python3', download = openDownload, convert,
+function createModelManager({ store, dir, converterDir, python = 'python3', download = openDownload, convert, cache,
   reserveBytes = 2 * GB, maxContext = 1024, maxNewTokens = 128 }) {
   const runConvert = convert || defaultConverter({ converterDir, python });
   const jobs = new Map();
@@ -232,6 +232,10 @@ function createModelManager({ store, dir, converterDir, python = 'python3', down
       const chatFormat = detectChatFormat(template);
       const contextLength = Number(metadata[`${architecture}.context_length`]) || null;
       await fsp.rm(gguf, { force: true });
+      if (cache) {
+        await store.updateModel(id, { detail: 'Saving converted model to private cloud storage', progress: 0.95 });
+        await cache.save(id, modelDir(id), controller.signal);
+      }
       await store.updateModel(id, { status: 'READY', progress: 1, detail: null, architecture, chat_format: chatFormat,
         generation_prefix: defaultGenerationPrefix(chatFormat, template), context_length: contextLength });
     } catch (error) {
@@ -295,7 +299,6 @@ function createModelManager({ store, dir, converterDir, python = 'python3', down
   async function remove(ownerId, id) {
     const row = await store.ownerModel(id, ownerId);
     if (!row) throw new HttpError(404, 'Model not found');
-    await store.deleteModel(id);
     const queued = queue.indexOf(id);
     if (queued !== -1) queue.splice(queued, 1);
     const job = jobs.get(id);
@@ -303,7 +306,9 @@ function createModelManager({ store, dir, converterDir, python = 'python3', down
       job.controller.abort();
       await job.done;
     }
+    if (cache) await cache.remove(id);
     await fsp.rm(modelDir(id), { recursive: true, force: true });
+    await store.deleteModel(id);
   }
 
   async function list(ownerId) { return (await store.ownerModels(ownerId)).map(publicModel); }
@@ -313,6 +318,14 @@ function createModelManager({ store, dir, converterDir, python = 'python3', down
     if (typeof id !== 'string' || !/^[0-9a-f-]{36}$/.test(id)) return null;
     const row = await store.ownerModel(id, ownerId);
     if (!row || row.status !== 'READY') return null;
+    try {
+      await fsp.access(path.join(modelDir(id), 'shards', 'model-manifest.json'));
+      await fsp.access(path.join(modelDir(id), 'ir-plan', 'gguf-metadata.json'));
+    } catch (error) {
+      if (error.code !== 'ENOENT') throw error;
+      if (!cache) throw new HttpError(503, 'Converted model files are missing; delete the model and add it again');
+      await cache.restore(id, modelDir(id), reserveBytes);
+    }
     const context = Math.min(maxContext, Number(row.context_length) || maxContext);
     return { id: row.id, name: row.name, package: path.join(modelDir(id), 'shards'), metadata: path.join(modelDir(id), 'ir-plan', 'gguf-metadata.json'),
       chatFormat: row.chat_format, generationPrefix: row.generation_prefix ?? undefined, maxContext: context,

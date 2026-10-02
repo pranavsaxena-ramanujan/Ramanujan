@@ -316,6 +316,7 @@ async function modelFixture(t, download) {
       conversions.push(gguf);
       if ((await fs.readFile(gguf)).includes('broken')) throw new Error('unsupported architecture: mystery');
       await fs.mkdir(shards); await fs.writeFile(path.join(shards, 'shard-00'), 'weights');
+      await fs.writeFile(path.join(shards, 'model-manifest.json'), '{}');
       await fs.mkdir(plan);
       await fs.writeFile(path.join(plan, 'gguf-metadata.json'), JSON.stringify({ 'general.architecture': 'llama',
         'llama.context_length': 512, 'tokenizer.chat_template': '<|start_header_id|>' }));

@@ -5,13 +5,17 @@ const { createStore } = require('./store');
 const { createApp } = require('./app');
 const { loadModels, createInference } = require('./inference');
 const { createModelManager } = require('./user-models');
+const { createModelCache } = require('./model-cache');
 
 async function main() {
   const models = await loadModels(process.env.MODELS_FILE, process.env.MODEL_ROOT);
   const store = createStore();
   const python = process.env.PYTHON || 'python3';
+  const cache = process.env.MODEL_CACHE_BUCKET ? createModelCache({
+    bucket: new (require('@google-cloud/storage').Storage)().bucket(process.env.MODEL_CACHE_BUCKET)
+  }) : undefined;
   const userModels = process.env.USER_MODELS === 'off' ? undefined : createModelManager({
-    store, python, dir: path.resolve(process.env.USER_MODEL_DIR || path.join(os.homedir(), '.ramanujan', 'portal-models')),
+    store, python, cache, dir: path.resolve(process.env.USER_MODEL_DIR || path.join(os.homedir(), '.ramanujan', 'portal-models')),
     converterDir: path.resolve(__dirname, '../../sharded-llm/converter')
   });
   await userModels?.init();
