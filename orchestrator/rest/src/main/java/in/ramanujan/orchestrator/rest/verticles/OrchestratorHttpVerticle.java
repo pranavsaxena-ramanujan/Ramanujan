@@ -58,6 +58,10 @@ public class OrchestratorHttpVerticle extends AbstractVerticle {
     @Autowired
     private StorageDao storageDao;
 
+    @Autowired private NativeLlmHandler nativeLlmHandler;
+    @Autowired private WorkerBinaryHandler workerBinaryHandler;
+    @Autowired private WorkerBinaryUploadHandler workerBinaryUploadHandler;
+
 
     @Override
     public void start(Future<Void> startFuture) throws Exception {
@@ -109,6 +113,12 @@ public class OrchestratorHttpVerticle extends AbstractVerticle {
         suspendWorkflow(router);
         debugPushAPI(router);
         clientCreatApis(router);
+        router.post("/llm/step").handler(event -> nativeLlmHandler.handle(event, "step"));
+        router.post("/llm/chain").handler(event -> nativeLlmHandler.handle(event, "chain"));
+        router.post("/llm/close").handler(event -> nativeLlmHandler.handle(event, "close"));
+        router.get("/binary/fetch").handler(event -> workerBinaryHandler.handle(event, false));
+        router.get("/binary/stat").handler(event -> workerBinaryHandler.handle(event, true));
+        router.post("/orchestrator/uploadBinary").handler(workerBinaryUploadHandler::handle);
     }
 
     private void resumeCheckpoint(Router router) {

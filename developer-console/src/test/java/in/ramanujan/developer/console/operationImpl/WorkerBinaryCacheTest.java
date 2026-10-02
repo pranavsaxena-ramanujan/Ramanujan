@@ -97,6 +97,26 @@ public class WorkerBinaryCacheTest {
     }
 
     @Test
+    public void differentPrivateGatewaysDoNotShareEqualPathAndStatCacheEntries() throws IOException {
+        server.createContext("/worker/room-a/binary/stat",
+                ex -> reply(ex, 200, "{\"size\":1,\"mtime\":1}".getBytes(StandardCharsets.UTF_8)));
+        server.createContext("/worker/room-b/binary/stat",
+                ex -> reply(ex, 200, "{\"size\":1,\"mtime\":1}".getBytes(StandardCharsets.UTF_8)));
+        server.createContext("/worker/room-a/binary/fetch", ex -> reply(ex, 200, new byte[]{1}));
+        server.createContext("/worker/room-b/binary/fetch", ex -> reply(ex, 200, new byte[]{2}));
+        String gateway = "http://127.0.0.1:" + server.getAddress().getPort();
+        WorkerBinaryCache a = new WorkerBinaryCache(root.resolve("cache"), gateway + "/worker/room-a");
+        WorkerBinaryCache b = new WorkerBinaryCache(root.resolve("cache"), gateway + "/worker/room-b");
+        try {
+            Path first = a.cached("/models/shared-name.bin");
+            Path second = b.cached("/models/shared-name.bin");
+            assertNotEquals(first, second);
+            assertArrayEquals(new byte[]{1}, Files.readAllBytes(first));
+            assertArrayEquals(new byte[]{2}, Files.readAllBytes(second));
+        } finally { a.close(); b.close(); }
+    }
+
+    @Test
     public void weightsAreDownloadedOnceAndMutableStateEveryTask() throws IOException {
         Path server = Files.createDirectories(root.resolve("server/layer 0"));
         Path weight = Files.write(server.resolve("attn_q.bin"), new byte[] {1, 2, 3, 4});

@@ -26,16 +26,17 @@ public class TaskCompleteHandler implements Handler<RoutingContext> {
         JsonObject body = event.getBodyAsJson();
         String hostId = body.getString("hostId");
         String uuid = body.getString("uuid");
-        Object data = body.getJsonObject("data").getMap();
+        Object data = body.getJsonObject("data") == null ? java.util.Collections.emptyMap() : body.getJsonObject("data").getMap();
 
-        taskCompleteService.completeTask(hostId, uuid, data).setHandler(new MonitoringHandler<>("taskCompletion", handler -> {
+        taskCompleteService.completeTask(hostId, uuid, data, body.getString("clusterId"), body.getString("error")).setHandler(new MonitoringHandler<>("taskCompletion", handler -> {
             if(handler.succeeded()) {
                 ApiResponse apiResponse = new ApiResponse(Status.SUCCESS.getKeyName(), null);
                 event.response().setStatusCode(HttpResponseStatus.OK.code()).end(JsonObject.mapFrom(apiResponse).toString());
             } else {
                 logger.error("Failed to complete task for hostId " +  hostId, handler.cause());
                 ApiResponse apiResponse = new ApiResponse(Status.FAILURE.getKeyName(), handler.cause());
-                event.response().setStatusCode(HttpResponseStatus.INTERNAL_SERVER_ERROR.code()).end(
+                event.response().setStatusCode(handler.cause() instanceof SecurityException ?
+                        HttpResponseStatus.FORBIDDEN.code() : HttpResponseStatus.INTERNAL_SERVER_ERROR.code()).end(
                         JsonObject.mapFrom(apiResponse).toString()
                 );
             }

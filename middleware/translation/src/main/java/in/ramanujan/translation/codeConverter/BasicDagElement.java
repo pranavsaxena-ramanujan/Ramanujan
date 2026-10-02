@@ -8,6 +8,7 @@ import lombok.Data;
 @JsonIgnoreProperties(ignoreUnknown = true)
 public class BasicDagElement {
     private String id;
+    private String clusterId;
     private RuleEngineInput ruleEngineInput;
     private String firstCommandId;
     private String commaSeparatedDebugPoints;

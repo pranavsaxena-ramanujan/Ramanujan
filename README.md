@@ -34,6 +34,12 @@ compiled down to the Ramanujan runtime.
 
 
 ## Documentation
+The new private compute-room portal, desktop client, Android app and installers
+live in [Ramanujan-Compute-Cluster/](Ramanujan-Compute-Cluster/README.md).
+Rooms use a browser-held management key without login/signup, and devices join
+with a room ID and join secret. The existing middleware, orchestrator and SQL
+layer remain the shared execution backend.
+
 This README covers only the high-level project description. The rest of the documentation has been split into
 focused pages under [docs/](docs/):
 
@@ -47,4 +53,3 @@ focused pages under [docs/](docs/):
 | [docs/contributor-guide.md](docs/contributor-guide.md) | Contributor quick start — running a Monte Carlo example on a computer and Android phone. |
 | [docs/roadmap.md](docs/roadmap.md) | Future of the language and platform. |
 | [docs/csv-data-usage.md](docs/csv-data-usage.md) | Direct CSV data loading, the `dump` command, and the Phi-3 inference example. |
-

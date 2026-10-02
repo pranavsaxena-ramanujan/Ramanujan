@@ -276,7 +276,7 @@ public class TranslateUtil {
         String csvPath = csvInformation.getFileName();
         // sidecarBinPath is the persistent .bin we write next to the CSV for reuse across calls.
         String sidecarBinPath = null;
-        if (csvPath != null && csvPath.endsWith(".csv")) {
+        if (!csvInformation.isInlineData() && csvPath != null && csvPath.endsWith(".csv")) {
             java.io.File csvFile = new java.io.File(csvPath);
 
             // 1. Try next to the CSV as-is
@@ -383,11 +383,11 @@ public class TranslateUtil {
                 tmpFile = sidecarFile;
                 usingSidecar = true;
             } else {
-                tmpFile = java.io.File.createTempFile("rj_bin_" + arrayName + "_", ".bin");
+                tmpFile = java.io.File.createTempFile("rj_bin_" + arrayName + "_", ".bin", new java.io.File("."));
                 tmpFile.deleteOnExit();
             }
         } else {
-            tmpFile = java.io.File.createTempFile("rj_bin_" + arrayName + "_", ".bin");
+            tmpFile = java.io.File.createTempFile("rj_bin_" + arrayName + "_", ".bin", new java.io.File("."));
             tmpFile.deleteOnExit();
         }
 

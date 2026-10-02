@@ -10,5 +10,6 @@ import java.util.List;
 @JsonIgnoreProperties(ignoreUnknown = true)
 public class CodeRunRequest {
     private String code;
+    private String clusterId;
     private List<CsvInformation> csvInformationList;
 }

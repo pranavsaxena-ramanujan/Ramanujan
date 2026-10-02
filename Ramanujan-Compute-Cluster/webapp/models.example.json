@@ -1,0 +1,19 @@
+[
+  {
+    "id": "qwen25-05b",
+    "name": "Qwen2.5 0.5B Instruct",
+    "package": "/srv/ramanujan/models/qwen2.5-0.5b-instruct-q4_k_m-shards",
+    "metadata": "/srv/ramanujan/models/qwen2.5-0.5b-instruct-q4_k_m-ir-plan/gguf-metadata.json",
+    "promptTemplate": "<|im_start|>user\n{question}<|im_end|>\n<|im_start|>assistant\n"
+  },
+  {
+    "id": "qwen38-27b",
+    "name": "Qwen3.8 27B (Q4_1)",
+    "package": "/srv/ramanujan/models/Qwen3.8-27B-Q4_1-shards",
+    "metadata": "/srv/ramanujan/models/Qwen3.8-27B-Q4_1-ir-plan/gguf-metadata.json",
+    "promptTemplate": "<|im_start|>user\n{question}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+    "maxContext": 256,
+    "maxNewTokens": 24,
+    "requestTimeout": 1800
+  }
+]

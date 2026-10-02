@@ -1,0 +1,68 @@
+plugins { id "com.android.application" }
+
+android {
+    namespace "in.ramanujan.cluster.android"
+    compileSdk 34
+    ndkVersion "26.1.10909125"
+    defaultConfig {
+        applicationId "in.ramanujan.cluster.android"
+        minSdk 26
+        targetSdk 34
+        versionCode 1
+        versionName "1.0.0"
+        ndk { abiFilters "arm64-v8a" }
+        externalNativeBuild {
+            cmake {
+                arguments "-DGPU_ENABLED=ON", "-DPROTOC_EXECUTABLE=${providers.gradleProperty('hostProtoc').getOrElse('protoc')}"
+                if (providers.gradleProperty("nativeDepsDir").isPresent()) {
+                    def cached = file(providers.gradleProperty("nativeDepsDir").get()).absolutePath
+                    arguments "-DFETCHCONTENT_SOURCE_DIR_PROTOBUF=${cached}/protobuf-src",
+                              "-DFETCHCONTENT_SOURCE_DIR_OPENCLHEADERS=${cached}/openclheaders-src"
+                }
+                targets "native_lib", "ramanujan_llm", "cluster_preflight"
+            }
+        }
+    }
+    signingConfigs {
+        release {
+            if (System.getenv("RAMANUJAN_ANDROID_KEYSTORE")) {
+                storeFile file(System.getenv("RAMANUJAN_ANDROID_KEYSTORE"))
+                storePassword System.getenv("RAMANUJAN_ANDROID_STORE_PASSWORD")
+                keyAlias System.getenv("RAMANUJAN_ANDROID_KEY_ALIAS")
+                keyPassword System.getenv("RAMANUJAN_ANDROID_KEY_PASSWORD")
+            }
+        }
+    }
+    buildTypes {
+        release {
+            minifyEnabled false
+            if (System.getenv("RAMANUJAN_ANDROID_KEYSTORE")) signingConfig signingConfigs.release
+        }
+    }
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_1_8
+        targetCompatibility JavaVersion.VERSION_1_8
+    }
+    externalNativeBuild {
+        cmake { path file("src/main/cpp/CMakeLists.txt"); version "3.30.3" }
+    }
+    sourceSets.main.java.srcDir(layout.buildDirectory.dir("generated/sharedWorker"))
+}
+
+tasks.register("syncSharedWorker", Sync) {
+    from("../../../developer-console/src/main/java") {
+        include "in/ramanujan/developer/console/Operation.java"
+        include "in/ramanujan/developer/console/operationImpl/ExecuteInlineWorker.java"
+        include "in/ramanujan/developer/console/operationImpl/WorkerBinaryCache.java"
+        include "in/ramanujan/developer/console/operationImpl/LlmTaskHandler.java"
+    }
+    from("../../client/src/main/java") { include "in/ramanujan/cluster/client/common/**" }
+    into layout.buildDirectory.dir("generated/sharedWorker")
+}
+tasks.named("preBuild").configure { dependsOn("syncSharedWorker") }
+
+dependencies {
+    implementation "in.ramanujan:rule-engine:1.0.3-SNAPSHOT"
+    implementation "com.fasterxml.jackson.core:jackson-databind:2.17.2"
+    testImplementation "junit:junit:4.13.2"
+}

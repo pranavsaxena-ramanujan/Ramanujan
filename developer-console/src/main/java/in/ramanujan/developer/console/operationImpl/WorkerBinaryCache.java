@@ -29,7 +29,7 @@ import java.util.concurrent.ConcurrentHashMap;
  * writable: hidden.bin, *_state.bin, *_k_cache.bin, *_v_cache.bin) is fetched fresh into a
  * per-task directory and keeps its file name so native keeps treating it as mutable.
  */
-final class WorkerBinaryCache {
+final class WorkerBinaryCache implements AutoCloseable {
     private static final ObjectMapper MAPPER = new ObjectMapper();
 
     private final Path root;
@@ -37,6 +37,23 @@ final class WorkerBinaryCache {
     private final Map<String, Object> locks = new ConcurrentHashMap<>();
     // Server paths already validated by this process; model weights are immutable while serving.
     private final Map<String, Path> validated = new ConcurrentHashMap<>();
+    private final java.util.Set<HttpURLConnection> connections = ConcurrentHashMap.newKeySet();
+    private volatile boolean closed;
+
+    @Override
+    public void close() {
+        closed = true;
+        for (HttpURLConnection connection : connections) connection.disconnect();
+    }
+
+    private HttpURLConnection connection(String route) throws IOException {
+        if (closed) throw new IOException("binary cache stopped");
+        HttpURLConnection conn = (HttpURLConnection) new URL(serverUrl + route).openConnection();
+        conn.setInstanceFollowRedirects(false);
+        connections.add(conn);
+        if (closed) { conn.disconnect(); throw new IOException("binary cache stopped"); }
+        return conn;
+    }
 
     WorkerBinaryCache(Path root, String serverUrl) {
         this.root = root.toAbsolutePath();
@@ -75,7 +92,8 @@ final class WorkerBinaryCache {
     Path cached(String serverPath) throws IOException {
         Path known = validated.get(serverPath);
         if (known != null) return known;
-        String key = sha256(serverPath);
+        // Equal server paths/stat metadata in different rooms must never share model bytes.
+        String key = sha256(serverUrl + "\n" + serverPath);
         Object lock = locks.computeIfAbsent(key, k -> new Object());
         synchronized (lock) {
             Path file = cachedAfterStat(serverPath, key);
@@ -116,8 +134,7 @@ final class WorkerBinaryCache {
     /** Streams one file; a truncated or oversized transfer is never moved into place. */
     private void download(String serverPath, Path destination, long expectedSize) throws IOException {
         Path temporary = destination.resolveSibling(destination.getFileName() + ".partial");
-        HttpURLConnection conn = (HttpURLConnection) new URL(
-                serverUrl + "/binary/fetch?path=" + encode(serverPath)).openConnection();
+        HttpURLConnection conn = connection("/binary/fetch?path=" + encode(serverPath));
         conn.setConnectTimeout(10_000);
         conn.setReadTimeout(600_000);
         try {
@@ -145,13 +162,14 @@ final class WorkerBinaryCache {
             Files.move(temporary, destination, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
         } finally {
             Files.deleteIfExists(temporary);
+            connections.remove(conn);
             conn.disconnect();
         }
     }
 
     @SuppressWarnings("unchecked")
     private Map<String, Object> getJson(String route) throws IOException {
-        HttpURLConnection conn = (HttpURLConnection) new URL(serverUrl + route).openConnection();
+        HttpURLConnection conn = connection(route);
         conn.setConnectTimeout(10_000);
         conn.setReadTimeout(60_000);
         try {
@@ -163,6 +181,7 @@ final class WorkerBinaryCache {
                 return MAPPER.readValue(in, Map.class);
             }
         } finally {
+            connections.remove(conn);
             conn.disconnect();
         }
     }

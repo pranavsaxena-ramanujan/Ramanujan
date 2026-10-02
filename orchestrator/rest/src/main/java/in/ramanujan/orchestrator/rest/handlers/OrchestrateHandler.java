@@ -50,7 +50,7 @@ public class OrchestrateHandler implements Handler<RoutingContext> {
             if(debuggable == null) {
                 debuggable = false;
             }
-            orchestrateService.orchestrateService(firstCommandId, orchestratorAsyncId, debuggable, debugLines)
+            orchestrateService.orchestrateService(firstCommandId, orchestratorAsyncId, debuggable, debugLines, input.getString("clusterId"))
                     .setHandler(new MonitoringHandler<>("orchestrateService", handler-> {
                 try {
                     if (handler.succeeded()) {

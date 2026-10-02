@@ -16,6 +16,17 @@ import java.util.Map;
 
 @Component
 public class AsyncTaskDaoSqlImpl implements AsyncTaskDao {
+    private final com.fasterxml.jackson.databind.ObjectMapper mapper = new com.fasterxml.jackson.databind.ObjectMapper();
+
+    private void writeNativeFields(AsyncTaskOrchestrator row, AsyncTask task) throws Exception {
+        row.setNativeState(task.getNativeState());
+        row.setNativeDeadline(task.getNativeDeadline());
+        if (task.getLlm() != null) row.setLlm(mapper.writeValueAsString(task.getLlm()));
+        if (task.getNativeResult() != null) row.setNativeResult(mapper.writeValueAsString(task.getNativeResult()));
+        if (task.getNativeBindings() != null) row.setNativeBindings(mapper.writeValueAsString(task.getNativeBindings()));
+        if (task.getNativeFiles() != null) row.setNativeFiles(mapper.writeValueAsString(task.getNativeFiles()));
+        if (task.getBinaryArrayFiles() != null) row.setBinaryArrayFiles(mapper.writeValueAsString(task.getBinaryArrayFiles()));
+    }
 
     @Autowired
     private QueryExecutor queryExecutor;
@@ -28,6 +39,8 @@ public class AsyncTaskDaoSqlImpl implements AsyncTaskDao {
             asyncTaskOrchestrator.setFirstCommandId(asyncTask.getFirstCommandId());
             asyncTaskOrchestrator.setStatus(asyncTask.getStatus());
             asyncTaskOrchestrator.setUuid(asyncTask.getUuid());
+            asyncTaskOrchestrator.setClusterId(asyncTask.getClusterId());
+            writeNativeFields(asyncTaskOrchestrator, asyncTask);
             asyncTaskOrchestrator.setDebug(asyncTask.getDebug().toString());
             queryExecutor.execute(asyncTaskOrchestrator, null, QueryType.INSERT).setHandler(handler -> {
                 if(handler.succeeded()) {
@@ -48,7 +61,14 @@ public class AsyncTaskDaoSqlImpl implements AsyncTaskDao {
         try {
             AsyncTaskOrchestrator asyncTaskOrchestrator = new AsyncTaskOrchestrator();
             asyncTaskOrchestrator.setUuid(uuid);
-            asyncTaskOrchestrator.setStatus((String) updateQuery.get(AsyncTaskFields.status.getFieldName()));
+            AsyncTask update = new AsyncTask();
+            for (Map.Entry<String, Object> entry : updateQuery.entrySet()) {
+                AsyncTaskFields field = AsyncTaskFields.getAsyncTaskFields(entry.getKey());
+                if (field == null) throw new IllegalArgumentException("Unknown async task field: " + entry.getKey());
+                field.triggerUpdate(update, entry.getValue());
+            }
+            asyncTaskOrchestrator.setStatus(update.getStatus());
+            writeNativeFields(asyncTaskOrchestrator, update);
             queryExecutor.execute(asyncTaskOrchestrator, Keys.UUID, QueryType.UPDATE).setHandler(handler -> {
                if(handler.succeeded()) {
                    future.complete();
@@ -80,6 +100,19 @@ public class AsyncTaskDaoSqlImpl implements AsyncTaskDao {
                    if(objectList != null && objectList.size() > 0) {
                        AsyncTaskOrchestrator resultObj = (AsyncTaskOrchestrator) objectList.get(0);
                        asyncTask.setStatus(resultObj.getStatus());
+                       asyncTask.setClusterId(resultObj.getClusterId());
+                       asyncTask.setNativeState(resultObj.getNativeState());
+                       asyncTask.setNativeDeadline(resultObj.getNativeDeadline());
+                       try {
+                           if (resultObj.getLlm() != null) asyncTask.setLlm(mapper.readValue(resultObj.getLlm(), Map.class));
+                           if (resultObj.getNativeResult() != null) asyncTask.setNativeResult(mapper.readValue(resultObj.getNativeResult(), Map.class));
+                           if (resultObj.getNativeBindings() != null) asyncTask.setNativeBindings(mapper.readValue(resultObj.getNativeBindings(), List.class));
+                           if (resultObj.getNativeFiles() != null) asyncTask.setNativeFiles(mapper.readValue(resultObj.getNativeFiles(), List.class));
+                           if (resultObj.getBinaryArrayFiles() != null) asyncTask.setBinaryArrayFiles(mapper.readValue(resultObj.getBinaryArrayFiles(), Map.class));
+                       } catch (Exception ex) {
+                           future.fail(ex);
+                           return;
+                       }
                        asyncTask.setFirstCommandId(resultObj.getFirstCommandId());
                        asyncTask.setDebug(Boolean.valueOf(resultObj.getDebug()));
                        asyncTask.setUuid(uuid);

@@ -1,0 +1,8 @@
+{
+  "name": "ramanujan-compute-cluster-portal",
+  "version": "0.1.0",
+  "private": true,
+  "engines": { "node": ">=22.13" },
+  "scripts": { "start": "node server.js", "migrate": "node migrate.js", "test": "node --test test/*.test.js" },
+  "dependencies": { "express": "^4.21.2", "mysql2": "^3.14.0" }
+}

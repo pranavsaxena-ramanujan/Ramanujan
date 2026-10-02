@@ -16,6 +16,36 @@ public class AffinityTaskQueueTest {
     }
 
     @Test
+    public void taggedTasksAndAffinityOwnersAreClusterIsolated() throws Exception {
+        queue.add("a", "same", "A");
+        assertNull(queue.poll("worker", 1, 0, "B"));
+        assertNull(queue.poll("global", 1, 0));
+        assertEquals("a", queue.poll("worker", 1, 0, "A"));
+        queue.completed("worker", "A");
+        queue.add("b", "same", "B");
+        assertEquals("b", queue.poll("worker", 1, 0, "B"));
+        assertEquals("worker", queue.owners("A").get("same"));
+        assertEquals("worker", queue.owners("B").get("same"));
+        assertNull(queue.owners().get("same"));
+    }
+
+    @Test
+    public void untaggedTasksRunInEveryClusterAndStaleTaggedWorkStaysInCluster() throws Exception {
+        for (String cluster : new String[]{null, "A", "B"}) {
+            queue.add("free", null);
+            assertEquals("free", queue.poll("worker", 2, 0, cluster));
+            queue.completed("worker", cluster);
+        }
+        queue.add("first", "affinity", "A");
+        assertEquals("first", queue.poll("worker", 2, 0, "A"));
+        queue.completed("worker", "A");
+        queue.add("retry", "affinity", "A");
+        now.addAndGet(AffinityTaskQueue.STALE_MILLIS + 1);
+        assertNull(queue.poll("worker", 2, 0, "B"));
+        assertEquals("retry", queue.poll("replacement", 2, 0, "A"));
+    }
+
+    @Test
     public void spreadsAffinitiesAcrossLiveWorkersAndKeepsThemSticky() throws Exception {
         assertNull(poll("a", 2));
         assertNull(poll("b", 2));

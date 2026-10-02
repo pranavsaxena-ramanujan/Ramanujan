@@ -28,10 +28,12 @@ final class AffinityTaskQueue<T> {
     private static final class Entry<T> {
         final T task;
         final String affinity;
+        final String clusterId;
 
-        Entry(T task, String affinity) {
+        Entry(T task, String affinity, String clusterId) {
             this.task = task;
-            this.affinity = affinity;
+            this.affinity = scoped(clusterId, affinity);
+            this.clusterId = clusterId;
         }
     }
 
@@ -40,6 +42,8 @@ final class AffinityTaskQueue<T> {
     private final Map<String, Long> lastSeen = new HashMap<>();
     private final Map<String, Integer> limits = new HashMap<>();
     private final Map<String, Integer> busy = new HashMap<>();
+    private final Map<String, String> hostClusters = new HashMap<>();
+    private final Map<String, String> hostIds = new HashMap<>();
     private final LongSupplier clock;
 
     AffinityTaskQueue() {
@@ -51,8 +55,22 @@ final class AffinityTaskQueue<T> {
     }
 
     synchronized void add(T task, String affinity) {
-        pending.add(new Entry<>(task, affinity));
+        add(task, affinity, null);
+    }
+
+    synchronized void add(T task, String affinity, String clusterId) {
+        pending.add(new Entry<>(task, affinity, clusterId));
         notifyAll();
+    }
+
+    synchronized void remove(T task) {
+        pending.removeIf(entry -> entry.task == task);
+        notifyAll();
+    }
+
+    private static String scoped(String clusterId, String value) {
+        if (value == null) return null;
+        return (clusterId == null ? "-1:" : clusterId.length() + ":" + clusterId + ":") + value;
     }
 
     synchronized int size() {
@@ -60,21 +78,39 @@ final class AffinityTaskQueue<T> {
     }
 
     synchronized Map<String, String> owners() {
-        return new LinkedHashMap<>(owners);
+        return owners(null);
+    }
+
+    synchronized Map<String, String> owners(String clusterId) {
+        String prefix = clusterId == null ? "-1:" : clusterId.length() + ":" + clusterId + ":";
+        Map<String, String> result = new LinkedHashMap<>();
+        owners.forEach((key, value) -> {
+            if (key.startsWith(prefix)) result.put(key.substring(prefix.length()), hostIds.get(value));
+        });
+        return result;
     }
 
     /** Returns the first eligible task for {@code host}, waiting up to {@code timeoutMillis}. */
     synchronized T poll(String host, int affinityLimit, long timeoutMillis) throws InterruptedException {
+        return poll(host, affinityLimit, timeoutMillis, null);
+    }
+
+    synchronized T poll(String host, int affinityLimit, long timeoutMillis, String clusterId) throws InterruptedException {
+        String hostId = host;
+        host = scoped(clusterId, host);
         long deadline = System.currentTimeMillis() + timeoutMillis;
         while (true) {
             long now = clock.getAsLong();
             if (host != null) {
                 lastSeen.put(host, now);
                 limits.put(host, Math.max(0, affinityLimit));
+                hostClusters.put(host, clusterId);
+                hostIds.put(host, hostId);
             }
             for (Iterator<Entry<T>> it = pending.iterator(); it.hasNext(); ) {
                 Entry<T> entry = it.next();
-                if (eligible(entry.affinity, host, now)) {
+                if ((entry.clusterId == null || entry.clusterId.equals(clusterId))
+                        && eligible(entry.affinity, host, now, entry.clusterId)) {
                     it.remove();
                     if (entry.affinity != null) {
                         owners.put(entry.affinity, host);
@@ -95,6 +131,11 @@ final class AffinityTaskQueue<T> {
 
     /** Records that {@code host} finished a task handed out by {@link #poll}. */
     synchronized void completed(String host) {
+        completed(host, null);
+    }
+
+    synchronized void completed(String host, String clusterId) {
+        host = scoped(clusterId, host);
         if (host == null) return;
         lastSeen.put(host, clock.getAsLong());
         Integer count = busy.get(host);
@@ -104,7 +145,7 @@ final class AffinityTaskQueue<T> {
         notifyAll();
     }
 
-    private boolean eligible(String affinity, String host, long now) {
+    private boolean eligible(String affinity, String host, long now, String clusterId) {
         if (affinity == null) return true;
         if (host == null) return false;
         String owner = owners.get(affinity);
@@ -117,7 +158,8 @@ final class AffinityTaskQueue<T> {
         int mine = owned(host);
         if (mine >= limits.getOrDefault(host, Integer.MAX_VALUE)) return false;
         for (String other : lastSeen.keySet()) {
-            if (!other.equals(host) && isAlive(other, now, LIVE_MILLIS)
+            if ((clusterId == null || clusterId.equals(hostClusters.get(other)))
+                    && !other.equals(host) && isAlive(other, now, LIVE_MILLIS)
                     && owned(other) < mine && owned(other) < limits.getOrDefault(other, Integer.MAX_VALUE)) {
                 return false;
             }

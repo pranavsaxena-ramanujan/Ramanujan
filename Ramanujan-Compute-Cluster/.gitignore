@@ -1,0 +1,14 @@
+**/target/
+**/build/
+**/.gradle/
+**/.cxx/
+**/local.properties
+**/__pycache__/
+**/node_modules/
+.env
+*.log
+*.sqlite*
+installer/releases/*
+!installer/releases/manifest.json
+androidapp/*.jks
+androidapp/*.keystore

@@ -13,6 +13,23 @@ import java.util.List;
 
 public class RowToObjectConvertorTest {
     @Test
+    public void clusterColumnsSurviveSqlRowConversion() throws Exception {
+        for (Object schema : new Object[]{
+                new AsyncTaskMiddleware(),
+                new in.ramanujan.db.layer.schema.AsyncTaskOrchestrator(),
+                new in.ramanujan.db.layer.schema.DagElementMetadata(),
+                new in.ramanujan.db.layer.schema.AvailableHost(),
+                new in.ramanujan.db.layer.schema.HostMapping()}) {
+            List<String> columnNames = new ArrayList<>();
+            columnNames.add("clusterId");
+            Row row = new MySQLRowImpl(new RowDesc(columnNames));
+            row.addValue("ExactCluster-A");
+            Object converted = RowToObjectConvertor.convert(row, schema);
+            Assert.assertEquals("ExactCluster-A", converted.getClass().getField("clusterId").get(converted));
+        }
+    }
+
+    @Test
     public void testForAsyncTaskMiddlewareSelect() throws  Exception {
         List<String> columnNames = new ArrayList<String>() {{
            add("taskId");

@@ -162,6 +162,7 @@ public abstract class  StorageDao {
                     BasicDagElement basicDagElement = new BasicDagElement();
                     basicDagElement.setId(dagElement.getId());
                     basicDagElement.setFirstCommandId(dagElement.getFirstCommandId());
+                    basicDagElement.setClusterId(dagElement.getClusterId());
                     basicDagElement.setRuleEngineInput(dagElement.getRuleEngineInput());
 
                     setObject(dagElement.getId(), dagElementBucketName, objectMapper.writeValueAsString(basicDagElement), 5);
@@ -228,4 +229,3 @@ public abstract class  StorageDao {
     protected abstract void setObject(String objectId, String buckName, String object, int currentRetryCount) throws Exception;
     protected abstract String getObject(String objectId, String bucketName, int currentRetryCount) throws Exception;
 }
-

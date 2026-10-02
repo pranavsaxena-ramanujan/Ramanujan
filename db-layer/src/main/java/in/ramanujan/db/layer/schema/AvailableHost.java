@@ -11,6 +11,9 @@ import lombok.Data;
 @Data
 @Table("availableHost")
 public class AvailableHost {
+    @ColumnName("clusterId")
+    public String clusterId;
+
     @PrimaryKey(keyValue = Keys.HOST_ID, order = "1")
     @ColumnName("hostId")
     public String hostId;

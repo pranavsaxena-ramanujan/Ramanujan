@@ -48,6 +48,9 @@ public class InMemQueryExecutor {
         inMemDb.put(DagElementOrchestratorAsyncIdMapping.class.getSimpleName(), new TreeMap<>());
         inMemDb.put(DagElementRelationShip.class.getSimpleName(), new TreeMap<>());
         inMemDb.put(HostMapping.class.getSimpleName(), new TreeMap<>());
+        inMemDb.put(NativeAffinityOwner.class.getSimpleName(), new TreeMap<>());
+        inMemDb.put(NativeTaskDelivery.class.getSimpleName(), new TreeMap<>());
+        inMemDb.put(NativePositionClaim.class.getSimpleName(), new TreeMap<>());
         inMemDb.put(OrchestratorCallLocker.class.getSimpleName(), new TreeMap<>());
         inMemDb.put(OrchestratorMiddlewareMapping.class.getSimpleName(), new TreeMap<>());
         inMemDb.put(VariableMapping.class.getSimpleName(), new TreeMap<>());
@@ -59,6 +62,12 @@ public class InMemQueryExecutor {
         //iterate through the fields of the object and get the primary key
         //and insert the object in the tableData
         GetAllPrimaryKeyOrders result = getGetAllPrimaryKeyOrders(object);
+        if (object instanceof NativeAffinityOwner || object instanceof NativeTaskDelivery || object instanceof NativePositionClaim) {
+            String id = String.valueOf(result.primaryKeyOrder.get(in.ramanujan.db.layer.constants.Keys.UUID).get(1));
+            if (tableData.containsKey(id) && !tableData.get(id).isEmpty()) {
+                throw new IllegalStateException("Native primary key is already claimed");
+            }
+        }
 
         for(String key : result.primaryKeyOrder.keySet()) {
             Map<Integer, Object> primaryKeyMap = result.primaryKeyOrder.get(key);
@@ -294,7 +303,7 @@ public class InMemQueryExecutor {
         }
     }
 
-    public Future<List<Object>> execute(Object object, String index, QueryType queryType,
+    public synchronized Future<List<Object>> execute(Object object, String index, QueryType queryType,
                                         List<Object>... batchOpObjectsListArray) throws Exception {
         try {
             switch (queryType) {

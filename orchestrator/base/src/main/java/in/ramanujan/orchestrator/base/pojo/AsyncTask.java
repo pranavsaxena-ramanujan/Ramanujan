@@ -7,6 +7,7 @@ import lombok.AllArgsConstructor;
 import lombok.Data;
 
 import java.util.List;
+import java.util.Map;
 
 @Data
 @AllArgsConstructor
@@ -21,6 +22,33 @@ public class AsyncTask {
     private Object data;
     private Boolean debug;
     private List<Integer> breakpoints;
+    private String clusterId;
+    private String assignedCluster;
+    private Map<String, Object> llm;
+    private Map<String, Object> nativeResult;
+    private String nativeState;
+    private Long nativeDeadline;
+    private List<String> nativeFiles;
+    private List<String> nativeBindings;
+    private Map<String, String> binaryArrayFiles;
+    @com.fasterxml.jackson.annotation.JsonIgnore
+    private String nativePreferredHost;
+    @com.fasterxml.jackson.annotation.JsonIgnore
+    private String assignedNonce;
+
+    public AsyncTask(String uuid, String status, String hostAssigned, RuleEngineInput ruleEngineInput,
+                     Checkpoint checkpoint, String firstCommandId, Object data, Boolean debug,
+                     List<Integer> breakpoints) {
+        this.uuid = uuid;
+        this.status = status;
+        this.hostAssigned = hostAssigned;
+        this.ruleEngineInput = ruleEngineInput;
+        this.checkpoint = checkpoint;
+        this.firstCommandId = firstCommandId;
+        this.data = data;
+        this.debug = debug;
+        this.breakpoints = breakpoints;
+    }
 
     public AsyncTask(){}
 }

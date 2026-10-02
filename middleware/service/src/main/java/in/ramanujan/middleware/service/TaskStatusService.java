@@ -23,11 +23,26 @@ public class TaskStatusService {
     private DagElementDao dagElementDao;
 
     public Future<AsyncTask> getAsyncTaskStatus(String asyncTaskId) {
+        return getAsyncTaskStatus(asyncTaskId, null);
+    }
+
+    public Future<AsyncTask> getAsyncTaskStatus(String asyncTaskId, String clusterId) {
         Future<AsyncTask> future = Future.future();
+        asyncTaskDao.getAsyncTask(asyncTaskId).setHandler(taskHandler -> {
+            if (taskHandler.failed()) {
+                future.fail(taskHandler.cause());
+                return;
+            }
+            AsyncTask stored = taskHandler.result();
+            if (stored == null || !java.util.Objects.equals(stored.getClusterId(), clusterId)) {
+                future.fail(new SecurityException("Unknown task or wrong cluster"));
+                return;
+            }
         dagElementDao.isAsyncTaskDone(asyncTaskId).setHandler(asyncDoneHandler -> {
            if(asyncDoneHandler.succeeded()) {
                if(asyncDoneHandler.result() == 0 ) {
                    AsyncTask asyncTask = new AsyncTask();
+                   asyncTask.setClusterId(stored.getClusterId());
                      asyncTask.setTaskId(asyncTaskId);
                         asyncTask.setTaskStatus(AsyncTask.TaskStatus.SUCCESS);
                    variableValueDao.getAllValuesForAsyncId(asyncTaskId).setHandler(getValueHandler -> {
@@ -40,19 +55,13 @@ public class TaskStatusService {
                        future.complete(asyncTask);
                      });
                } else {
-                   asyncTaskDao.getAsyncTask(asyncTaskId).setHandler(handler -> {
-                          if(handler.succeeded()) {
-                            AsyncTask asyncTask = handler.result();
-                                 future.complete(asyncTask);
-                          } else {
-                            future.fail(handler.cause());
-                          }
-                   });
+                   future.complete(stored);
                }
            } else {
                future.fail(asyncDoneHandler.cause());
                return;
            }
+        });
         });
         return  future;
     }

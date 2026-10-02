@@ -81,7 +81,7 @@ public class HttpVerticle extends AbstractVerticle {
 
     @Override
     public void start(Future<Void> startFuture) throws Exception {
-        connectionCreator.init(context);
+        if (ConfigurationGetter.getDBType() != QueryExecutor.DB_TYPE.IN_MEM) connectionCreator.init(context);
         QueryExecutor.DBConfig dbConfig = new QueryExecutor.DBConfig(ConfigurationGetter.getString(Config.DB_URL),
                 ConfigurationGetter.getString(Config.DB_USER), ConfigurationGetter.getString(Config.DB_PASSWORD),
                 ConfigurationGetter.getString(Config.DB_NAME));
@@ -112,7 +112,7 @@ public class HttpVerticle extends AbstractVerticle {
                     logger.error("Exception for request: error: {}", event);
                 }
         ).listen(
-                config().getInteger("event.http.port", 8888), "0.0.0.0", next
+                config().getInteger("event.http.port", 8888), config().getString("event.http.host", "0.0.0.0"), next
         );
     }
 
@@ -138,7 +138,9 @@ public class HttpVerticle extends AbstractVerticle {
                 .allowedHeader("Accept");
         
         router.route().handler(corsHandler);
-        router.route().handler(BodyHandler.create());
+        BodyHandler bodies = BodyHandler.create();
+        if (config().containsKey("event.http.body.limit")) bodies.setBodyLimit(config().getLong("event.http.body.limit"));
+        router.route().handler(bodies);
         
         runUserCodeHandle(router);
         clientCreatApis(router);

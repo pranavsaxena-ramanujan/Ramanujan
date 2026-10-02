@@ -26,7 +26,7 @@ import java.util.concurrent.locks.ReentrantReadWriteLock;
  *   java -jar developer-console.jar worker [server-url] [num-threads] [options]
  *
  * Defaults:
- *   server-url   = http://localhost:8888
+ *   server-url   = RAMANUJAN_WORKER_URL, or http://localhost:8888
  *   num-threads  = number of available CPUs
  *
  * Options:
@@ -46,7 +46,8 @@ import java.util.concurrent.locks.ReentrantReadWriteLock;
  *
  * The worker continuously polls /pings/open, executes the ruleEngineInput
  * through NativeProcessor (same path as Android), and posts results to
- * /task/complete.  Press Ctrl-C to stop.
+ * /task/complete. Private-room launchers pass the scoped bearer URL via
+ * RAMANUJAN_WORKER_URL rather than command-line arguments. Press Ctrl-C to stop.
  */
 public class ExecuteInlineWorker implements Operation {
 
@@ -60,11 +61,26 @@ public class ExecuteInlineWorker implements Operation {
     private WorkerBinaryCache binaryCache;
     private Path taskRoot;
     private LlmTaskHandler llmTasks;
+    private volatile ExecutorService pool;
+    private volatile boolean stopped;
+    private final Set<HttpURLConnection> connections = ConcurrentHashMap.newKeySet();
+    private String scopedUrl;
+
+    /** Stops polling and in-flight transfers; native sessions close after the execution thread exits. */
+    public void stop() {
+        stopped = true;
+        ExecutorService running = pool;
+        if (running != null) running.shutdownNow();
+        for (HttpURLConnection connection : connections) connection.disconnect();
+        if (binaryCache != null) binaryCache.close();
+    }
 
     @Override
     public void execute(List<String> args) throws IOException {
         // args[0] = "worker", args[1] = optional url, args[2] = optional threads
-        String serverUrl = "http://localhost:8888";
+        String environmentUrl = System.getenv("RAMANUJAN_WORKER_URL");
+        String serverUrl = environmentUrl == null || environmentUrl.trim().isEmpty()
+                ? "http://localhost:8888" : environmentUrl.trim().replaceAll("/+$", "");
         int numThreads = Runtime.getRuntime().availableProcessors();
         String cacheDir = Paths.get(System.getProperty("user.home"), ".ramanujan", "worker-cache").toString();
         boolean sharedFilesystem = false;
@@ -117,22 +133,35 @@ public class ExecuteInlineWorker implements Operation {
         llmTasks = new LlmTaskHandler(binaryCache, llmSessions);
 
         System.out.println("LOCAL_WORKER_READY");
-        System.out.println("LOCAL_WORKER_URL " + serverUrl);
+        scopedUrl = serverUrl.contains("/worker/") ? serverUrl : null;
+        System.out.println("LOCAL_WORKER_URL " + (scopedUrl == null ? serverUrl : "[private room gateway]"));
         System.out.println("LOCAL_WORKER_THREADS " + numThreads);
         System.out.println("LOCAL_WORKER_HOST " + hostId);
         System.out.println("LOCAL_WORKER_BINARIES " + (sharedFilesystem ? "shared-filesystem" : "cache " + cacheDir));
         System.out.flush();
 
         final String url = serverUrl;
-        ExecutorService pool = Executors.newFixedThreadPool(numThreads);
+        pool = Executors.newFixedThreadPool(numThreads);
         for (int i = 0; i < numThreads; i++) {
             pool.submit(() -> workerLoop(url));
         }
 
+        pool.shutdown();
         try {
             pool.awaitTermination(Long.MAX_VALUE, TimeUnit.DAYS);
         } catch (InterruptedException e) {
+            stop();
             Thread.currentThread().interrupt();
+        } finally {
+            stop();
+            // Native calls cannot be interrupted; do not close sessions while a call is using them.
+            boolean interrupted = Thread.interrupted();
+            while (!pool.isTerminated()) {
+                try { pool.awaitTermination(1, TimeUnit.SECONDS); }
+                catch (InterruptedException e) { interrupted = true; }
+            }
+            llmTasks.closeAll();
+            if (interrupted) Thread.currentThread().interrupt();
         }
     }
 
@@ -142,16 +171,21 @@ public class ExecuteInlineWorker implements Operation {
         String pollUrl = serverUrl + "/pings/open?uuid=" + hostId
                 + (affinityLimit == Integer.MAX_VALUE ? "" : "&affinityLimit=" + affinityLimit);
 
-        while (!Thread.currentThread().isInterrupted()) {
+        while (!stopped && !Thread.currentThread().isInterrupted()) {
             try {
-                // Long-poll: the server blocks up to 900 ms waiting for work
-                // before returning null, so no client-side sleep is needed.
+                long pollStarted = System.nanoTime();
                 Map<String, Object> pingResp = postJson(pollUrl, "");
-                if (pingResp == null) continue;
+                if (pingResp == null) {
+                    idleBackoff(pollStarted);
+                    continue;
+                }
                 if (!"SUCCESS".equalsIgnoreCase((String) pingResp.get("status"))) continue;
 
                 Object dataObj = pingResp.get("data");
-                if (dataObj == null) continue; // no pending tasks
+                if (dataObj == null) {
+                    idleBackoff(pollStarted);
+                    continue;
+                }
 
                 Map<String, Object> taskData = (Map<String, Object>) dataObj;
                 if (taskData.get("llm") instanceof Map) {
@@ -217,7 +251,7 @@ public class ExecuteInlineWorker implements Operation {
                         }
                     }
                 } catch (Exception | LinkageError e) {
-                    error = e.getClass().getSimpleName() + ": " + e.getMessage();
+                    error = safeError(e);
                     System.err.println("[Worker] execution error for " + uuid + ": " + error);
                 } finally {
                     deleteRecursively(taskDir);
@@ -245,7 +279,7 @@ public class ExecuteInlineWorker implements Operation {
                         try {
                             if (error == null) uploadBinaryFile(serverUrl, uuid, arrayId, filePath);
                         } catch (Exception uploadEx) {
-                            error = "upload of binary array " + arrayId + " failed: " + uploadEx.getMessage();
+                            error = "upload of binary array " + arrayId + " failed: " + safeError(uploadEx);
                             System.err.println("[Worker] " + error + " (task " + uuid + ")");
                         } finally {
                             new File(filePath).delete();
@@ -269,8 +303,9 @@ public class ExecuteInlineWorker implements Operation {
                 // are logged instead of silently killing this thread: workerLoop() runs
                 // inside pool.submit(), whose returned Future is never .get()'d, so an
                 // uncaught Error here would otherwise vanish with no diagnostic output.
-                System.err.println("[Worker] error: " + t);
-                t.printStackTrace();
+                System.err.println("[Worker] error: " + safeError(t));
+                try { Thread.sleep(1000); }
+                catch (InterruptedException e) { Thread.currentThread().interrupt(); break; }
             }
         }
     }
@@ -283,7 +318,7 @@ public class ExecuteInlineWorker implements Operation {
         try {
             results = llmTasks.handle(task);
         } catch (Exception | LinkageError e) {
-            error = e.getClass().getSimpleName() + ": " + e.getMessage();
+            error = safeError(e);
             System.err.println("[Worker] llm " + task.get("op") + " failed for session " + task.get("session") + ": " + error);
         }
         String what = task.get("stages") instanceof List
@@ -304,6 +339,27 @@ public class ExecuteInlineWorker implements Operation {
         return args.get(index).trim();
     }
 
+    private String safeError(Throwable error) {
+        String message = error.getClass().getSimpleName() + ": " + error.getMessage();
+        if (scopedUrl != null) message = message.replace(scopedUrl, "[private room gateway]");
+        return message.replaceAll("(?i)/worker/[^\\s/?\"']+", "/worker/[redacted]");
+    }
+
+    static void idleBackoff(long pollStarted) throws InterruptedException {
+        // Legacy central polling returns immediately; homelab's long-poll already supplies this delay.
+        long remaining = TimeUnit.MILLISECONDS.toNanos(100) - (System.nanoTime() - pollStarted);
+        if (remaining > 0) TimeUnit.NANOSECONDS.sleep(remaining);
+    }
+
+    private HttpURLConnection connection(String url) throws IOException {
+        if (stopped) throw new IOException("worker stopped");
+        HttpURLConnection connection = (HttpURLConnection) new URL(url).openConnection();
+        connection.setInstanceFollowRedirects(false);
+        connections.add(connection);
+        if (stopped) { connection.disconnect(); throw new IOException("worker stopped"); }
+        return connection;
+    }
+
     private static void deleteRecursively(Path path) {
         if (path == null || !Files.exists(path)) return;
         try (java.util.stream.Stream<Path> walk = Files.walk(path)) {
@@ -319,7 +375,8 @@ public class ExecuteInlineWorker implements Operation {
         String url = serverUrl + "/orchestrator/uploadBinary?uuid=" + URLEncoder.encode(uuid, "UTF-8")
                 + "&arrayId=" + URLEncoder.encode(arrayId, "UTF-8");
 
-        HttpURLConnection conn = (HttpURLConnection) new URL(url).openConnection();
+        HttpURLConnection conn = connection(url);
+        try {
         conn.setRequestMethod("POST");
         conn.setRequestProperty("Content-Type", "application/octet-stream");
         conn.setDoOutput(true);
@@ -336,6 +393,7 @@ public class ExecuteInlineWorker implements Operation {
         if (code >= 400) {
             throw new IOException("uploadBinary for arrayId=" + arrayId + " failed with HTTP " + code);
         }
+        } finally { connections.remove(conn); conn.disconnect(); }
     }
 
     private static byte[] readAllBytes(String filePath) throws IOException {
@@ -349,7 +407,8 @@ public class ExecuteInlineWorker implements Operation {
     }
 
     private Map<String, Object> postJson(String url, String body) throws Exception {
-        HttpURLConnection conn = (HttpURLConnection) new URL(url).openConnection();
+        HttpURLConnection conn = connection(url);
+        try {
         conn.setRequestMethod("POST");
         conn.setRequestProperty("Content-Type", "application/json");
         conn.setDoOutput(true);
@@ -363,6 +422,7 @@ public class ExecuteInlineWorker implements Operation {
         }
 
         int code = conn.getResponseCode();
+        if (code < 200 || code >= 300) throw new IOException("worker request failed with HTTP " + code);
         InputStream is = (code < 400) ? conn.getInputStream() : conn.getErrorStream();
         if (is == null) return null;
 
@@ -373,5 +433,6 @@ public class ExecuteInlineWorker implements Operation {
         is.close();
 
         return MAPPER.readValue(baos.toByteArray(), Map.class);
+        } finally { connections.remove(conn); conn.disconnect(); }
     }
 }

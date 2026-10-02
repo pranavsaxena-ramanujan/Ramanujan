@@ -9,6 +9,9 @@ import lombok.Data;
 @Data
 @Table("dagElementMetadata")
 public class DagElementMetadata {
+    @ColumnName("clusterId")
+    public String clusterId;
+
     @ColumnName("dagElementId")
     @PrimaryKey(keyValue = Keys.DAG_ELEMENT_ID, order = "1")
     public String dagElementId;

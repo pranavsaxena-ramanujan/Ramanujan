@@ -57,8 +57,19 @@ public class RunService {
     private Logger logger = LoggerFactory.getLogger(RunService.class);
 
     public Future<String> runCode(final TranslateResponse translateResponse, Vertx vertx, Boolean toBeDebugged) {
+        return runCode(translateResponse, vertx, toBeDebugged, null);
+    }
+
+    public Future<String> runCode(final TranslateResponse translateResponse, Vertx vertx, Boolean toBeDebugged,
+                                  String clusterId) {
+        translateResponse.getFirstDagElement().setClusterId(clusterId);
+        for (DagElement element : translateResponse.getDagElementList()) element.setClusterId(clusterId);
         Future<String> future = Future.future();
-        addAsyncTask().setHandler(new MonitoringHandler<>("asyncTaskAdd", asyncTaskInsert -> {
+        addAsyncTask(clusterId).setHandler(new MonitoringHandler<>("asyncTaskAdd", asyncTaskInsert -> {
+            if (asyncTaskInsert.failed()) {
+                future.fail(asyncTaskInsert.cause());
+                return;
+            }
             String asyncId = asyncTaskInsert.result();
 
             initDbEntries(asyncId, translateResponse).setHandler(new MonitoringHandler<>("initDbEntries", dbOperationHandler -> {
@@ -197,11 +208,12 @@ public class RunService {
         }
     }
 
-    private Future<String> addAsyncTask() {
+    private Future<String> addAsyncTask(String clusterId) {
         Future<String> future = Future.future();
         String taskId = UUID.randomUUID().toString();
         AsyncTask asyncTask = new AsyncTask();
         asyncTask.setTaskId(taskId);
+        asyncTask.setClusterId(clusterId);
         asyncTask.setTaskStatus(AsyncTask.TaskStatus.PENDING);
         asyncTaskDao.insert(asyncTask).setHandler(handler -> {
            if(handler.succeeded()) {
@@ -246,7 +258,7 @@ public class RunService {
             return;
         }
         orchestrationApiCaller.runCode(asyncId,
-                        basicDagElement.getFirstCommandId(), basicDagElement.getId(), vertx, orchestratorAsyncId, toBeDebugged, basicDagElement.getCommaSeparatedDebugPoints())
+                        basicDagElement.getFirstCommandId(), basicDagElement.getId(), vertx, orchestratorAsyncId, toBeDebugged, basicDagElement.getCommaSeparatedDebugPoints(), basicDagElement.getClusterId())
                 .setHandler(orchestratorCallHandler -> {
                     if(orchestratorCallHandler.failed()) {
                         logger.error("Failed to run dag element id: " + dagElementId, orchestratorCallHandler.cause());

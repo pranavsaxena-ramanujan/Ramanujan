@@ -22,7 +22,7 @@ public class StatusHandler implements Handler<RoutingContext> {
 
         String taskId = event.queryParams().get("uuid");
 
-        taskStatusService.getAsyncTaskStatus(taskId).setHandler(handler -> {
+        taskStatusService.getAsyncTaskStatus(taskId, event.queryParams().get("clusterId")).setHandler(handler -> {
            if(handler.succeeded()) {
                AsyncTask asyncTask = handler.result();
                ApiResponse apiResponse = new ApiResponse(HttpResponseStatus.OK.toString(), asyncTask);
@@ -31,7 +31,8 @@ public class StatusHandler implements Handler<RoutingContext> {
                );
            } else {
 
-               event.response().setStatusCode(HttpResponseStatus.INTERNAL_SERVER_ERROR.code()).end(
+               event.response().setStatusCode(handler.cause() instanceof SecurityException ?
+                       HttpResponseStatus.FORBIDDEN.code() : HttpResponseStatus.INTERNAL_SERVER_ERROR.code()).end(
                        JsonObject.mapFrom(new ApiResponse(HttpResponseStatus.INTERNAL_SERVER_ERROR.toString(),
                                handler.cause())).toString()
                );

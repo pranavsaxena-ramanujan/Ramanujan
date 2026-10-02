@@ -5,21 +5,24 @@ import os
 import sys
 import threading
 import unittest
+from unittest.mock import patch
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from native_runner import HomelabChain, HomelabStage  # noqa: E402
+from native_runner import HomelabChain, HomelabStage, _post  # noqa: E402
 
 
 class _FakeHomelab(BaseHTTPRequestHandler):
     requests = []
+    authorization = []
 
     def do_POST(self):
         body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
         type(self).requests.append((self.path, body))
+        type(self).authorization.append(self.headers.get("Authorization"))
         if self.path == "/llm/step" and body["pos"] > 0 and body["session"] not in _FakeHomelab.opened:
             self._reply(500, {"status": "ERROR", "error": "LLM session is not open on this worker"})
             return
@@ -67,6 +70,7 @@ class _FakeHomelab(BaseHTTPRequestHandler):
 class _FakeHomelabTest(unittest.TestCase):
     def setUp(self):
         _FakeHomelab.requests = []
+        _FakeHomelab.authorization = []
         _FakeHomelab.opened = set()
         self.server = HTTPServer(("127.0.0.1", 0), _FakeHomelab)
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
@@ -79,6 +83,18 @@ class _FakeHomelabTest(unittest.TestCase):
 
 
 class HomelabStageTest(_FakeHomelabTest):
+    def test_portal_token_is_forwarded_without_changing_request_body(self):
+        with patch.dict(os.environ, {"RAMANUJAN_PORTAL_TOKEN": "test-token-only"}):
+            stage = HomelabStage(self.url, "shard-01", self.graph, 30)
+            stage.step(hidden=np.zeros((1, 2), np.float32))
+        self.assertEqual(_FakeHomelab.authorization, ["Bearer test-token-only"])
+        self.assertNotIn("token", _FakeHomelab.requests[0][1])
+
+    def test_portal_token_rejected_over_remote_plain_http(self):
+        with patch.dict(os.environ, {"RAMANUJAN_PORTAL_TOKEN": "test-token-only"}):
+            with self.assertRaisesRegex(ValueError, "HTTPS"):
+                _post("http://example.test", "/llm/close", {}, 30)
+
     def test_graph_and_files_are_sent_only_when_opening(self):
         stage = HomelabStage(self.url, "shard-01", self.graph, 30)
         out = stage.step(hidden=np.array([[1, 2], [3, 4]], np.float32))

@@ -51,6 +51,17 @@ public class TranslateAndRunHandler implements Handler<RoutingContext> {
             }
             JsonObject jsonObject = routingContext.getBodyAsJson();
             final CodeRunRequest codeRunRequest = jsonObject.mapTo(CodeRunRequest.class);
+            if (codeRunRequest.getClusterId() != null && codeRunRequest.getCsvInformationList() != null) {
+                for (in.ramanujan.developer.console.model.pojo.csv.CsvInformation csv : codeRunRequest.getCsvInformationList()) {
+                    if (csv == null || csv.getFileName() == null || csv.getData() == null
+                            || !csv.getFileName().matches("[A-Za-z_][A-Za-z0-9_]*(\\.csv)?")) {
+                        routingContext.response().setStatusCode(400).end("Inline CSV requires a logical fileName and data");
+                        currentRequestCount.decrementAndGet();
+                        return;
+                    }
+                    csv.setInlineData(true);
+                }
+            }
             final String toBeDebuggedStr = routingContext.queryParams().get("debug");
             final Boolean toBeDebugged = (toBeDebuggedStr != null && "true".equals(toBeDebuggedStr)) ? true : false;
             String code = codeRunRequest.getCode();
@@ -85,7 +96,7 @@ public class TranslateAndRunHandler implements Handler<RoutingContext> {
                 .setHandler(translateHandler -> {
            if(translateHandler.succeeded()) {
                TranslateResponse translateResponse = translateHandler.result();
-               runService.runCode(translateResponse, routingContext.vertx(), toBeDebugged).setHandler(runCodeHandler -> {
+               runService.runCode(translateResponse, routingContext.vertx(), toBeDebugged, codeRunRequest.getClusterId()).setHandler(runCodeHandler -> {
                    if(runCodeHandler.succeeded()) {
                        CodeRunAsyncResponse codeRunAsyncResponse = new CodeRunAsyncResponse();
                        codeRunAsyncResponse.setAsyncId((String) runCodeHandler.result());

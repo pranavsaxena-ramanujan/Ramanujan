@@ -10,6 +10,7 @@ needed. --check-layers needs every hidden state, so it calls /llm/step once per 
 """
 import base64
 import json
+import os
 import time
 import urllib.error
 import urllib.request
@@ -24,8 +25,14 @@ from converter.ramanujan_shards.native_llm import NativeStage
 
 
 def _post(url, route, body, timeout):
+    headers = {"Content-Type": "application/json"}
+    portal_token = os.environ.get("RAMANUJAN_PORTAL_TOKEN")
+    if portal_token:
+        if not url.startswith("https://") and not url.startswith(("http://localhost:", "http://127.0.0.1:")):
+            raise ValueError("portal authentication requires HTTPS (except localhost)")
+        headers["Authorization"] = "Bearer " + portal_token
     request = urllib.request.Request(url + route, json.dumps(body).encode("utf-8"),
-                                     {"Content-Type": "application/json"})
+                                     headers)
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
             payload = json.loads(response.read() or b"{}")
