@@ -37,7 +37,7 @@ import java.util.concurrent.locks.ReentrantReadWriteLock;
  *   --max-shards N         most affinity groups (model shards) this worker accepts
  *   --shared-filesystem    read binary arrays at the server's paths instead of fetching
  *   --llm-sessions N       native LLM stage sessions kept open (default 8; least recently
- *                          used is closed first). /llm/step tasks run on libramanujan_llm.
+ *                          used is closed first). /llm/step and /llm/chain tasks run on libramanujan_llm.
  *
  * Examples:
  *   java -jar developer-console.jar worker
@@ -286,7 +286,9 @@ public class ExecuteInlineWorker implements Operation {
             error = e.getClass().getSimpleName() + ": " + e.getMessage();
             System.err.println("[Worker] llm " + task.get("op") + " failed for session " + task.get("session") + ": " + error);
         }
-        System.err.println("[Worker] llm " + task.get("op") + " session=" + task.get("session") + " pos=" + task.get("pos")
+        String what = task.get("stages") instanceof List
+                ? "stages=" + ((List<?>) task.get("stages")).size() : "session=" + task.get("session");
+        System.err.println("[Worker] llm " + task.get("op") + " " + what + " pos=" + task.get("pos")
                 + " n=" + task.get("n") + " done in " + (System.currentTimeMillis() - start) + "ms"
                 + " (open sessions " + llmTasks.openSessions() + ")");
         Map<String, Object> payload = new LinkedHashMap<>();

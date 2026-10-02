@@ -14,12 +14,13 @@ import java.util.List;
 import java.util.Map;
 
 /**
- * Executes homelab {@code /llm/step} and {@code /llm/close} tasks on a worker.
+ * Executes homelab {@code /llm/step}, {@code /llm/chain} and {@code /llm/close} tasks on a worker.
  *
  * Each driver-side pipeline stage has a session key; the worker keeps one native
  * {@link LlmSession} per key (weights on the device, KV cache, recurrent state), so a
- * token step only carries token ids or one hidden vector per token. Weight files named
- * by the stage graph are localized through the worker's persistent binary cache once.
+ * token step only carries token ids or one hidden vector per token. A chain task runs
+ * several of this worker's stages back to back. Weight files named by the stage graph
+ * are localized through the worker's persistent binary cache once.
  */
 final class LlmTaskHandler {
     interface SessionFactory {
@@ -83,22 +84,70 @@ final class LlmTaskHandler {
             result.put("closed", session != null);
             return result;
         }
+        if ("chain".equals(op)) return chain(task);
         if (!"step".equals(op)) throw new IllegalArgumentException("unknown llm op " + op);
         int n = ((Number) task.get("n")).intValue();
         int pos = ((Number) task.get("pos")).intValue();
         Session session = session(key, pos, (Map<String, Object>) task.get("graph"));
-        int[] tokens = null;
-        float[] hidden = null;
-        if (task.get("tokens") != null) {
-            List<Number> ids = (List<Number>) task.get("tokens");
-            tokens = new int[ids.size()];
-            for (int i = 0; i < tokens.length; i++) tokens[i] = ids.get(i).intValue();
-        }
-        if (task.get("hidden") != null) hidden = decodeFloats(String.valueOf(task.get("hidden")));
-        float[] out = session.step(tokens, hidden, n, pos);
-        result.put("output", encodeFloats(out));
+        float[] hidden = task.get("hidden") != null ? decodeFloats(String.valueOf(task.get("hidden"))) : null;
+        float[] out = session.step(tokens(task), hidden, n, pos);
+        putOutput(result, out, task.get("output"));
         result.put("info", MAPPER.readValue(session.info(), Map.class));
         return result;
+    }
+
+    /**
+     * Runs consecutive stages of one token back to back: {stages: [{session, graph?}], tokens | hidden, n,
+     * pos, output}. Each stage's output feeds the next in memory, so the device never waits on the network
+     * between them. Returns the last stage's output plus every stage's info, in order.
+     */
+    @SuppressWarnings("unchecked")
+    private Map<String, Object> chain(Map<String, Object> task) throws IOException {
+        int n = ((Number) task.get("n")).intValue();
+        int pos = ((Number) task.get("pos")).intValue();
+        int[] tokens = tokens(task);
+        float[] hidden = task.get("hidden") != null ? decodeFloats(String.valueOf(task.get("hidden"))) : null;
+        List<Object> infos = new ArrayList<>();
+        Map<String, Object> info = null;
+        for (Map<String, Object> stage : (List<Map<String, Object>>) task.get("stages")) {
+            Session session = session(String.valueOf(stage.get("session")), pos, (Map<String, Object>) stage.get("graph"));
+            hidden = session.step(tokens, hidden, n, pos);
+            tokens = null;
+            info = MAPPER.readValue(session.info(), Map.class);
+            infos.add(info);
+        }
+        Map<String, Object> result = new LinkedHashMap<>();
+        putOutput(result, hidden, task.get("output"));
+        result.put("info", info);
+        result.put("infos", infos);
+        return result;
+    }
+
+    /** "argmax" returns only the chosen token id (greedy decoding); anything else returns all floats. */
+    private static void putOutput(Map<String, Object> result, float[] out, Object mode) {
+        if ("argmax".equals(mode)) {
+            result.put("token", argmax(out));
+        } else {
+            result.put("output", encodeFloats(out));
+        }
+    }
+
+    /** Lowest index on ties, matching numpy.argmax on the driver. */
+    static int argmax(float[] values) {
+        int best = 0;
+        for (int i = 1; i < values.length; i++) {
+            if (values[i] > values[best]) best = i;
+        }
+        return best;
+    }
+
+    @SuppressWarnings("unchecked")
+    private static int[] tokens(Map<String, Object> task) {
+        if (task.get("tokens") == null) return null;
+        List<Number> ids = (List<Number>) task.get("tokens");
+        int[] tokens = new int[ids.size()];
+        for (int i = 0; i < tokens.length; i++) tokens[i] = ids.get(i).intValue();
+        return tokens;
     }
 
     private Session session(String key, int pos, Map<String, Object> graph) throws IOException {

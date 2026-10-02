@@ -386,9 +386,9 @@ homelab server instead of starting local JVMs. The steps are embed, each layer
 per token, and the head. `rj worker` processes on any machine execute them with
 their own platform native library. The homelab plumbing is generic: any REI
 task can carry an affinity and use the worker binary cache. With
-`--runtime native`, each stage step is instead one `POST /llm/step`, and the
-worker keeps a native session per stage, so no state files move between
-steps ([NATIVE_LLM.md](NATIVE_LLM.md#design)).
+`--runtime native`, each token is instead one `POST /llm/chain` through all
+stages, and the worker keeps a native session per stage, so no state files
+move between steps ([NATIVE_LLM.md](NATIVE_LLM.md#design)).
 
 ```mermaid
 sequenceDiagram
@@ -512,10 +512,10 @@ does not reach 5 tok/s; that needs faster native kernels (see Limitations).
 | Path | Purpose |
 |---|---|
 | `sharded-llm/run_gguf_shards.py` | Generic sharded GGUF runner (local JVMs or `--homelab`), parity checks; `run_qwen35_shards.py` is an alias |
-| `sharded-llm/native_runner.py`, `NATIVE_LLM.md` | `--runtime native` driver (local ctypes or `/llm/step`) and its documentation |
+| `sharded-llm/native_runner.py`, `NATIVE_LLM.md` | `--runtime native` driver (local ctypes or `/llm/chain`) and its documentation |
 | `converter/ramanujan_shards/llm_graph.py`, `native_llm.py` | Stage graph JSON and ctypes binding for `libramanujan_llm` |
 | `ramanujan-native/native/llm/` | Native LLM runtime: OpenCL kernels, sessions, weight streaming, C API, JNI |
-| `rule-engine/.../LlmSession.java`, `developer-console/.../LlmTaskHandler.java` | JNI session and the worker's `/llm/step` handler |
+| `rule-engine/.../LlmSession.java`, `developer-console/.../LlmTaskHandler.java` | JNI session and the worker's `/llm/step` and `/llm/chain` handler |
 | `sharded-llm/compare_llama_cpp.py` | NumPy reference vs llama.cpp logits and greedy output |
 | `converter/ramanujan_shards/gguf_source.py` | Streaming GGUF reader (local and HTTP Range) |
 | `converter/ramanujan_shards/gguf_adapter.py`, `planner.py` | Layer grouping and byte-balanced shard planning |

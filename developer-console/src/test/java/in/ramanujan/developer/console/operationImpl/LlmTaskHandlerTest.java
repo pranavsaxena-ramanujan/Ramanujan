@@ -127,4 +127,67 @@ public class LlmTaskHandlerTest {
         assertArrayEquals(values, LlmTaskHandler.decodeFloats(LlmTaskHandler.encodeFloats(values)), 0f);
         assertEquals("AACAPw==", LlmTaskHandler.encodeFloats(new float[]{1f}));
     }
+
+    private static Map<String, Object> chain(int pos, Object tokens, String hidden, int n, String output, Object... stages) {
+        Map<String, Object> task = new LinkedHashMap<>();
+        task.put("op", "chain");
+        List<Object> list = new ArrayList<>();
+        for (int i = 0; i < stages.length; i += 2) {
+            Map<String, Object> stage = new LinkedHashMap<>();
+            stage.put("session", stages[i]);
+            if (stages[i + 1] != null) stage.put("graph", stages[i + 1]);
+            list.add(stage);
+        }
+        task.put("stages", list);
+        task.put("pos", pos);
+        task.put("n", n);
+        if (tokens != null) task.put("tokens", tokens);
+        if (hidden != null) task.put("hidden", hidden);
+        if (output != null) task.put("output", output);
+        return task;
+    }
+
+    @Test
+    public void chainFeedsEachStageIntoTheNext() throws Exception {
+        LlmTaskHandler handler = handler(4);
+        Map<String, Object> first = handler.handle(chain(0, Arrays.asList(3, 4), null, 2, null,
+                "a", graph("/a"), "b", graph("/b"), "c", graph("/c")));
+        assertArrayEquals(new float[]{12, 16}, LlmTaskHandler.decodeFloats((String) first.get("output")), 0f);
+        assertEquals(3, ((List<?>) first.get("infos")).size());
+        assertEquals(3, opened.size());
+
+        String hidden = LlmTaskHandler.encodeFloats(new float[]{1.5f});
+        Map<String, Object> second = handler.handle(chain(2, null, hidden, 1, null, "b", null, "c", null));
+        assertArrayEquals(new float[]{6f}, LlmTaskHandler.decodeFloats((String) second.get("output")), 0f);
+        assertEquals(3, ((Map<?, ?>) second.get("info")).get("position"));
+        assertEquals(2, opened.get(0).position);
+    }
+
+    @Test
+    public void chainSessionsMustBeOpenAfterPositionZero() throws Exception {
+        LlmTaskHandler handler = handler(4);
+        handler.handle(chain(0, Arrays.asList(1), null, 1, null, "a", graph("/a")));
+        try {
+            handler.handle(chain(1, Arrays.asList(1), null, 1, null, "a", null, "lost", null));
+            fail("expected lost-session error");
+        } catch (IllegalStateException expected) {
+            assertTrue(expected.getMessage().contains("not open on this worker"));
+        }
+    }
+
+    @Test
+    public void argmaxReturnsOnlyTheChosenToken() throws Exception {
+        LlmTaskHandler handler = handler(4);
+        String hidden = LlmTaskHandler.encodeFloats(new float[]{1f, 5f, -2f, 5f});
+        Map<String, Object> stepTask = step("s", 0, graph("/s"), null, hidden, 4);
+        stepTask.put("output", "argmax");
+        Map<String, Object> stepResult = handler.handle(stepTask);
+        assertEquals(1, stepResult.get("token"));
+        assertTrue(!stepResult.containsKey("output"));
+
+        Map<String, Object> chained = handler.handle(chain(0, null, hidden, 4, "argmax", "a", graph("/a"), "b", graph("/b")));
+        assertEquals(1, chained.get("token"));
+        assertTrue(!chained.containsKey("output"));
+        assertEquals(0, LlmTaskHandler.argmax(new float[]{Float.NEGATIVE_INFINITY, Float.NEGATIVE_INFINITY}));
+    }
 }

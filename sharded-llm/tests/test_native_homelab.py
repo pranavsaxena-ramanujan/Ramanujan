@@ -1,4 +1,4 @@
-"""HomelabStage speaks the /llm/step protocol; checked against a fake homelab server."""
+"""HomelabStage and HomelabChain speak the /llm/step and /llm/chain protocols; checked against a fake homelab."""
 import base64
 import json
 import os
@@ -11,7 +11,7 @@ import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from native_runner import HomelabStage  # noqa: E402
+from native_runner import HomelabChain, HomelabStage  # noqa: E402
 
 
 class _FakeHomelab(BaseHTTPRequestHandler):
@@ -24,7 +24,24 @@ class _FakeHomelab(BaseHTTPRequestHandler):
             self._reply(500, {"status": "ERROR", "error": "LLM session is not open on this worker"})
             return
         reply = {"status": "SUCCESS", "worker": "w1"}
-        if self.path == "/llm/step":
+        if self.path == "/llm/chain":
+            # Embedding copies token ids, every later stage doubles; the last stage is the head.
+            values = np.asarray(body["tokens"], "<f4")
+            infos = []
+            for stage in body["stages"]:
+                if body["pos"] > 0 and stage["session"] not in _FakeHomelab.opened:
+                    self._reply(500, {"status": "ERROR", "error": "LLM session is not open on this worker"})
+                    return
+                _FakeHomelab.opened.add(stage["session"])
+                if infos:
+                    values = values * 2
+                infos.append({"position": body["pos"] + body["n"], "last_step_ms": 1.5})
+            if body.get("output") == "argmax":
+                reply["token"] = int(np.argmax(values))
+            else:
+                reply["output"] = base64.b64encode(values.astype("<f4").tobytes()).decode("ascii")
+            reply.update(infos=infos, tasks=1, workers=["w1"])
+        elif self.path == "/llm/step":
             _FakeHomelab.opened.add(body["session"])
             if "hidden" in body:
                 values = np.frombuffer(base64.b64decode(body["hidden"]), "<f4") * 2
@@ -47,7 +64,7 @@ class _FakeHomelab(BaseHTTPRequestHandler):
         pass
 
 
-class HomelabStageTest(unittest.TestCase):
+class _FakeHomelabTest(unittest.TestCase):
     def setUp(self):
         _FakeHomelab.requests = []
         _FakeHomelab.opened = set()
@@ -60,6 +77,8 @@ class HomelabStageTest(unittest.TestCase):
         self.server.shutdown()
         self.server.server_close()
 
+
+class HomelabStageTest(_FakeHomelabTest):
     def test_graph_and_files_are_sent_only_when_opening(self):
         stage = HomelabStage(self.url, "shard-01", self.graph, 30)
         out = stage.step(hidden=np.array([[1, 2], [3, 4]], np.float32))
@@ -90,6 +109,40 @@ class HomelabStageTest(unittest.TestCase):
         _FakeHomelab.opened.clear()
         with self.assertRaisesRegex(RuntimeError, "not open on this worker"):
             stage.step(hidden=np.zeros((1, 2), np.float32))
+
+
+class HomelabChainTest(_FakeHomelabTest):
+    def _stages(self):
+        embed = dict(self.graph, hyper={"dim": 2}, embed={"file": "/m/shard-00/embed.bin"})
+        head = dict(self.graph, head={"output": {"file": "/m/shard-00/head.bin"}})
+        return [HomelabStage(self.url, "shard-00", embed, 30), HomelabStage(self.url, "shard-01", self.graph, 30),
+                HomelabStage(self.url, "shard-00", head, 30)]
+
+    def test_one_call_per_token_with_graphs_only_when_opening(self):
+        stages = self._stages()
+        chain = HomelabChain(stages)
+        logits = chain.step([1, 5, 2], logits=True)
+        np.testing.assert_array_equal(logits, [4, 20, 8])
+        self.assertEqual(chain.step([3]), 0)
+        (path, first), (_, second) = _FakeHomelab.requests
+        self.assertEqual(path, "/llm/chain")
+        self.assertEqual([s["affinity"] for s in first["stages"]], ["shard-00", "shard-01", "shard-00"])
+        self.assertEqual((first["pos"], first["n"], first["tokens"]), (0, 3, [1, 5, 2]))
+        self.assertNotIn("output", first)
+        self.assertEqual(first["stages"][1]["files"], ["/m/shard-01/w.bin"])
+        self.assertTrue(all("graph" in s for s in first["stages"]))
+        self.assertEqual((second["pos"], second["n"], second["output"]), (3, 1, "argmax"))
+        self.assertTrue(all(set(s) == {"affinity", "session"} for s in second["stages"]))
+        self.assertEqual([stage.position for stage in stages], [4, 4, 4])
+        self.assertEqual(stages[2].info()["last_step_ms"], 1.5)
+        self.assertEqual(chain.last, {"tasks": 1, "workers": ["w1"]})
+
+    def test_lost_worker_session_surfaces_as_error(self):
+        chain = HomelabChain(self._stages())
+        chain.step([1])
+        _FakeHomelab.opened.clear()
+        with self.assertRaisesRegex(RuntimeError, "not open on this worker"):
+            chain.step([2])
 
 
 if __name__ == "__main__":

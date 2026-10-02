@@ -1,10 +1,12 @@
 """Pipeline execution of a sharded GGUF model on the native LLM runtime (libramanujan_llm).
 
 Consecutive pieces (embedding, layers, head) on the same shard form one stage. Locally every
-stage is an in-process NativeStage; with --homelab each stage call is POSTed to `rj homelab`
-(/llm/step), whose `rj worker` for that shard keeps the stage session (weights, KV cache and
-recurrent state) alive between tokens, so only token ids and one hidden vector per token
-cross the network.
+stage is an in-process NativeStage. With --homelab the `rj worker` that owns a stage's shard
+keeps the stage session (weights, KV cache and recurrent state) alive between tokens, so only
+token ids and one hidden vector per token cross the network. A token goes through all stages
+in one /llm/chain call: the homelab hands consecutive stages owned by the same worker to that
+worker as a single task, and the head returns only the chosen token unless the logits are
+needed. --check-layers needs every hidden state, so it calls /llm/step once per stage.
 """
 import base64
 import json
@@ -19,6 +21,20 @@ from converter.ramanujan_shards.llm_graph import graph_files, plan_stages, stage
 from converter.ramanujan_shards.llm_package import load_model_from_args
 from converter.ramanujan_shards.llm_tokenizer import load_tokenizer
 from converter.ramanujan_shards.native_llm import NativeStage
+
+
+def _post(url, route, body, timeout):
+    request = urllib.request.Request(url + route, json.dumps(body).encode("utf-8"),
+                                     {"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            payload = json.loads(response.read() or b"{}")
+    except urllib.error.HTTPError as error:
+        detail = error.read().decode("utf-8", "replace")
+        raise RuntimeError("homelab {0} failed with HTTP {1}: {2}".format(route, error.code, detail)) from None
+    if payload.get("status") != "SUCCESS":
+        raise RuntimeError("homelab {0} failed: {1}".format(route, payload.get("error", payload)))
+    return payload
 
 
 class HomelabStage:
@@ -37,17 +53,15 @@ class HomelabStage:
         self.last = {}
 
     def _post(self, route, body):
-        request = urllib.request.Request(self.url + route, json.dumps(body).encode("utf-8"),
-                                         {"Content-Type": "application/json"})
-        try:
-            with urllib.request.urlopen(request, timeout=self.timeout) as response:
-                payload = json.loads(response.read() or b"{}")
-        except urllib.error.HTTPError as error:
-            detail = error.read().decode("utf-8", "replace")
-            raise RuntimeError("homelab {0} failed with HTTP {1}: {2}".format(route, error.code, detail)) from None
-        if payload.get("status") != "SUCCESS":
-            raise RuntimeError("homelab {0} failed: {1}".format(route, payload.get("error", payload)))
-        return payload
+        return _post(self.url, route, body, self.timeout)
+
+    def request(self):
+        """This stage's part of a /llm/chain body; the graph and files go only with position 0."""
+        stage = {"affinity": self.shard_id, "session": self.session}
+        if self.position == 0:
+            stage["graph"] = self.graph
+            stage["files"] = graph_files(self.graph)
+        return stage
 
     def step(self, tokens=None, hidden=None):
         body = {"affinity": self.shard_id, "session": self.session, "pos": self.position,
@@ -84,6 +98,38 @@ class HomelabStage:
             pass
 
 
+class HomelabChain:
+    """Runs one token through every HomelabStage with a single /llm/chain call."""
+
+    def __init__(self, stages):
+        self.stages = stages
+        self.url = stages[0].url
+        self.timeout = stages[0].timeout
+        self.last = {}
+
+    def step(self, tokens, logits=False):
+        """Returns the head's logits when `logits` is set, otherwise only the chosen token id."""
+        n = len(tokens)
+        body = {"stages": [stage.request() for stage in self.stages],
+                "tokens": [int(token) for token in tokens], "n": n, "pos": self.stages[0].position,
+                "timeout": int(self.timeout)}
+        if not logits:
+            body["output"] = "argmax"
+        payload = _post(self.url, "/llm/chain", body, self.timeout)
+        for stage, info in zip(self.stages, payload.get("infos", [])):
+            stage.last = {"info": info}
+            stage.position += n
+        self.last = {key: payload[key] for key in ("tasks", "workers") if key in payload}
+        if logits:
+            return np.frombuffer(base64.b64decode(payload["output"]), "<f4")
+        return int(payload["token"])
+
+
+def on_chain(plan):
+    """A chain needs the whole model: it starts from token ids and ends at the head."""
+    return bool(plan) and plan[0]["embed"] and plan[-1]["head"]
+
+
 class NativeGgufRunner:
     """Drop-in for GgufRunner (forward/head/close) backed by the native runtime."""
 
@@ -111,10 +157,13 @@ class NativeGgufRunner:
                                   "layers": stage["layers"], "head": stage["head"],
                                   "seconds": round(time.monotonic() - started, 2),
                                   "weights": info.get("weights"), "device": info.get("device")}), flush=True)
+        self.chain = HomelabChain(self.stages) if args.homelab and on_chain(self.plan) else None
         self.position = 0
         self.logits = None
 
     def forward(self, tokens, on_layer=None):
+        if self.chain is not None and on_layer is None:
+            return self._forward_chain(tokens)
         hidden = None
         for stage, executor in zip(self.plan, self.stages):
             started = time.monotonic()
@@ -141,7 +190,30 @@ class NativeGgufRunner:
         self.position += len(tokens)
         return [self.logits]
 
+    def _forward_chain(self, tokens):
+        # Only --reference-token needs logits, and only for the first generated token.
+        want_logits = bool(self.args.reference_token) and self.position == 0
+        started = time.monotonic()
+        out = self.chain.step(tokens, logits=want_logits)
+        if self.args.verbose:
+            for stage, executor in zip(self.plan, self.stages):
+                info = executor.info()
+                print(json.dumps({"event": "stage", "shard": self.shards[stage["shard"]]["id"],
+                                  "layers": stage["layers"], "tokens": len(tokens),
+                                  "deviceMs": round(info.get("last_step_ms", 0), 1),
+                                  "loadWaitMs": round(info.get("last_wait_ms", 0), 1)}), flush=True)
+            print(json.dumps({"event": "chain", "tokens": len(tokens),
+                              "seconds": round(time.monotonic() - started, 3),
+                              "tasks": self.chain.last.get("tasks"),
+                              "workers": self.chain.last.get("workers")}), flush=True)
+        self.position += len(tokens)
+        self.logits = out if want_logits else None
+        return [out]
+
     def head(self, logits):
+        if isinstance(logits, int):
+            # The homelab chain already picked the token.
+            return logits, None
         if logits is None:
             raise ValueError("the stage plan has no output head")
         # Lowest index on ties, matching numpy.argmax.

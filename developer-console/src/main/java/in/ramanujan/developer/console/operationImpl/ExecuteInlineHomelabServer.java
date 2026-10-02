@@ -478,6 +478,7 @@ public class ExecuteInlineHomelabServer extends ExecuteInline {
         createdServer.createContext("/orchestrator/uploadBinary", this::handleUploadBinary);
         createdServer.createContext("/llm/step",          ex -> handleLlm(ex, "step"));
         createdServer.createContext("/llm/close",         ex -> handleLlm(ex, "close"));
+        createdServer.createContext("/llm/chain",         this::handleLlmChain);
         createdServer.setExecutor(Executors.newCachedThreadPool());
         createdServer.start();
         System.err.println("[Homelab] HTTP server listening on :" + port);
@@ -519,9 +520,10 @@ public class ExecuteInlineHomelabServer extends ExecuteInline {
 
     /**
      * Native LLM stage call from a pipeline driver (sharded-llm native_runner.py). The body is
-     * {affinity, session, graph?, files?, tokens | hidden (base64 float32), n, pos}; it becomes a
+     * {affinity, session, graph?, files?, tokens | hidden (base64 float32), n, pos, output?}; it becomes a
      * task for the worker owning {@code affinity}, which keeps the stage session between calls.
-     * Blocks until the worker reports and returns {status, output (base64 float32), info, worker}.
+     * Blocks until the worker reports and returns {status, output (base64 float32) | token (output "argmax"),
+     * info, worker}.
      */
     @SuppressWarnings("unchecked")
     private void handleLlm(HttpExchange ex, String op) throws IOException {
@@ -540,23 +542,8 @@ public class ExecuteInlineHomelabServer extends ExecuteInline {
             }
             req.remove("files");
             req.put("op", op);
-            long timeoutSeconds = req.get("timeout") instanceof Number ? ((Number) req.get("timeout")).longValue() : 1800;
-            String taskUuid = UUID.randomUUID().toString();
-            Map<String, Object> data = new LinkedHashMap<>();
-            data.put("uuid", taskUuid);
-            data.put("llm", req);
-            Map<String, Object> envelope = new LinkedHashMap<>();
-            envelope.put("status", "SUCCESS");
-            envelope.put("data", data);
-            CompletableFuture<Map<String, Object>> done = new CompletableFuture<>();
-            PendingTask task = new PendingTask(taskUuid, null, null, MAPPER.writeValueAsString(envelope), done);
-            inflight.put(taskUuid, task);
-            taskQueue.add(task, String.valueOf(affinity));
-            Map<String, Object> payload;
-            try {
-                payload = done.get(timeoutSeconds, TimeUnit.SECONDS);
-            } catch (TimeoutException e) {
-                inflight.remove(taskUuid);
+            Map<String, Object> payload = runLlmTask(req, String.valueOf(affinity), llmTimeoutSeconds(req));
+            if (payload == null) {
                 sendJson(ex, 504, "{\"status\":\"ERROR\",\"error\":\"no worker completed the llm task in time\"}");
                 return;
             }
@@ -575,6 +562,136 @@ public class ExecuteInlineHomelabServer extends ExecuteInline {
             result.put("status", "ERROR");
             result.put("error", e.getMessage() != null ? e.getMessage() : e.toString());
             sendJson(ex, 500, MAPPER.writeValueAsString(result));
+        }
+    }
+
+    /**
+     * One token through a run of pipeline stages:
+     * {stages: [{affinity, session, graph?, files?}], tokens | hidden, n, pos, output?, timeout?}.
+     * Consecutive stages whose affinities are already owned by the same worker go out as a single
+     * chain task, so that worker runs them back to back without a network round trip in between.
+     * Stages with no owner yet go out alone, which lets the queue place them as it does for /llm/step.
+     * The hidden state between groups is forwarded as the base64 string the worker returned.
+     * With output "argmax" the last group returns only the chosen token id.
+     * Returns {status, token | output, infos (one per stage), tasks, workers}.
+     */
+    @SuppressWarnings("unchecked")
+    private void handleLlmChain(HttpExchange ex) throws IOException {
+        Map<String, Object> result = new LinkedHashMap<>();
+        try {
+            Map<String, Object> req = MAPPER.readValue(readAllBytes(ex.getRequestBody()), Map.class);
+            List<Map<String, Object>> stages = req.get("stages") instanceof List
+                    ? (List<Map<String, Object>>) req.get("stages") : null;
+            if (stages == null || stages.isEmpty()) {
+                sendJson(ex, 400, "{\"status\":\"ERROR\",\"error\":\"stages are required\"}");
+                return;
+            }
+            for (Map<String, Object> stage : stages) {
+                if (stage.get("affinity") == null || stage.get("session") == null) {
+                    sendJson(ex, 400, "{\"status\":\"ERROR\",\"error\":\"every stage needs affinity and session\"}");
+                    return;
+                }
+                if (stage.get("files") instanceof List) {
+                    for (Object file : (List<Object>) stage.get("files")) {
+                        if (file instanceof String && new File((String) file).isFile()) fetchableBinaryFiles.add((String) file);
+                    }
+                }
+            }
+            long timeoutSeconds = llmTimeoutSeconds(req);
+            Object tokens = req.get("tokens");
+            Object hidden = req.get("hidden");
+            List<Object> infos = new ArrayList<>();
+            List<Object> workers = new ArrayList<>();
+            Map<String, Object> last = null;
+            int tasks = 0;
+            int i = 0;
+            while (i < stages.size()) {
+                int end = groupEnd(stages, i, taskQueue.owners());
+                List<Map<String, Object>> group = new ArrayList<>();
+                for (Map<String, Object> stage : stages.subList(i, end)) {
+                    Map<String, Object> s = new LinkedHashMap<>();
+                    s.put("session", stage.get("session"));
+                    if (stage.get("graph") != null) s.put("graph", stage.get("graph"));
+                    group.add(s);
+                }
+                Map<String, Object> task = new LinkedHashMap<>();
+                task.put("op", "chain");
+                task.put("stages", group);
+                if (tokens != null) task.put("tokens", tokens);
+                if (hidden != null) task.put("hidden", hidden);
+                task.put("n", req.get("n"));
+                task.put("pos", req.get("pos"));
+                if (end == stages.size() && req.get("output") != null) task.put("output", req.get("output"));
+                Map<String, Object> payload = runLlmTask(task, String.valueOf(stages.get(i).get("affinity")), timeoutSeconds);
+                tasks++;
+                if (payload == null) {
+                    sendJson(ex, 504, "{\"status\":\"ERROR\",\"error\":\"no worker completed the llm chain task for stage "
+                            + i + " in time\"}");
+                    return;
+                }
+                if (payload.get("error") != null) {
+                    result.put("status", "ERROR");
+                    result.put("error", payload.get("error"));
+                    result.put("stage", i);
+                    result.put("worker", payload.get("hostId"));
+                    sendJson(ex, 500, MAPPER.writeValueAsString(result));
+                    return;
+                }
+                last = payload.get("data") instanceof Map ? (Map<String, Object>) payload.get("data") : new LinkedHashMap<>();
+                if (last.get("infos") instanceof List) infos.addAll((List<Object>) last.get("infos"));
+                workers.add(payload.get("hostId"));
+                tokens = null;
+                hidden = last.get("output");
+                i = end;
+            }
+            result.put("status", "SUCCESS");
+            if (last.containsKey("token")) result.put("token", last.get("token"));
+            if (last.containsKey("output")) result.put("output", last.get("output"));
+            result.put("infos", infos);
+            result.put("tasks", tasks);
+            result.put("workers", workers);
+            sendJson(ex, 200, MAPPER.writeValueAsString(result));
+        } catch (Exception e) {
+            result.put("status", "ERROR");
+            result.put("error", e.getMessage() != null ? e.getMessage() : e.toString());
+            sendJson(ex, 500, MAPPER.writeValueAsString(result));
+        }
+    }
+
+    /**
+     * End (exclusive) of the group starting at {@code start}: following stages join while their affinity is
+     * owned by the same worker as the first. A stage without an owner is always a group of its own.
+     */
+    static int groupEnd(List<Map<String, Object>> stages, int start, Map<String, String> owners) {
+        String owner = owners.get(String.valueOf(stages.get(start).get("affinity")));
+        int end = start + 1;
+        if (owner == null) return end;
+        while (end < stages.size() && owner.equals(owners.get(String.valueOf(stages.get(end).get("affinity"))))) end++;
+        return end;
+    }
+
+    private static long llmTimeoutSeconds(Map<String, Object> req) {
+        return req.get("timeout") instanceof Number ? ((Number) req.get("timeout")).longValue() : 1800;
+    }
+
+    /** Queues one llm task for the worker owning {@code affinity}; returns its /task/complete payload, or null on timeout. */
+    private Map<String, Object> runLlmTask(Map<String, Object> llm, String affinity, long timeoutSeconds) throws Exception {
+        String taskUuid = UUID.randomUUID().toString();
+        Map<String, Object> data = new LinkedHashMap<>();
+        data.put("uuid", taskUuid);
+        data.put("llm", llm);
+        Map<String, Object> envelope = new LinkedHashMap<>();
+        envelope.put("status", "SUCCESS");
+        envelope.put("data", data);
+        CompletableFuture<Map<String, Object>> done = new CompletableFuture<>();
+        PendingTask task = new PendingTask(taskUuid, null, null, MAPPER.writeValueAsString(envelope), done);
+        inflight.put(taskUuid, task);
+        taskQueue.add(task, affinity);
+        try {
+            return done.get(timeoutSeconds, TimeUnit.SECONDS);
+        } catch (TimeoutException e) {
+            inflight.remove(taskUuid);
+            return null;
         }
     }
 
