@@ -1,5 +1,7 @@
 package in.ramanujan.developer.console.operationImpl;
 
+import in.ramanujan.devices.common.DeviceOrchestratorClient;
+
 import com.sun.net.httpserver.HttpServer;
 import org.junit.Test;
 import java.io.*;
@@ -66,21 +68,15 @@ public class PrivateRoomWorkerTest {
         gateway.createContext("/worker/test_bearer/orchestrator/uploadBinary", handler);
         gateway.createContext("/orchestrator/uploadBinary", handler);
         gateway.start();
-        Path root = Paths.get("target", "private-room-test", UUID.randomUUID().toString());
-        Files.createDirectories(root);
-        Path file = root.resolve("array.bin"); Files.write(file, new byte[]{1, 2, 3});
-        ExecuteInlineWorker worker = new ExecuteInlineWorker();
-        try {
-            java.lang.reflect.Method upload = ExecuteInlineWorker.class.getDeclaredMethod(
-                    "uploadBinaryFile", String.class, String.class, String.class, String.class);
-            upload.setAccessible(true);
-            String server = "http://127.0.0.1:" + gateway.getAddress().getPort();
-            upload.invoke(worker, server + "/worker/test_bearer", "task-1", "array-1", file.toString());
-            upload.invoke(worker, server, "task-1", "array-1", file.toString());
+        String server = "http://127.0.0.1:" + gateway.getAddress().getPort();
+        try (DeviceOrchestratorClient scoped = new DeviceOrchestratorClient(server + "/worker/test_bearer");
+             DeviceOrchestratorClient legacy = new DeviceOrchestratorClient(server)) {
+            scoped.uploadBinary("task-1", "array-1", new byte[]{1, 2, 3});
+            legacy.uploadBinary("task-1", "array-1", new byte[]{1, 2, 3});
             assertEquals("/worker/test_bearer/orchestrator/uploadBinary?uuid=task-1&arrayId=array-1", requests.get(0));
             assertEquals("/orchestrator/uploadBinary?uuid=task-1&arrayId=array-1", requests.get(1));
         } finally {
-            worker.stop(); gateway.stop(0); Files.deleteIfExists(file); Files.deleteIfExists(root);
+            gateway.stop(0);
         }
     }
 

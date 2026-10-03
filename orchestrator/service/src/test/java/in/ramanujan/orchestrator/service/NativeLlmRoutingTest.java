@@ -217,6 +217,7 @@ public class NativeLlmRoutingTest {
     }
 
     @Test
+    @SuppressWarnings("unchecked")
     public void plannedTaskStaysOnItsCapacityHostAfterReloadingTheQueuedRow() throws Exception {
         try (Fixture f = new Fixture()) {
             in.ramanujan.db.layer.utils.CapacityStore store = new in.ramanujan.db.layer.utils.CapacityStore();
@@ -225,6 +226,13 @@ public class NativeLlmRoutingTest {
             inject(real, "store", store);
             CapacityDao capacity = spy(real);
             doReturn(true).when(capacity).enabled();
+            // Slow plan bookkeeping exposes a result published before the stage is marked closed.
+            doAnswer(call -> {
+                Future<Void> delayed = Future.future();
+                f.vertx.setTimer(300L, timer -> real.completed(call.getArgument(0), call.getArgument(1),
+                        call.getArgument(2), call.<Boolean>getArgument(3)).setHandler(delayed));
+                return delayed;
+            }).when(capacity).completed(anyString(), anyString(), anyList(), anyBoolean());
             inject(f.hosts, "capacityDao", capacity);
             inject(f.llm, "capacityDao", capacity);
             String binding = NativeLlmService.binding("A", "shard", "s");
@@ -242,8 +250,11 @@ public class NativeLlmRoutingTest {
             // Reserved hosts are hidden from unpinned work, so only the pinned host may take it.
             AsyncTask task = f.poll("b", "A");
             assertEquals("b", task.getHostAssigned());
-            f.finish(task, "b", "A", map("closed", true));
+            Future<Void> finished = f.complete.completeTask("b", task.getUuid(), map("closed", true), "A");
             assertNull(await(close).get("error"));
+            // The submitter releases right after the close result; the stage must already be closed.
+            await(capacity.release("A", "plan"));
+            await(finished);
         }
     }
 

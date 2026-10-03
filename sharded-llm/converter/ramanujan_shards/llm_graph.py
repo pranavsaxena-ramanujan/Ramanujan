@@ -50,31 +50,6 @@ def plan_stages(spec, tensors, last_layer=None, split=False):
     return stages
 
 
-def coalesce_stages(stages, max_stages):
-    """Bound canonical sessions before admission, keeping every decoder layer whole.
-
-    A group can read files from several canonical shards; its first shard is only
-    an affinity label. Grouping precedes graph generation and reservation, so no
-    returned plan identity or graph needs rebinding.
-    """
-    if isinstance(max_stages, bool) or not isinstance(max_stages, int) or max_stages < 0:
-        raise ValueError("capacity max stages must be a nonnegative integer")
-    if not max_stages or len(stages) <= max_stages:
-        return stages
-    groups = []
-    previous = None
-    for index, piece in enumerate(stages):
-        bucket = index * max_stages // len(stages)
-        if bucket != previous:
-            groups.append({"shard": piece["shard"], "embed": False, "layers": [], "head": False})
-            previous = bucket
-        group = groups[-1]
-        group["embed"] = group["embed"] or piece["embed"]
-        group["layers"].extend(piece["layers"])
-        group["head"] = group["head"] or piece["head"]
-    return groups
-
-
 def hyper(spec):
     return {"architecture": spec.architecture, "dim": spec.dim, "vocab": spec.vocab, "eps": spec.eps,
             "heads": spec.heads, "kv_heads": spec.kv_heads, "head_dim": spec.head_dim,

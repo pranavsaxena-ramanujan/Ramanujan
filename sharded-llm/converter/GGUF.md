@@ -45,12 +45,10 @@ individual decoder layers, and the head from this canonical layout at run time, 
 chain multiple adjacent stages on one device. It also accepts existing grouped
 packages, preserving their coarse stage graphs. Fine-grained execution graphs
 do not duplicate the canonical tensor files.
-Canonical pieces are coalesced before admission into at most eight sessions
-by default, so a 65-block package does not require 65 live sessions per device.
-`--capacity-max-stages N` controls this bound; `0` requests every piece
-separately. This groups execution graphs, not artifact files, and requires no
-second GGUF conversion.
-See [../NATIVE_LLM.md](../NATIVE_LLM.md#capacity-aware-placement-opt-in).
+The orchestrator merges each device's contiguous pieces into one session, so a
+65-block package does not require 65 live sessions per device. This groups
+execution graphs, not artifact files, and requires no second GGUF conversion.
+See [../../ORCHESTRATION.md](../../ORCHESTRATION.md).
 
 On an individual device, add `--shard-index 1` (zero-based) to fetch only that
 device's assigned shard from the URL and store it at `--output-dir`. Run the

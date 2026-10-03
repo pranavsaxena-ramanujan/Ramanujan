@@ -2,6 +2,7 @@ package in.ramanujan.developer.console.operationImpl;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.sun.net.httpserver.HttpServer;
+import in.ramanujan.devices.common.WorkerCapacity;
 import org.junit.Test;
 
 import java.io.IOException;
@@ -141,7 +142,7 @@ public class WorkerCapacityTest {
             assertEquals(false, payload.get().get("supportsRuntime"));
             assertNull(payload.get().get("gpuAllocatedBytes"));
             assertEquals(1, probes.get());
-            assertEquals("worker-capacity", probeThread.get());
+            assertEquals("device-capacity-ping", probeThread.get());
         } finally {
             worker.stop();
             release.countDown();

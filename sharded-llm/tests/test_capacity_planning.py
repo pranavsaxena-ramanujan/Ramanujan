@@ -1,6 +1,5 @@
 """Capacity admission tests use only local fixture files and mocked HTTP/native calls."""
 import copy
-import math
 import sys
 import tempfile
 import unittest
@@ -15,7 +14,7 @@ from native_runner import HomelabChain, HomelabStage, NativeGgufRunner  # noqa: 
 from converter.ramanujan_shards.llm_capacity import (  # noqa: E402
     describe_placement,
     UPLOAD_STAGING_BYTES, stage_capacity, validate_placement, validate_plan)
-from converter.ramanujan_shards.llm_graph import coalesce_stages, plan_stages, stage_graph  # noqa: E402
+from converter.ramanujan_shards.llm_graph import plan_stages, stage_graph  # noqa: E402
 from converter.ramanujan_shards.llm_spec import QUANT, build_spec  # noqa: E402
 from test_llm_programs import _Model, _attention_layout, _globals, _hyper  # noqa: E402
 from run_gguf_shards import main, parse_args  # noqa: E402
@@ -182,8 +181,7 @@ class CapacityRunnerTest(_CapacityFixture):
     def _args(self, **overrides):
         args = dict(capacity_aware=True, homelab="http://fixture.invalid/", timeout=1,
                     stop_after_layer=None, check_layers=None, max_context=128, weights="auto",
-                    stream_depth=2, stream_threads=2, verbose=False, reference_token=False,
-                    capacity_max_stages=8)
+                    stream_depth=2, stream_threads=2, verbose=False, reference_token=False)
         args.update(overrides)
         return SimpleNamespace(**args)
 
@@ -193,6 +191,13 @@ class CapacityRunnerTest(_CapacityFixture):
 
     def _post(self, url, route, body, timeout):
         self.requests.append((route, copy.deepcopy(body)))
+        if route == "/llm/plan" and body.get("placement") == "vram":
+            stages = body["stages"]
+            groups = getattr(self, "vram_groups", None) or [
+                (index, index + 1, "host-{0}".format(index // getattr(self, "host_group_size", 2)),
+                 "stream" if index % 2 else "resident") for index in range(len(stages))]
+            return {"status": "SUCCESS", "planId": "plan-1",
+                    "stages": [_merged(stages, *group) for group in groups]}
         if route == "/llm/plan":
             return {"status": "SUCCESS", "planId": "plan-1", "stages": [
                 {"affinity": stage["affinity"], "session": stage["session"],
@@ -225,7 +230,7 @@ class CapacityRunnerTest(_CapacityFixture):
         runner = self._runner()
         self.assertEqual([route for route, _ in self.requests], ["/llm/plan"])
         route, body = self.requests[0]
-        self.assertEqual(set(body), {"stages", "weights"})
+        self.assertEqual(set(body), {"stages", "weights", "placement"})
         self.assertEqual(len(body["stages"]), 4)
         self.assertEqual(len({s["affinity"] for s in body["stages"]}), 4)
         self.assertEqual(len({s["session"] for s in body["stages"]}), 4)
@@ -294,102 +299,10 @@ class CapacityRunnerTest(_CapacityFixture):
         self.assertEqual([route for route, _ in self.requests].count("/llm/close"), 4)
         self.assertTrue(runner.closed)
 
-    def test_stream_request_has_no_combined_cluster_weight_limit(self):
-        # A sparse, multi-GB embedding does not enter RAM and is read one row at a time.
-        tensor = self.model.tensors["token_embd.weight"]
-        tensor["shape"][0] = 1 << 24
-        tensor["bytes"] = (1 << 24) * 64 * 4
-        with tensor["file"].open("r+b") as stream:
-            stream.truncate(tensor["bytes"])
-        self.spec.vocab = 1 << 24
-        runner = self._runner(weights="stream", stop_after_layer=1)
-        body = self.requests[0][1]
-        self.assertEqual(body["weights"], "stream")
-        self.assertGreater(sum(s["weightBytes"] for s in body["stages"]), 4 << 30)
-        self.assertLess(sum(s["streamWorkingBytes"] + s["scratchBytes"] + s["stateBytes"]
-                            for s in body["stages"]), 1 << 30)
-        self.assertLess(body["stages"][0]["maxAllocationBytes"], 1 << 20)
-        self.assertTrue(all(stage.graph["weights"] == "stream" for stage in runner.stages))
-        runner.close()
-
-    def test_complete_model_can_exceed_two_devices_while_each_stream_stage_fits(self):
-        # Admission is mocked: this checks the driver's contract, not idle-buffer
-        # reuse in the native runtime. Sparse files never materialize full weights.
-        layout = _globals(4096, 32768)
-        for index in range(65):
-            layout.update(_attention_layout(index, 4096, 32, 8, 128, 11008))
-        tensors = {}
-        for name, (shape, _) in layout.items():
-            path = self.root / (name + ".bin")
-            size = 4 * math.prod(shape)
-            with path.open("wb") as stream:
-                stream.truncate(size)
-            tensors[name] = {"file": path, "shape": shape, "encoding": "gguf-f32",
-                             "bytes": size, "shard": 0}
-        metadata = {"general.architecture": "llama"}
-        metadata.update({"llama." + name: value for name, value in _hyper(4096, 32, 8, 65).items()})
-        self.model = SimpleNamespace(tensors=tensors, metadata=metadata)
-        self.spec = build_spec(metadata, tensors)
-        self.host_group_size = 4
-        runner = self._runner(weights="stream", stream_depth=1, stream_threads=1)
-        body = self.requests[0][1]
-        self.assertEqual(len(body["stages"]), 8)
-        self.assertGreater(sum(stage["weightBytes"] for stage in body["stages"]), 16 << 30)
-        working = [stage["streamWorkingBytes"] + stage["stateBytes"] + stage["scratchBytes"]
-                   for stage in body["stages"]]
-        self.assertLess(sum(working), 16 << 30)
-        for host in {stage.host_id for stage in runner.stages}:
-            self.assertLess(sum(size for size, stage in zip(working, runner.stages)
-                                if stage.host_id == host), 8 << 30)
-        self.assertTrue(runner.plan[0]["embed"])
-        self.assertTrue(runner.plan[-1]["head"])
-        self.assertEqual(len({stage.host_id for stage in runner.stages}), 2)
-        self.assertEqual(self.requests[0][0], "/llm/plan")
-        runner.close()
-
-    def test_canonical_65_layer_package_is_reserved_as_at_most_eight_sessions(self):
-        self.model = self._model(layers=65)
-        for name, tensor in self.model.tensors.items():
-            tensor["shard"] = (int(name.split(".")[1]) if name.startswith("blk.")
-                               else 0 if name == "token_embd.weight" else 64)
-        self.spec = build_spec(self.model.metadata, self.model.tensors)
-        self.host_group_size = 99
-        shards = [{"id": "shard-" + str(index), "artifactLayout": "per-layer"} for index in range(65)]
-        with patch.object(self, "_load", return_value=(self.spec, shards, self.model.tensors, self.model.metadata)):
-            runner = self._runner(weights="stream", stream_depth=1, stream_threads=1)
-        requested = self.requests[0][1]["stages"]
-        self.assertEqual(len(requested), 8)
-        layers = [layer["index"] for stage in requested for layer in stage["graph"]["layers"]]
-        self.assertEqual(layers, list(range(65)))
-        self.assertIn("embed", requested[0]["graph"])
-        self.assertIn("head", requested[-1]["graph"])
-        self.assertEqual(len({stage.host_id for stage in runner.stages}), 1)
-        self.assertEqual(runner.forward([1]), [7])
-        runner.close()
-        self.assertEqual([route for route, _ in self.requests].count("/llm/close"), 8)
-
-    def test_check_layers_keeps_individual_graphs_even_with_grouping_limit(self):
-        runner = self._runner(check_layers=2, capacity_max_stages=1)
+    def test_check_layers_keeps_individual_graphs(self):
+        runner = self._runner(check_layers=2)
         self.assertEqual(len(self.requests[0][1]["stages"]), 4)
         self.assertTrue(all(len(stage.graph["layers"]) <= 1 for stage in runner.stages))
-        runner.close()
-
-    def test_grouping_is_configurable_and_never_changes_reserved_bindings(self):
-        fine = plan_stages(self.spec, self.model.tensors, split=True)
-        self.assertEqual(coalesce_stages(fine, 0), fine)
-        for limit in (-1, True, None):
-            with self.subTest(limit=limit), self.assertRaises(ValueError):
-                coalesce_stages(fine, limit)
-        grouped = coalesce_stages(fine, 1)
-        self.assertEqual(len(grouped), 1)
-        self.assertEqual(grouped[0]["layers"], [0, 1])
-        runner = self._runner(weights="stream", capacity_max_stages=1)
-        self.assertEqual(len(self.requests[0][1]["stages"]), 1)
-        runner.forward([1])
-        reserved = self.requests[0][1]["stages"][0]
-        executed = self.requests[1][1]["stages"][0]
-        self.assertEqual((executed["affinity"], executed["session"]),
-                         (reserved["affinity"], reserved["session"]))
         runner.close()
 
     def test_default_does_not_call_plan_or_release_and_preserves_stage_grouping(self):
@@ -401,11 +314,12 @@ class CapacityRunnerTest(_CapacityFixture):
         self.assertEqual([route for route, _ in self.requests], ["/llm/close"])
         self.assertNotIn("planId", self.requests[0][1])
 
-    def test_grouped_package_keeps_coarse_graphs_under_capacity_opt_in(self):
+    def test_grouped_package_is_placed_by_orchestrator_as_whole_layers(self):
         loaded = (self.spec, [{"id": "shard-00"}], self.model.tensors, self.model.metadata)
+        self.vram_groups = [(0, 4, "host-0", "resident")]
         with patch.object(self, "_load", return_value=loaded):
             runner = self._runner()
-        self.assertEqual(len(self.requests[0][1]["stages"]), 1)
+        self.assertEqual(len(self.requests[0][1]["stages"]), 4)
         self.assertEqual(len(runner.stages), 1)
         graph = runner.stages[0].graph
         self.assertIn("embed", graph)
@@ -547,7 +461,7 @@ class VramRunnerTest(_CapacityFixture):
 
     def test_orchestrator_places_pieces_and_runner_opens_one_session_per_run(self):
         self.groups = [(0, 3, "big", "resident"), (3, 4, "small", "stream")]
-        runner = self._runner(capacity_placement="vram")
+        runner = self._runner()
         self.assertEqual([route for route, _ in self.requests], ["/llm/plan"])
         body = self.requests[0][1]
         self.assertEqual(body["placement"], "vram")
@@ -570,7 +484,7 @@ class VramRunnerTest(_CapacityFixture):
     def test_dry_run_prints_shards_without_reserving_or_opening(self):
         self.groups = [(0, 4, "big", "resident")]
         with patch("builtins.print") as printed, self.assertRaises(SystemExit):
-            self._runner(capacity_placement="vram", capacity_dry_run=True)
+            self._runner(capacity_dry_run=True)
         self.assertEqual([route for route, _ in self.requests], ["/llm/plan"])
         self.assertTrue(self.requests[0][1]["dryRun"])
         self.assertIn("capacity-placement", printed.call_args.args[0])
@@ -579,7 +493,7 @@ class VramRunnerTest(_CapacityFixture):
     def test_no_fitting_device_fails_before_opening(self):
         self.groups = None
         with self.assertRaisesRegex(RuntimeError, "lack fresh capacity"):
-            self._runner(capacity_placement="vram")
+            self._runner()
         self.assertEqual([route for route, _ in self.requests], ["/llm/plan"])
 
     def test_unexpected_graph_is_rejected_before_opening(self):
@@ -591,7 +505,7 @@ class VramRunnerTest(_CapacityFixture):
             result["graph"]["max_context"] = 1
             return result
         with patch(__name__ + "._merged", side_effect=tampered), self.assertRaisesRegex(RuntimeError, "unexpected graph"):
-            self._runner(capacity_placement="vram")
+            self._runner()
         self.assertEqual([route for route, _ in self.requests], ["/llm/plan"])
 
 
@@ -627,12 +541,12 @@ class PlanValidationTest(unittest.TestCase):
         with patch.object(sys, "argv", common + ["--runtime", "native"]):
             args = parse_args()
             self.assertFalse(args.capacity_aware)
-            self.assertEqual(args.capacity_max_stages, 8)
         with patch.object(sys, "argv", common + ["--capacity-aware", "--runtime", "native",
                                                "--homelab", "http://fixture.invalid"]):
             self.assertTrue(parse_args().capacity_aware)
         for extra in (["--runtime", "native"], ["--runtime", "dsl", "--work-dir", "fixture",
-                                              "--homelab", "http://fixture.invalid"]):
+                                              "--homelab", "http://fixture.invalid"],
+                      ["--runtime", "native", "--homelab", "http://fixture.invalid", "--weights", "stream"]):
             with patch.object(sys, "argv", common + ["--capacity-aware"] + extra), \
                     patch("sys.stderr"), self.assertRaises(SystemExit):
                 parse_args()

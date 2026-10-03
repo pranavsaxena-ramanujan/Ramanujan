@@ -5,8 +5,8 @@ import android.content.*;
 import android.content.pm.ServiceInfo;
 import android.os.*;
 import in.ramanujan.cluster.client.common.JoinClient;
+import in.ramanujan.devices.common.WorkerCapacity;
 import in.ramanujan.developer.console.operationImpl.ExecuteInlineWorker;
-import in.ramanujan.developer.console.operationImpl.WorkerCapacity;
 import java.util.Arrays;
 import java.util.concurrent.*;
 

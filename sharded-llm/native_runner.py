@@ -18,7 +18,7 @@ import uuid
 
 import numpy as np
 
-from converter.ramanujan_shards.llm_graph import coalesce_stages, graph_files, plan_stages, stage_graph
+from converter.ramanujan_shards.llm_graph import graph_files, plan_stages, stage_graph
 from converter.ramanujan_shards.llm_capacity import (describe_placement, merge_pieces, stage_capacity,
                                                       validate_placement, validate_plan)
 from converter.ramanujan_shards.llm_package import load_model_from_args
@@ -178,23 +178,18 @@ class NativeGgufRunner:
         self.tokenizer = load_tokenizer(metadata)
         self.stop_ids = set(self.tokenizer.stop_ids)
         last = args.stop_after_layer
-        canonical = bool(self.shards) and all(shard.get("artifactLayout") == "per-layer"
-                                             for shard in self.shards)
-        if (self.capacity_aware and not args.check_layers
-                and getattr(args, "capacity_placement", "search") == "vram"):
+        if self.capacity_aware and not args.check_layers:
             self._place_by_vram(last)
         else:
-            self._open_stages(last, canonical)
+            self._open_stages(last)
         self.chain = HomelabChain(self.stages) if args.homelab and on_chain(self.plan) else None
         self.position = 0
         self.logits = None
 
-    def _open_stages(self, last, canonical):
+    def _open_stages(self, last):
         args = self.args
         self.plan = plan_stages(self.spec, self.tensors, last_layer=last,
-                                split=(self.capacity_aware and canonical) or bool(args.check_layers))
-        if self.capacity_aware and canonical and not args.check_layers:
-            self.plan = coalesce_stages(self.plan, getattr(args, "capacity_max_stages", 8))
+                                split=bool(args.check_layers))
         self.stages = []
         run_id = uuid.uuid4().hex if self.capacity_aware else None
         for index, stage in enumerate(self.plan):
@@ -226,7 +221,7 @@ class NativeGgufRunner:
         """
         args = self.args
         if args.weights == "stream":
-            raise ValueError("--capacity-placement vram sizes resident shards; use --weights auto or resident")
+            raise ValueError("--capacity-aware lets the orchestrator choose streaming; use --weights auto or resident")
         dry_run = bool(getattr(args, "capacity_dry_run", False))
         pieces = plan_stages(self.spec, self.tensors, last_layer=last, split=True)
         run_id = uuid.uuid4().hex

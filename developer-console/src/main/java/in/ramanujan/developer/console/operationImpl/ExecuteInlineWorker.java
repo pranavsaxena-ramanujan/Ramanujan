@@ -2,6 +2,9 @@ package in.ramanujan.developer.console.operationImpl;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import in.ramanujan.developer.console.Operation;
+import in.ramanujan.devices.common.DeviceCapacityPinger;
+import in.ramanujan.devices.common.DeviceOrchestratorClient;
+import in.ramanujan.devices.common.WorkerCapacity;
 import in.ramanujan.pojo.RuleEngineInput;
 import in.ramanujan.pojo.ruleEngineInputUnitsExt.FunctionCall;
 import in.ramanujan.rule.engine.NativeProcessor;
@@ -9,8 +12,6 @@ import in.ramanujan.rule.engine.LlmSession;
 import in.ramanujan.rule.engine.RuleEngineInputProtoSerializer;
 
 import java.io.*;
-import java.net.*;
-import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
@@ -66,13 +67,12 @@ public class ExecuteInlineWorker implements Operation {
     private Path taskRoot;
     private LlmTaskHandler llmTasks;
     private volatile ExecutorService pool;
-    private volatile ScheduledExecutorService capacitySender;
+    private volatile DeviceCapacityPinger capacityPinger;
     private final WorkerCapacity.Provider capacityProvider;
     private final Runnable nativeCapacityProbe;
-    private volatile boolean nativeProbeFailed;
     private final java.util.concurrent.atomic.AtomicInteger activeDagTasks = new java.util.concurrent.atomic.AtomicInteger();
     private volatile boolean stopped;
-    private final Set<HttpURLConnection> connections = ConcurrentHashMap.newKeySet();
+    private volatile DeviceOrchestratorClient orchestrator;
     private String scopedUrl;
 
     public ExecuteInlineWorker() { this(new WorkerCapacity.DesktopProvider()); }
@@ -91,9 +91,10 @@ public class ExecuteInlineWorker implements Operation {
         stopped = true;
         ExecutorService running = pool;
         if (running != null) running.shutdownNow();
-        ScheduledExecutorService sender = capacitySender;
-        if (sender != null) sender.shutdownNow();
-        for (HttpURLConnection connection : connections) connection.disconnect();
+        DeviceCapacityPinger sender = capacityPinger;
+        if (sender != null) sender.close();
+        DeviceOrchestratorClient client = orchestrator;
+        if (client != null) client.close();
         if (binaryCache != null) binaryCache.close();
     }
 
@@ -160,6 +161,7 @@ public class ExecuteInlineWorker implements Operation {
         }
         if (capacitySessionLimit != null && capacitySessionLimit < llmSessions)
             throw new IllegalArgumentException("--capacity-session-limit must be >= --llm-sessions");
+        orchestrator = new DeviceOrchestratorClient(serverUrl);
         if (!sharedFilesystem) {
             binaryCache = new WorkerBinaryCache(Paths.get(cacheDir), serverUrl, diskReserveBytes);
             taskRoot = Paths.get(cacheDir).toAbsolutePath().resolve("tasks");
@@ -178,42 +180,20 @@ public class ExecuteInlineWorker implements Operation {
 
         final String url = serverUrl;
         final WorkerCapacity capacity = new WorkerCapacity(capacityProvider, Paths.get(cacheDir).toAbsolutePath(),
-                hostId, binaryCache);
-        capacitySender = Executors.newSingleThreadScheduledExecutor(r -> {
-            Thread thread = new Thread(r, "worker-capacity");
-            thread.setDaemon(true);
-            return thread;
-        });
-        capacitySender.execute(() -> {
-            if (stopped) return;
-            try {
-                nativeCapacityProbe.run();
-            } catch (Exception | LinkageError e) {
-                nativeProbeFailed = true;
-                if (!stopped) System.err.println("[Worker] native capacity preflight failed: " + safeError(e));
-            }
-        });
-        capacitySender.scheduleWithFixedDelay(() -> {
-            if (stopped) return;
-            try {
-                Map<String, Object> snapshot = capacity.sample(llmTasks.openSessions(),
-                        acceptingNewWork(), llmTasks.activePlans());
-                snapshot.put("sessionLimit", llmTasks.sessionLimit());
-                snapshot.put("capacitySessionLimit", llmTasks.capacitySessionLimit());
-                snapshot.put("affinityLimit", affinityLimit == Integer.MAX_VALUE ? null : affinityLimit);
-                snapshot.put("acceptingNewWork", acceptingNewWork());
-                if (nativeProbeFailed && snapshot.get("nativeReady") == null) {
-                    snapshot.put("nativeReady", false);
-                    snapshot.put("supportsRuntime", false);
-                }
-                postCapacity(url + "/pings/capacity", MAPPER.writeValueAsBytes(snapshot));
-            } catch (Exception | LinkageError e) {
-                if (!stopped) System.err.println("[Worker] capacity report failed: " + safeError(e));
-            }
-        }, 0, 10, TimeUnit.SECONDS);
+                hostId);
+        capacityPinger = new DeviceCapacityPinger(url, () -> {
+            Map<String, Object> snapshot = capacity.sample(llmTasks.openSessions(),
+                    acceptingNewWork(), llmTasks.activePlans(), capacityDetails());
+            snapshot.put("sessionLimit", llmTasks.sessionLimit());
+            snapshot.put("capacitySessionLimit", llmTasks.capacitySessionLimit());
+            snapshot.put("affinityLimit", affinityLimit == Integer.MAX_VALUE ? null : affinityLimit);
+            snapshot.put("acceptingNewWork", acceptingNewWork());
+            return snapshot;
+        }, nativeCapacityProbe, error -> System.err.println("[Worker] capacity ping/preflight failed: " + safeError(error)));
+        capacityPinger.start();
         pool = Executors.newFixedThreadPool(numThreads);
         for (int i = 0; i < numThreads; i++) {
-            pool.submit(() -> workerLoop(url));
+            pool.submit(this::workerLoop);
         }
 
         pool.shutdown();
@@ -236,16 +216,15 @@ public class ExecuteInlineWorker implements Operation {
     }
 
     @SuppressWarnings("unchecked")
-    private void workerLoop(String serverUrl) {
+    private void workerLoop() {
         System.err.println("[Worker] started hostId=" + hostId);
-        String pollUrl = serverUrl + "/pings/open?uuid=" + hostId
-                + (affinityLimit == Integer.MAX_VALUE ? "" : "&affinityLimit=" + affinityLimit);
+        Integer pollAffinityLimit = affinityLimit == Integer.MAX_VALUE ? null : affinityLimit;
 
         while (!stopped && !Thread.currentThread().isInterrupted()) {
             boolean dagInFlight = false;
             try {
                 long pollStarted = System.nanoTime();
-                Map<String, Object> pingResp = postJson(pollUrl, "");
+                Map<String, Object> pingResp = orchestrator.pollTask(hostId, pollAffinityLimit);
                 if (pingResp == null) {
                     idleBackoff(pollStarted);
                     continue;
@@ -260,7 +239,7 @@ public class ExecuteInlineWorker implements Operation {
 
                 Map<String, Object> taskData = (Map<String, Object>) dataObj;
                 if (taskData.get("llm") instanceof Map) {
-                    runLlmTask(serverUrl, (String) taskData.get("uuid"), (Map<String, Object>) taskData.get("llm"));
+                    runLlmTask((String) taskData.get("uuid"), (Map<String, Object>) taskData.get("llm"));
                     continue;
                 }
                 String uuid           = (String) taskData.get("uuid");
@@ -350,7 +329,7 @@ public class ExecuteInlineWorker implements Operation {
                         String arrayId  = be.getKey();
                         String filePath = be.getValue();
                         try {
-                            if (error == null) uploadBinaryFile(serverUrl, uuid, arrayId, filePath);
+                            if (error == null) orchestrator.uploadBinary(uuid, arrayId, readAllBytes(filePath));
                         } catch (Exception uploadEx) {
                             error = "upload of binary array " + arrayId + " failed: " + safeError(uploadEx);
                             System.err.println("[Worker] " + error + " (task " + uuid + ")");
@@ -360,13 +339,7 @@ public class ExecuteInlineWorker implements Operation {
                     }
                 }
 
-                // Submit results back to homelab server
-                Map<String, Object> payload = new LinkedHashMap<>();
-                payload.put("uuid",   uuid);
-                payload.put("hostId", hostId);
-                payload.put("data",   results);
-                if (error != null) payload.put("error", error);
-                postJson(serverUrl + "/task/complete", MAPPER.writeValueAsString(payload));
+                orchestrator.completeTask(uuid, hostId, results, error);
 
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
@@ -390,7 +363,7 @@ public class ExecuteInlineWorker implements Operation {
     }
 
     /** Runs a native LLM stage step (or session close) and reports it to /task/complete. */
-    private void runLlmTask(String serverUrl, String uuid, Map<String, Object> task) throws Exception {
+    private void runLlmTask(String uuid, Map<String, Object> task) throws Exception {
         Map<String, Object> results = new HashMap<>();
         String error = null;
         long start = System.currentTimeMillis();
@@ -405,12 +378,7 @@ public class ExecuteInlineWorker implements Operation {
         System.err.println("[Worker] llm " + task.get("op") + " " + what + " pos=" + task.get("pos")
                 + " n=" + task.get("n") + " done in " + (System.currentTimeMillis() - start) + "ms"
                 + " (open sessions " + llmTasks.openSessions() + ")");
-        Map<String, Object> payload = new LinkedHashMap<>();
-        payload.put("uuid", uuid);
-        payload.put("hostId", hostId);
-        payload.put("data", results);
-        if (error != null) payload.put("error", error);
-        postJson(serverUrl + "/task/complete", MAPPER.writeValueAsString(payload));
+        orchestrator.completeTask(uuid, hostId, results, error);
     }
 
     private static String requireValue(List<String> args, int index, String option) {
@@ -430,15 +398,6 @@ public class ExecuteInlineWorker implements Operation {
         if (remaining > 0) TimeUnit.NANOSECONDS.sleep(remaining);
     }
 
-    private HttpURLConnection connection(String url) throws IOException {
-        if (stopped) throw new IOException("worker stopped");
-        HttpURLConnection connection = (HttpURLConnection) new URL(url).openConnection();
-        connection.setInstanceFollowRedirects(false);
-        connections.add(connection);
-        if (stopped) { connection.disconnect(); throw new IOException("worker stopped"); }
-        return connection;
-    }
-
     private static void deleteRecursively(Path path) {
         if (path == null || !Files.exists(path)) return;
         try (java.util.stream.Stream<Path> walk = Files.walk(path)) {
@@ -446,33 +405,6 @@ public class ExecuteInlineWorker implements Operation {
         } catch (IOException e) {
             System.err.println("[Worker] could not delete " + path + ": " + e.getMessage());
         }
-    }
-
-    /** Uploads the full contents of a RETURN()-marked array as raw bytes (not JSON). */
-    private void uploadBinaryFile(String serverUrl, String uuid, String arrayId, String filePath) throws Exception {
-        byte[] data = readAllBytes(filePath);
-        String url = serverUrl + "/orchestrator/uploadBinary?uuid=" + URLEncoder.encode(uuid, "UTF-8")
-                + "&arrayId=" + URLEncoder.encode(arrayId, "UTF-8");
-
-        HttpURLConnection conn = connection(url);
-        try {
-        conn.setRequestMethod("POST");
-        conn.setRequestProperty("Content-Type", "application/octet-stream");
-        conn.setDoOutput(true);
-        conn.setConnectTimeout(5000);
-        conn.setReadTimeout(120_000);
-        conn.setFixedLengthStreamingMode(data.length);
-        try (OutputStream os = conn.getOutputStream()) {
-            os.write(data);
-        }
-
-        int code = conn.getResponseCode();
-        InputStream is = (code < 400) ? conn.getInputStream() : conn.getErrorStream();
-        if (is != null) is.close();
-        if (code >= 400) {
-            throw new IOException("uploadBinary for arrayId=" + arrayId + " failed with HTTP " + code);
-        }
-        } finally { connections.remove(conn); conn.disconnect(); }
     }
 
     private static byte[] readAllBytes(String filePath) throws IOException {
@@ -485,52 +417,17 @@ public class ExecuteInlineWorker implements Operation {
         }
     }
 
-    private void postCapacity(String url, byte[] body) throws IOException {
-        HttpURLConnection conn = connection(url);
-        try {
-            conn.setRequestMethod("POST");
-            conn.setRequestProperty("Content-Type", "application/json");
-            conn.setDoOutput(true);
-            conn.setConnectTimeout(3000);
-            conn.setReadTimeout(3000);
-            conn.setFixedLengthStreamingMode(body.length);
-            try (OutputStream out = conn.getOutputStream()) { out.write(body); }
-            int code = conn.getResponseCode();
-            if (code < 200 || code >= 300) throw new IOException("capacity request failed with HTTP " + code);
-            // No response JSON is required (e.g. 204).
-        } finally {
-            connections.remove(conn);
-            conn.disconnect();
+    private Map<String, Object> capacityDetails() {
+        Map<String, Object> details = new LinkedHashMap<>();
+        if (binaryCache == null) return details;
+        WorkerBinaryCache.CacheInventory inventory = binaryCache.inventory();
+        details.put("cachedFiles", inventory.files);
+        details.put("cachedFilesTruncated", inventory.truncated);
+        Map<String, Long> cached = new HashMap<>();
+        for (Map<String, Object> file : inventory.files) {
+            cached.put((String) file.get("path"), ((Number) file.get("bytes")).longValue());
         }
-    }
-
-    private Map<String, Object> postJson(String url, String body) throws Exception {
-        HttpURLConnection conn = connection(url);
-        try {
-        conn.setRequestMethod("POST");
-        conn.setRequestProperty("Content-Type", "application/json");
-        conn.setDoOutput(true);
-        conn.setConnectTimeout(5000);
-        conn.setReadTimeout(120_000);
-
-        byte[] bytes = body.getBytes(StandardCharsets.UTF_8);
-        conn.setFixedLengthStreamingMode(bytes.length);
-        try (OutputStream os = conn.getOutputStream()) {
-            os.write(bytes);
-        }
-
-        int code = conn.getResponseCode();
-        if (code < 200 || code >= 300) throw new IOException("worker request failed with HTTP " + code);
-        InputStream is = (code < 400) ? conn.getInputStream() : conn.getErrorStream();
-        if (is == null) return null;
-
-        ByteArrayOutputStream baos = new ByteArrayOutputStream();
-        byte[] buf = new byte[4096];
-        int n;
-        while ((n = is.read(buf)) != -1) baos.write(buf, 0, n);
-        is.close();
-
-        return MAPPER.readValue(baos.toByteArray(), Map.class);
-        } finally { connections.remove(conn); conn.disconnect(); }
+        details.put("cachedShards", binaryCache.shards().report(cached));
+        return details;
     }
 }

@@ -417,19 +417,10 @@ def parse_args():
                         help="native runtime: keep stage weights on the device, or stream them per step "
                              "(auto: resident when they fit in half of device and system memory)")
     parser.add_argument("--capacity-aware", action="store_true",
-                        help="native + homelab only: reserve a per-run contiguous stage placement plan "
-                             "before opening sessions; use backend-selected resident/stream modes")
-    parser.add_argument("--capacity-max-stages", type=int, default=8,
-                        help="capacity-aware canonical packages: coalesce consecutive pieces BEFORE "
-                             "admission into at most this many graph/session stages (default 8); "
-                             "0 keeps every piece separate; used by --capacity-placement search")
-    parser.add_argument("--capacity-placement", choices=["vram", "search"], default="vram",
-                        help="capacity-aware: vram (default) lets the orchestrator give the device with the "
-                             "most free VRAM the largest whole-layer resident shard, then the next device, and "
-                             "stream any remainder on one device; search coalesces to --capacity-max-stages "
-                             "and lets the backend choose hosts")
+                        help="native + homelab only: the orchestrator shards whole layers by live device "
+                             "VRAM (largest device gets the largest resident shard) before sessions open")
     parser.add_argument("--capacity-dry-run", action="store_true",
-                        help="capacity-aware vram placement: print each device's planned shard and exit "
+                        help="capacity-aware: print each device's orchestrator-planned shard and exit "
                              "before reserving, opening sessions or downloading weights")
     parser.add_argument("--stream-depth", type=int, default=2,
                         help="native runtime: layers uploaded ahead while streaming")
@@ -438,16 +429,14 @@ def parse_args():
     add_model_arguments(parser)
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()
-    if args.capacity_max_stages < 0:
-        parser.error("--capacity-max-stages must be nonnegative")
     if args.capacity_aware and (args.runtime != "native" or not args.homelab):
         parser.error("--capacity-aware requires --runtime native and --homelab")
     if args.capacity_aware and args.resident_weights:
         parser.error("--capacity-aware uses --weights, not --resident-weights")
-    if args.capacity_aware and args.capacity_placement == "vram" and args.weights == "stream":
-        parser.error("--capacity-placement vram needs --weights auto or resident (use search for stream)")
-    if args.capacity_dry_run and not (args.capacity_aware and args.capacity_placement == "vram"):
-        parser.error("--capacity-dry-run requires --capacity-aware with vram placement")
+    if args.capacity_aware and args.weights == "stream":
+        parser.error("--capacity-aware lets the orchestrator choose streaming; use --weights auto or resident")
+    if args.capacity_dry_run and not args.capacity_aware:
+        parser.error("--capacity-dry-run requires --capacity-aware")
     if args.prefetch_steps is None:
         args.prefetch_steps = 0 if args.homelab else 1
     if args.runtime == "dsl" and args.work_dir is None:

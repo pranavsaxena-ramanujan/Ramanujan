@@ -1,6 +1,7 @@
 package in.ramanujan.developer.console.operationImpl;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import in.ramanujan.devices.common.DeviceOrchestratorClient;
 import in.ramanujan.pojo.RuleEngineInput;
 import in.ramanujan.pojo.ruleEngineInputUnitsExt.array.Array;
 
@@ -8,8 +9,6 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.net.HttpURLConnection;
-import java.net.URL;
-import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -40,25 +39,14 @@ final class WorkerBinaryCache implements AutoCloseable {
     private final Map<String, Object> locks = new ConcurrentHashMap<>();
     // Server paths already validated by this process; model weights are immutable while serving.
     private final Map<String, Path> validated = new ConcurrentHashMap<>();
-    private final java.util.Set<HttpURLConnection> connections = ConcurrentHashMap.newKeySet();
-    private volatile boolean closed;
+    private final DeviceOrchestratorClient orchestrator;
     private final long diskReserveBytes;
     private long reservedDownloads;
     private final WorkerShardManifest shards;
 
     @Override
     public void close() {
-        closed = true;
-        for (HttpURLConnection connection : connections) connection.disconnect();
-    }
-
-    private HttpURLConnection connection(String route) throws IOException {
-        if (closed) throw new IOException("binary cache stopped");
-        HttpURLConnection conn = (HttpURLConnection) new URL(serverUrl + route).openConnection();
-        conn.setInstanceFollowRedirects(false);
-        connections.add(conn);
-        if (closed) { conn.disconnect(); throw new IOException("binary cache stopped"); }
-        return conn;
+        orchestrator.close();
     }
 
     WorkerBinaryCache(Path root, String serverUrl) {
@@ -69,6 +57,7 @@ final class WorkerBinaryCache implements AutoCloseable {
         if (diskReserveBytes < 0) throw new IllegalArgumentException("disk reserve must be >= 0");
         this.root = root.toAbsolutePath();
         this.serverUrl = serverUrl;
+        this.orchestrator = new DeviceOrchestratorClient(serverUrl);
         this.diskReserveBytes = diskReserveBytes;
         this.shards = new WorkerShardManifest(this.root, serverUrl);
     }
@@ -133,7 +122,7 @@ final class WorkerBinaryCache implements AutoCloseable {
             if (validated.containsKey(serverPath)) continue;
             String key = sha256(serverUrl + "\n" + serverPath);
             Path directory = root.resolve("objects").resolve(key);
-            Map<String, Object> stat = getJson("/binary/stat?path=" + encode(serverPath));
+            Map<String, Object> stat = orchestrator.binaryStat(serverPath);
             long size = ((Number) stat.get("size")).longValue();
             long mtime = ((Number) stat.get("mtime")).longValue();
             if (size < 0) throw new IOException("invalid binary size for " + serverPath + ": " + size);
@@ -153,7 +142,7 @@ final class WorkerBinaryCache implements AutoCloseable {
         Path directory = root.resolve("objects").resolve(key);
         Path file = directory.resolve(Paths.get(serverPath).getFileName());
         Path meta = directory.resolve("meta.json");
-        Map<String, Object> stat = getJson("/binary/stat?path=" + encode(serverPath));
+        Map<String, Object> stat = orchestrator.binaryStat(serverPath);
         long size = ((Number) stat.get("size")).longValue();
         long mtime = ((Number) stat.get("mtime")).longValue();
         if (matches(file, meta, serverPath, size, mtime)) return file;
@@ -189,9 +178,7 @@ final class WorkerBinaryCache implements AutoCloseable {
                 reserve(destination, expectedSize);
                 reservation = expectedSize;
             }
-            conn = connection("/binary/fetch?path=" + encode(serverPath));
-            conn.setConnectTimeout(10_000);
-            conn.setReadTimeout(600_000);
+            conn = orchestrator.openBinaryFetch(serverPath);
             int code = conn.getResponseCode();
             if (code != 200) {
                 throw new IOException("fetch " + serverPath + " failed with HTTP " + code);
@@ -222,7 +209,7 @@ final class WorkerBinaryCache implements AutoCloseable {
             synchronized (this) { reservedDownloads -= reservation; }
             try { Files.deleteIfExists(temporary); }
             finally {
-                if (conn != null) { connections.remove(conn); conn.disconnect(); }
+                orchestrator.release(conn);
             }
         }
     }
@@ -283,29 +270,6 @@ final class WorkerBinaryCache implements AutoCloseable {
             incomplete = true;
         }
         return new CacheInventory(files, incomplete);
-    }
-
-    @SuppressWarnings("unchecked")
-    private Map<String, Object> getJson(String route) throws IOException {
-        HttpURLConnection conn = connection(route);
-        conn.setConnectTimeout(10_000);
-        conn.setReadTimeout(60_000);
-        try {
-            int code = conn.getResponseCode();
-            if (code != 200) {
-                throw new IOException(route + " failed with HTTP " + code);
-            }
-            try (InputStream in = conn.getInputStream()) {
-                return MAPPER.readValue(in, Map.class);
-            }
-        } finally {
-            connections.remove(conn);
-            conn.disconnect();
-        }
-    }
-
-    private static String encode(String value) throws IOException {
-        return URLEncoder.encode(value, "UTF-8");
     }
 
     private static String sha256(String value) {

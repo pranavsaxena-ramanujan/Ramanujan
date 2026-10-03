@@ -283,15 +283,23 @@ public class NativeLlmService {
         update.put("nativeResult", payload);
         update.put("nativeState", failed ? "FAILED" : "COMPLETED");
         update.put("status", failed ? Status.FAILURE.getKeyName() : Status.SUCCESS.getKeyName());
-        return asyncTaskDao.update(task.getUuid(), update).compose(ignored ->
-                hostMappingDao.removeMapping(task.getHostAssigned(), task.getUuid())).compose(ignored -> {
-                    if (failed) return affinityDao.state(task.getNativeBindings(), "FAILED");
-                    boolean closed = "close".equals(task.getLlm().get("op"));
-                    Future<Void> state = closed ? affinityDao.state(task.getNativeBindings(), "CLOSED") : Future.succeededFuture();
-                    if (task.getLlm().get("planId") == null) return state;
-                    return state.compose(done -> capacityDao.completed(task.getClusterId(),
-                            (String) task.getLlm().get("planId"), task.getNativeBindings(), closed));
-                });
+        // Record session/plan state before publishing the result: the submitter returns as soon as
+        // nativeResult is visible and may release the capacity plan immediately after a close.
+        Future<Void> recorded;
+        if (failed) {
+            recorded = affinityDao.state(task.getNativeBindings(), "FAILED");
+        } else {
+            boolean closed = "close".equals(task.getLlm().get("op"));
+            recorded = closed ? affinityDao.state(task.getNativeBindings(), "CLOSED") : Future.succeededFuture();
+            if (task.getLlm().get("planId") != null) {
+                recorded = recorded.compose(done -> capacityDao.completed(task.getClusterId(),
+                        (String) task.getLlm().get("planId"), task.getNativeBindings(), closed));
+            }
+        }
+        return recorded.map(done -> (Throwable) null).recover(Future::succeededFuture).compose(stateError ->
+                asyncTaskDao.update(task.getUuid(), update).compose(ignored ->
+                        hostMappingDao.removeMapping(task.getHostAssigned(), task.getUuid())).compose(ignored ->
+                        stateError == null ? Future.<Void>succeededFuture() : Future.<Void>failedFuture(stateError)));
     }
 
     public Future<Map<String, Object>> fail(AsyncTask task, String error, boolean timedOut) {

@@ -124,8 +124,8 @@ admission, without unbounding legacy work. Downloads preserve a 64 MiB disk rese
 Explicit native `weights: "stream"` remains supported for models larger than cluster
 RAM/VRAM; one device can host multiple pinned contiguous stages. Assigned weights
 are preflighted against incremental disk space, not required to fit physical memory.
-See [worker capacity protocol](../../../developer-console/WORKER_CAPACITY.md) for
-schema, counter semantics and limitations.
+See [ORCHESTRATION.md](../../ORCHESTRATION.md) for the capacity ping schema,
+counter semantics and placement.
 
 ## Signed release
 

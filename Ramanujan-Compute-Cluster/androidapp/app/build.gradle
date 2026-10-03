@@ -55,7 +55,13 @@ tasks.register("syncSharedWorker", Sync) {
         include "in/ramanujan/developer/console/operationImpl/ExecuteInlineWorker.java"
         include "in/ramanujan/developer/console/operationImpl/WorkerBinaryCache.java"
         include "in/ramanujan/developer/console/operationImpl/LlmTaskHandler.java"
-        include "in/ramanujan/developer/console/operationImpl/WorkerCapacity.java"
+        include "in/ramanujan/developer/console/operationImpl/WorkerShardManifest.java"
+    }
+    from("../../../ramanujan-device-common/src/main/java") {
+        include "in/ramanujan/devices/common/WorkerCapacity.java"
+        include "in/ramanujan/devices/common/DeviceCapacityPinger.java"
+        include "in/ramanujan/devices/common/DeviceProtocol.java"
+        include "in/ramanujan/devices/common/DeviceOrchestratorClient.java"
     }
     from("../../client/src/main/java") { include "in/ramanujan/cluster/client/common/**" }
     into layout.buildDirectory.dir("generated/sharedWorker")

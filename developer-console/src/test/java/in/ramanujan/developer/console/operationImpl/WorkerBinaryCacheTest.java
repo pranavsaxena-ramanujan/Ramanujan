@@ -2,6 +2,7 @@ package in.ramanujan.developer.console.operationImpl;
 
 import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpServer;
+import in.ramanujan.devices.common.WorkerCapacity;
 import in.ramanujan.pojo.RuleEngineInput;
 import in.ramanujan.pojo.ruleEngineInputUnitsExt.array.Array;
 import org.junit.After;
@@ -197,8 +198,9 @@ public class WorkerBinaryCacheTest {
         assertEquals(1, bounded.files.size());
         assertTrue(bounded.truncated);
         WorkerCapacity snapshot = new WorkerCapacity(p -> new WorkerCapacity.Snapshot(null, null, null),
-                root.resolve("cache"), "host", cache);
-        assertEquals(all.files.size(), ((List<?>) snapshot.sample(0, true).get("cachedFiles")).size());
+                root.resolve("cache"), "host");
+        assertEquals(all.files.size(), ((List<?>) snapshot.sample(0, true, java.util.Collections.emptyMap(),
+                java.util.Collections.singletonMap("cachedFiles", all.files)).get("cachedFiles")).size());
         cache.close();
         WorkerBinaryCache restarted = cache();
         try { assertEquals(2, restarted.inventory().files.size()); }

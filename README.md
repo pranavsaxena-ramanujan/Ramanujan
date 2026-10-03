@@ -50,6 +50,7 @@ focused pages under [docs/](docs/):
 | [docs/gpu-acceleration.md](docs/gpu-acceleration.md) | GPU acceleration support via OpenCL — kernel generation, built-ins, memory management. |
 | [docs/ramanujan-language.md](docs/ramanujan-language.md) | The original `ramanujan` language (**deprecated**) — variables, arrays, functions, loops, threads. |
 | [docs/architecture.md](docs/architecture.md) | Code-flow across dev-console, middleware, orchestrator, and the native interpreter. |
+| [ORCHESTRATION.md](ORCHESTRATION.md) | Cluster rooms, `clusterId` routing, device protocol and the orchestrator's LLM sharding algorithm. |
 | [docs/build-and-usage.md](docs/build-and-usage.md) | Build and usage strategy — Maven build, native build, Docker, configuration. |
 | [docs/contributor-guide.md](docs/contributor-guide.md) | Contributor quick start — running a Monte Carlo example on a computer and Android phone. |
 | [docs/roadmap.md](docs/roadmap.md) | Future of the language and platform. |

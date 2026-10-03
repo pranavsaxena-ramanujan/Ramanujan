@@ -1,4 +1,4 @@
-package in.ramanujan.developer.console.operationImpl;
+package in.ramanujan.devices.common;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import in.ramanujan.rule.engine.LlmSession;
@@ -10,7 +10,7 @@ import java.util.Map;
 import java.util.UUID;
 import java.util.stream.Stream;
 
-/** Platform physical-memory telemetry; unknown values are never replaced by JVM heap sizes. */
+/** Shared device-capacity schema and platform memory sampling. */
 public final class WorkerCapacity {
     public interface Provider {
         Snapshot sample(Path cacheRoot);
@@ -30,16 +30,14 @@ public final class WorkerCapacity {
         public Snapshot sample(Path root) {
             Long total = null, available = null;
             try {
-                // Reflection keeps java.lang.management and vendor MXBeans out of Android linkage.
                 Object bean = Class.forName("java.lang.management.ManagementFactory")
                         .getMethod("getOperatingSystemMXBean").invoke(null);
                 Class<?> type = Class.forName("com.sun.management.OperatingSystemMXBean");
                 total = (Long) type.getMethod("getTotalPhysicalMemorySize").invoke(bean);
                 available = (Long) type.getMethod("getFreePhysicalMemorySize").invoke(bean);
             } catch (ReflectiveOperationException | RuntimeException ignored) {
-                // Unsupported JVM/platform: leave physical memory unknown.
+                // Leave physical memory unknown on unsupported JVMs.
             }
-            // "Free" excludes reclaimable page cache, which would make a busy desktop look full.
             Long reclaimable = reclaimableMemory();
             if (reclaimable != null) available = total == null ? reclaimable : Math.min(total, reclaimable);
             Long disk = null;
@@ -75,7 +73,7 @@ public final class WorkerCapacity {
             return null;
         }
 
-        static Long parseVmStat(String text) {
+        public static Long parseVmStat(String text) {
             java.util.regex.Matcher size = java.util.regex.Pattern.compile("page size of (\\d+) bytes").matcher(text);
             if (!size.find()) return null;
             long pages = 0;
@@ -91,48 +89,40 @@ public final class WorkerCapacity {
     private final Provider provider;
     private final Path root;
     private final String hostId;
-    private final WorkerBinaryCache binaryCache;
     private final String bootId = UUID.randomUUID().toString();
     private long sequence;
 
-    WorkerCapacity(Provider provider, Path root, String hostId) {
-        this(provider, root, hostId, null);
+    public WorkerCapacity(Provider provider, Path root, String hostId) {
+        this.provider = java.util.Objects.requireNonNull(provider, "provider");
+        this.root = java.util.Objects.requireNonNull(root, "root");
+        this.hostId = java.util.Objects.requireNonNull(hostId, "hostId");
     }
 
-    WorkerCapacity(Provider provider, Path root, String hostId, WorkerBinaryCache binaryCache) {
-        this.provider = provider;
-        this.root = root;
-        this.hostId = hostId;
-        this.binaryCache = binaryCache;
+    public Map<String, Object> sample(int sessions, boolean accepting) {
+        return sample(sessions, accepting, java.util.Collections.emptyMap(), java.util.Collections.emptyMap());
     }
 
-    Map<String, Object> sample(int sessions, boolean accepting) {
-        return sample(sessions, accepting, java.util.Collections.emptyMap());
+    public Map<String, Object> sample(int sessions, boolean accepting, Map<String, Integer> activePlans) {
+        return sample(sessions, accepting, activePlans, java.util.Collections.emptyMap());
     }
 
-    Map<String, Object> sample(int sessions, boolean accepting, Map<String, Integer> activePlans) {
-        Snapshot s;
-        try { s = provider.sample(root); }
-        catch (RuntimeException e) { s = new Snapshot(null, null, null); }
+    public Map<String, Object> sample(int sessions, boolean accepting, Map<String, Integer> activePlans,
+                                      Map<String, Object> deviceDetails) {
+        Snapshot snapshot;
+        try { snapshot = provider.sample(root); }
+        catch (RuntimeException e) { snapshot = new Snapshot(null, null, null); }
         Map<String, Object> value = new LinkedHashMap<>();
         value.put("schemaVersion", 1);
         value.put("hostId", hostId);
         value.put("bootId", bootId);
         value.put("sequence", ++sequence);
-        value.put("ramTotalBytes", s.ramTotalBytes);
-        value.put("ramAvailableBytes", s.ramAvailableBytes);
+        value.put("ramTotalBytes", snapshot.ramTotalBytes);
+        value.put("ramAvailableBytes", snapshot.ramAvailableBytes);
         value.put("ramAllocatedBytes", null);
-        value.put("diskAvailableBytes", s.diskAvailableBytes);
+        value.put("diskAvailableBytes", snapshot.diskAvailableBytes);
         value.put("cacheBytes", cacheBytes(root));
-        WorkerBinaryCache.CacheInventory inventory = binaryCache == null
-                ? new WorkerBinaryCache.CacheInventory(java.util.Collections.emptyList(), false) : binaryCache.inventory();
-        value.put("cachedFiles", inventory.files);
-        value.put("cachedFilesTruncated", inventory.truncated);
-        if (binaryCache != null) {
-            Map<String, Long> cached = new java.util.HashMap<>();
-            for (Map<String, Object> file : inventory.files) cached.put((String) file.get("path"), ((Number) file.get("bytes")).longValue());
-            value.put("cachedShards", binaryCache.shards().report(cached));
-        }
+        value.put("cachedFiles", java.util.Collections.emptyList());
+        value.put("cachedFilesTruncated", false);
         value.put("gpuTotalBytes", null);
         value.put("gpuAvailableBytes", null);
         value.put("gpuResidentBytes", null);
@@ -159,11 +149,20 @@ public final class WorkerCapacity {
                     if (gpu.containsKey(field)) value.put(field, gpu.get(field));
             }
         } catch (Exception | LinkageError ignored) {
-            // An older/missing JNI library must not disable heartbeat or task execution.
+            // Missing/older JNI libraries must not disable worker execution.
         }
         value.put("activeSessions", sessions);
         value.put("activePlans", new LinkedHashMap<>(activePlans));
         value.put("acceptingNewWork", accepting);
+        for (Map.Entry<String, Object> detail : deviceDetails.entrySet()) {
+            if ("cachedFiles".equals(detail.getKey()) || "cachedFilesTruncated".equals(detail.getKey())) {
+                value.put(detail.getKey(), detail.getValue());
+            } else if (value.containsKey(detail.getKey())) {
+                throw new IllegalArgumentException("device capacity detail conflicts with schema field: " + detail.getKey());
+            } else {
+                value.put(detail.getKey(), detail.getValue());
+            }
+        }
         return value;
     }
 
