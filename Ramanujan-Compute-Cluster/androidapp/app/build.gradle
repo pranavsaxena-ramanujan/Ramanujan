@@ -55,6 +55,7 @@ tasks.register("syncSharedWorker", Sync) {
         include "in/ramanujan/developer/console/operationImpl/ExecuteInlineWorker.java"
         include "in/ramanujan/developer/console/operationImpl/WorkerBinaryCache.java"
         include "in/ramanujan/developer/console/operationImpl/LlmTaskHandler.java"
+        include "in/ramanujan/developer/console/operationImpl/WorkerCapacity.java"
     }
     from("../../client/src/main/java") { include "in/ramanujan/cluster/client/common/**" }
     into layout.buildDirectory.dir("generated/sharedWorker")

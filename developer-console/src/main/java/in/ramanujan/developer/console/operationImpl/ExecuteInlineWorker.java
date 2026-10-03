@@ -5,6 +5,7 @@ import in.ramanujan.developer.console.Operation;
 import in.ramanujan.pojo.RuleEngineInput;
 import in.ramanujan.pojo.ruleEngineInputUnitsExt.FunctionCall;
 import in.ramanujan.rule.engine.NativeProcessor;
+import in.ramanujan.rule.engine.LlmSession;
 import in.ramanujan.rule.engine.RuleEngineInputProtoSerializer;
 
 import java.io.*;
@@ -36,8 +37,11 @@ import java.util.concurrent.locks.ReentrantReadWriteLock;
  *                          (default ~/.ramanujan/worker-cache)
  *   --max-shards N         most affinity groups (model shards) this worker accepts
  *   --shared-filesystem    read binary arrays at the server's paths instead of fetching
- *   --llm-sessions N       native LLM stage sessions kept open (default 8; least recently
- *                          used is closed first). /llm/step and /llm/chain tasks run on libramanujan_llm.
+ *   --llm-sessions N       pinned native LLM stage sessions (default 8); new sessions at the
+ *                          limit are rejected until an explicit /llm/close.
+ *   --disk-reserve-bytes N free disk space preserved while downloading (default 64 MiB).
+ *   --capacity-session-limit N opt-in total stage-session ceiling for trusted planId tasks
+ *                          (1..1024, >= --llm-sessions; default same as --llm-sessions).
  *
  * Examples:
  *   java -jar developer-console.jar worker
@@ -62,15 +66,33 @@ public class ExecuteInlineWorker implements Operation {
     private Path taskRoot;
     private LlmTaskHandler llmTasks;
     private volatile ExecutorService pool;
+    private volatile ScheduledExecutorService capacitySender;
+    private final WorkerCapacity.Provider capacityProvider;
+    private final Runnable nativeCapacityProbe;
+    private volatile boolean nativeProbeFailed;
+    private final java.util.concurrent.atomic.AtomicInteger activeDagTasks = new java.util.concurrent.atomic.AtomicInteger();
     private volatile boolean stopped;
     private final Set<HttpURLConnection> connections = ConcurrentHashMap.newKeySet();
     private String scopedUrl;
+
+    public ExecuteInlineWorker() { this(new WorkerCapacity.DesktopProvider()); }
+
+    public ExecuteInlineWorker(WorkerCapacity.Provider capacityProvider) {
+        this(capacityProvider, LlmSession::prepareCapacity);
+    }
+
+    ExecuteInlineWorker(WorkerCapacity.Provider capacityProvider, Runnable nativeCapacityProbe) {
+        this.capacityProvider = Objects.requireNonNull(capacityProvider, "capacityProvider");
+        this.nativeCapacityProbe = Objects.requireNonNull(nativeCapacityProbe, "nativeCapacityProbe");
+    }
 
     /** Stops polling and in-flight transfers; native sessions close after the execution thread exits. */
     public void stop() {
         stopped = true;
         ExecutorService running = pool;
         if (running != null) running.shutdownNow();
+        ScheduledExecutorService sender = capacitySender;
+        if (sender != null) sender.shutdownNow();
         for (HttpURLConnection connection : connections) connection.disconnect();
         if (binaryCache != null) binaryCache.close();
     }
@@ -85,6 +107,8 @@ public class ExecuteInlineWorker implements Operation {
         String cacheDir = Paths.get(System.getProperty("user.home"), ".ramanujan", "worker-cache").toString();
         boolean sharedFilesystem = false;
         int llmSessions = 8;
+        Integer capacitySessionLimit = null;
+        long diskReserveBytes = 64L << 20;
 
         List<String> positional = new ArrayList<>();
         for (int i = 1; i < args.size(); i++) {
@@ -107,6 +131,15 @@ public class ExecuteInlineWorker implements Operation {
                     llmSessions = Integer.parseInt(requireValue(args, ++i, arg));
                     if (llmSessions < 1) throw new IllegalArgumentException("--llm-sessions must be >= 1");
                     break;
+                case "--disk-reserve-bytes":
+                    diskReserveBytes = Long.parseLong(requireValue(args, ++i, arg));
+                    if (diskReserveBytes < 0) throw new IllegalArgumentException("--disk-reserve-bytes must be >= 0");
+                    break;
+                case "--capacity-session-limit":
+                    capacitySessionLimit = Integer.parseInt(requireValue(args, ++i, arg));
+                    if (capacitySessionLimit < 1 || capacitySessionLimit > 1024)
+                        throw new IllegalArgumentException("--capacity-session-limit must be 1..1024");
+                    break;
                 default:
                     if (arg.startsWith("--")) throw new IllegalArgumentException("unknown worker option " + arg);
                     positional.add(arg);
@@ -125,12 +158,15 @@ public class ExecuteInlineWorker implements Operation {
                 catch (NumberFormatException ignored) {}
             }
         }
+        if (capacitySessionLimit != null && capacitySessionLimit < llmSessions)
+            throw new IllegalArgumentException("--capacity-session-limit must be >= --llm-sessions");
         if (!sharedFilesystem) {
-            binaryCache = new WorkerBinaryCache(Paths.get(cacheDir), serverUrl);
+            binaryCache = new WorkerBinaryCache(Paths.get(cacheDir), serverUrl, diskReserveBytes);
             taskRoot = Paths.get(cacheDir).toAbsolutePath().resolve("tasks");
             Files.createDirectories(taskRoot);
         }
-        llmTasks = new LlmTaskHandler(binaryCache, llmSessions);
+        llmTasks = new LlmTaskHandler(binaryCache, llmSessions,
+                capacitySessionLimit == null ? llmSessions : capacitySessionLimit);
 
         System.out.println("LOCAL_WORKER_READY");
         scopedUrl = serverUrl.contains("/worker/") ? serverUrl : null;
@@ -141,6 +177,40 @@ public class ExecuteInlineWorker implements Operation {
         System.out.flush();
 
         final String url = serverUrl;
+        final WorkerCapacity capacity = new WorkerCapacity(capacityProvider, Paths.get(cacheDir).toAbsolutePath(),
+                hostId, binaryCache);
+        capacitySender = Executors.newSingleThreadScheduledExecutor(r -> {
+            Thread thread = new Thread(r, "worker-capacity");
+            thread.setDaemon(true);
+            return thread;
+        });
+        capacitySender.execute(() -> {
+            if (stopped) return;
+            try {
+                nativeCapacityProbe.run();
+            } catch (Exception | LinkageError e) {
+                nativeProbeFailed = true;
+                if (!stopped) System.err.println("[Worker] native capacity preflight failed: " + safeError(e));
+            }
+        });
+        capacitySender.scheduleWithFixedDelay(() -> {
+            if (stopped) return;
+            try {
+                Map<String, Object> snapshot = capacity.sample(llmTasks.openSessions(),
+                        acceptingNewWork(), llmTasks.activePlans());
+                snapshot.put("sessionLimit", llmTasks.sessionLimit());
+                snapshot.put("capacitySessionLimit", llmTasks.capacitySessionLimit());
+                snapshot.put("affinityLimit", affinityLimit == Integer.MAX_VALUE ? null : affinityLimit);
+                snapshot.put("acceptingNewWork", acceptingNewWork());
+                if (nativeProbeFailed && snapshot.get("nativeReady") == null) {
+                    snapshot.put("nativeReady", false);
+                    snapshot.put("supportsRuntime", false);
+                }
+                postCapacity(url + "/pings/capacity", MAPPER.writeValueAsBytes(snapshot));
+            } catch (Exception | LinkageError e) {
+                if (!stopped) System.err.println("[Worker] capacity report failed: " + safeError(e));
+            }
+        }, 0, 10, TimeUnit.SECONDS);
         pool = Executors.newFixedThreadPool(numThreads);
         for (int i = 0; i < numThreads; i++) {
             pool.submit(() -> workerLoop(url));
@@ -172,6 +242,7 @@ public class ExecuteInlineWorker implements Operation {
                 + (affinityLimit == Integer.MAX_VALUE ? "" : "&affinityLimit=" + affinityLimit);
 
         while (!stopped && !Thread.currentThread().isInterrupted()) {
+            boolean dagInFlight = false;
             try {
                 long pollStarted = System.nanoTime();
                 Map<String, Object> pingResp = postJson(pollUrl, "");
@@ -196,6 +267,8 @@ public class ExecuteInlineWorker implements Operation {
                 String firstCommandId = (String) taskData.get("firstCommandId");
                 Object reiObj         = taskData.get("ruleEngineInput");
                 if (uuid == null || reiObj == null) continue;
+                activeDagTasks.incrementAndGet();
+                dagInFlight = true;
 
                 System.err.println("[Worker] task " + uuid + " firstCmd=" + firstCommandId);
 
@@ -306,8 +379,14 @@ public class ExecuteInlineWorker implements Operation {
                 System.err.println("[Worker] error: " + safeError(t));
                 try { Thread.sleep(1000); }
                 catch (InterruptedException e) { Thread.currentThread().interrupt(); break; }
+            } finally {
+                if (dagInFlight) activeDagTasks.decrementAndGet();
             }
         }
+    }
+
+    boolean acceptingNewWork() {
+        return !stopped && activeDagTasks.get() == 0 && llmTasks != null && llmTasks.acceptingNewSessions();
     }
 
     /** Runs a native LLM stage step (or session close) and reports it to /task/complete. */
@@ -403,6 +482,25 @@ public class ExecuteInlineWorker implements Operation {
             int n;
             while ((n = is.read(buf)) != -1) baos.write(buf, 0, n);
             return baos.toByteArray();
+        }
+    }
+
+    private void postCapacity(String url, byte[] body) throws IOException {
+        HttpURLConnection conn = connection(url);
+        try {
+            conn.setRequestMethod("POST");
+            conn.setRequestProperty("Content-Type", "application/json");
+            conn.setDoOutput(true);
+            conn.setConnectTimeout(3000);
+            conn.setReadTimeout(3000);
+            conn.setFixedLengthStreamingMode(body.length);
+            try (OutputStream out = conn.getOutputStream()) { out.write(body); }
+            int code = conn.getResponseCode();
+            if (code < 200 || code >= 300) throw new IOException("capacity request failed with HTTP " + code);
+            // No response JSON is required (e.g. 204).
+        } finally {
+            connections.remove(conn);
+            conn.disconnect();
         }
     }
 

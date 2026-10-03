@@ -141,6 +141,57 @@ tables. Keep SQL credentials in protected runtime files outside the checkout.
 For private testing, use SSH tunneling for browser access; a public deployment
 requires HTTPS.
 
+### Capacity-aware placement (opt-in)
+
+After applying `db-layer/src/main/resources/migrations/20261002_capacity_admission.sql`
+with an administrator account, set `RAMANUJAN_CAPACITY_AWARE=1` on both
+middleware and portal. Upgrade workers only when idle. The default remains
+the existing routing behavior; do not change services during active inference.
+
+Workers report latest RAM, selected-GPU and cache-volume capacity independently
+of task polling. The private-room gateway supplies device and cluster identity.
+Samples older than 45 seconds are excluded from **new** plans. Missing measurements
+stay unknown; devices without usable RAM/disk/GPU limits are not automatically
+admitted. GPU free memory may be unavailable; admission then budgets the device
+total minus `max(1 GiB, 10%)` and 256 MiB headroom, not a fabricated free-memory value.
+
+Placement is VRAM-first and whole-layer: the device with the most usable VRAM
+receives the largest resident shard, the next device the next largest, and any
+remainder of an oversized model streams on one device. The orchestrator makes
+this decision for every run from the devices' 10-second capacity pings, so
+shards follow devices joining, leaving or filling up. `GET /llm/capacity`
+reports each device's `gpuBudgetBytes`/`ramBudgetBytes`; the runner's
+`--capacity-dry-run` prints the planned shard per device without loading anything.
+
+New model imports use reusable per-layer artifacts rather than fixed four-way
+packages. Existing packages also work but retain their original indivisible
+groups. Each inference reserves an immutable, contiguous assignment in SQL.
+Multiple adjacent shards may run on one device, and a model can exceed the
+cluster's combined RAM/VRAM: `auto` first attempts resident placement, then
+explicit streaming placement. Streaming budgets include persistent context
+state, the largest working window and scratch space, not all weights.
+
+Admission serializes per room across orchestrator processes. Available memory
+is reconciled with reported worker allocations before subtracting reservations;
+unknown allocation accounting is deliberately conservative. Unified-memory
+devices share one physical RAM budget. Disk admission charges uncached files,
+checks size/mtime against reported cache entries and leaves 256 MiB headroom.
+Partial downloads may temporarily be conservatively charged twice; they are
+never assumed reusable before completion. Legacy active native sessions are
+not automatically folded into a new plan.
+
+Changing devices or telemetry does not migrate a running session. New unplanned
+LLM/code work cannot take a reserved host, and capacity is released only after
+all planned native sessions acknowledge close. A failed or disconnected run
+keeps its reservation quarantined: no timeout silently releases memory while
+native execution might still be running. Automatic failure recovery and
+performance-based placement are not part of this first rollout.
+
+The gateway exposes owner-only `/llm/capacity`, `/llm/plan` and
+`/llm/plan/release` under each room's `homelab` path. Direct native CLI runs
+opt in with `--capacity-aware`. No cloud resource or live SQL migration is
+created automatically by enabling this feature.
+
 For direct CLI inference, put the private management key in the process
 environment as `RAMANUJAN_PORTAL_TOKEN` and use:
 

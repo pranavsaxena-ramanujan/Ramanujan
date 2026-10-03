@@ -66,6 +66,20 @@ test('driver failure and missing generated text are not success-shaped answers',
     error => error.code === 'INFERENCE_BACKEND_NOT_READY');
 });
 
+test('capacity-aware inference is opt-in and passed to the runner explicitly', async t => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'rj-capacity-driver-'));
+  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  const runner = path.join(root, 'driver.js');
+  await fs.writeFile(runner, `
+    require('fs').readFileSync(0, 'utf8');
+    console.log(JSON.stringify({event:'completion',text:process.argv.includes('--capacity-aware')?'planned':'legacy'}));
+  `);
+  const request = { model: { package: '/model', metadata: '/metadata' }, question: 'Q',
+    roomId: 'room', apiToken: 'test-capability', publicUrl: 'https://portal.test' };
+  assert.equal((await createInference({ runner, python: process.execPath })(request)).text, 'legacy');
+  assert.equal((await createInference({ runner, python: process.execPath, capacityAware: true })(request)).text, 'planned');
+});
+
 test('generated text is cut at the first end-of-turn token', () => {
   assert.equal(trimAtStop(' 4<|im_end|>junk', ['</s>', '<|im_end|>']), '4');
   assert.equal(trimAtStop('plain', ['<|im_end|>']), 'plain');

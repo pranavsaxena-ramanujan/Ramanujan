@@ -11,8 +11,12 @@ def main() -> None:
     parser.add_argument("--output-dir", required=True, type=Path)
     parser.add_argument("--shards", type=int, default=4)
     parser.add_argument("--shard-index", type=int, help="Only fetch and store this zero-based shard")
+    parser.add_argument("--per-layer", action="store_true",
+                        help="canonical one-block artifacts independent of --shards and worker topology; "
+                             "embedding/global tensors accompany the first block, output tensors the last")
     args = parser.parse_args()
-    package = emit_gguf_package(args.gguf, args.output_dir, args.shards, args.shard_index)
+    package = emit_gguf_package(args.gguf, args.output_dir, args.shards, args.shard_index,
+                                per_layer=args.per_layer)
     print(json.dumps({"output": str(args.output_dir), "architecture": package["architectureId"],
                       "shards": len(package["shards"]), "status": package["status"]}, sort_keys=True))
 

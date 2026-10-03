@@ -65,6 +65,19 @@ public final class LlmSession implements AutoCloseable {
         return nativeInfo(requireOpen());
     }
 
+    /** Already-selected device telemetry, or null before library load. Does not initialize OpenCL. */
+    public static String capacityInfo() {
+        return loaded ? nativeCapacityInfo() : null;
+    }
+
+    public static boolean isLoaded() { return loaded; }
+
+    /** Selects the runtime device and prepares kernels, without opening or resetting any session. */
+    public static void prepareCapacity() {
+        ensureLoaded();
+        nativePrepareCapacity();
+    }
+
     @Override
     public synchronized void close() {
         if (handle != 0) {
@@ -85,6 +98,10 @@ public final class LlmSession implements AutoCloseable {
     private static native void nativeReset(long handle);
 
     private static native String nativeInfo(long handle);
+
+    private static native String nativeCapacityInfo();
+
+    private static native void nativePrepareCapacity();
 
     private static native void nativeClose(long handle);
 }

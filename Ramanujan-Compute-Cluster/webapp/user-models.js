@@ -103,10 +103,11 @@ function runPython({ python, cwd, args, signal }) {
   });
 }
 
-function defaultConverter({ converterDir, python }) {
+function defaultConverter({ converterDir, python, capacityAware }) {
   return async ({ gguf, shards, plan, signal }) => {
     await runPython({ python, cwd: converterDir, signal,
-      args: ['-m', 'ramanujan_shards.emit_gguf', '--gguf', gguf, '--output-dir', shards, '--shards', '4'] });
+      args: ['-m', 'ramanujan_shards.emit_gguf', '--gguf', gguf, '--output-dir', shards,
+        ...(capacityAware ? ['--per-layer'] : ['--shards', '4'])] });
     await runPython({ python, cwd: converterDir, signal,
       args: ['-m', 'ramanujan_shards.gguf_ir_plan', '--package', shards, '--gguf', gguf, '--output-dir', plan] });
   };
@@ -131,8 +132,8 @@ function publicModel(row) {
 }
 
 function createModelManager({ store, dir, converterDir, python = 'python3', download = openDownload, convert, cache,
-  reserveBytes = 2 * GB, maxContext = 1024, maxNewTokens = 128 }) {
-  const runConvert = convert || defaultConverter({ converterDir, python });
+  reserveBytes = 2 * GB, maxContext = 1024, maxNewTokens = 128, capacityAware = false }) {
+  const runConvert = convert || defaultConverter({ converterDir, python, capacityAware });
   const jobs = new Map();
   const queue = [];
   let converting = false;

@@ -47,6 +47,7 @@ public class HostDaoStackImpl implements HostsDao {
 
     @Autowired
     private in.ramanujan.orchestrator.data.dao.NativeDeliveryDao nativeDeliveryDao;
+    @Autowired private in.ramanujan.orchestrator.data.dao.CapacityDao capacityDao;
 
     @PostConstruct
     public void init() {
@@ -60,11 +61,14 @@ public class HostDaoStackImpl implements HostsDao {
     @Override
     public synchronized Future<String> getMachine(AsyncTask asyncTask, Boolean resumeComputation) {
         if (asyncTask.getLlm() == null || nativeAffinityDao == null) {
-            return selectMachine(asyncTask, resumeComputation, Collections.emptyMap());
+            return reservedHosts(asyncTask).compose(reserved ->
+                    selectMachine(asyncTask, resumeComputation, Collections.emptyMap(), reserved));
         }
         Map<String, List<in.ramanujan.db.layer.schema.NativeAffinityOwner>> owners =
                 new java.util.concurrent.ConcurrentHashMap<>();
         List<Future> queries = new ArrayList<>();
+        Future<Set<String>> reserved = reservedHosts(asyncTask);
+        queries.add(reserved);
         for (String host : new ArrayList<>(hostStack)) {
             if (asyncTask.getClusterId() != null && !asyncTask.getClusterId().equals(hostClusters.get(host))) continue;
             if (asyncTask.getNativePreferredHost() != null && !asyncTask.getNativePreferredHost().equals(host)) continue;
@@ -76,15 +80,37 @@ public class HostDaoStackImpl implements HostsDao {
         Future<String> result = Future.future();
         CompositeFuture.all(queries).setHandler(handler -> {
             if (handler.failed()) result.fail(handler.cause());
-            else selectMachine(asyncTask, resumeComputation, owners).setHandler(selected -> {
+            else selectMachine(asyncTask, resumeComputation, owners, reserved.result()).setHandler(selected -> {
                 if (selected.succeeded()) result.complete(selected.result()); else result.fail(selected.cause());
             });
         });
         return result;
     }
 
+    private Future<Set<String>> reservedHosts(AsyncTask task) {
+        if (capacityDao == null || !capacityDao.enabled() || task.getNativePreferredHost() != null) {
+            return Future.succeededFuture(Collections.emptySet());
+        }
+        Set<String> clusters = task.getClusterId() == null
+                ? new HashSet<>(hostClusters.values()) : Collections.singleton(task.getClusterId());
+        Set<String> reserved = new HashSet<>();
+        Future<Void> result = Future.succeededFuture();
+        for (String cluster : clusters) if (cluster != null) {
+            result = result.compose(ignored -> capacityDao.reservedHosts(cluster).map(hosts -> {
+                reserved.addAll(hosts);
+                return (Void) null;
+            }));
+        }
+        return result.map(ignored -> reserved);
+    }
+
     private synchronized Future<String> selectMachine(AsyncTask asyncTask, Boolean resumeComputation,
             Map<String, List<in.ramanujan.db.layer.schema.NativeAffinityOwner>> owners) {
+        return selectMachine(asyncTask, resumeComputation, owners, Collections.emptySet());
+    }
+
+    private synchronized Future<String> selectMachine(AsyncTask asyncTask, Boolean resumeComputation,
+            Map<String, List<in.ramanujan.db.layer.schema.NativeAffinityOwner>> owners, Set<String> reservedHosts) {
         String candidate = null;
         int candidateIndex = -1;
         int candidateOwned = Integer.MAX_VALUE;
@@ -100,6 +126,7 @@ public class HostDaoStackImpl implements HostsDao {
                 if (candidateIndex > index) candidateIndex--;
             } else if ((asyncTask.getClusterId() == null || asyncTask.getClusterId().equals(hostClusters.get(host)))
                     && (asyncTask.getNativePreferredHost() == null || asyncTask.getNativePreferredHost().equals(host))) {
+                if (reservedHosts.contains(host)) continue;
                 Set<String> active = new HashSet<>();
                 for (in.ramanujan.db.layer.schema.NativeAffinityOwner owner :
                         owners.getOrDefault(host, Collections.emptyList())) {
@@ -113,7 +140,7 @@ public class HostDaoStackImpl implements HostsDao {
                     for (String binding : asyncTask.getNativeBindings()) if (!active.contains(binding)) newBindings++;
                 }
                 int limit = hostAffinityLimits.getOrDefault(host, Integer.MAX_VALUE);
-                if (limit == Integer.MAX_VALUE) limit = 8;
+                if (limit == Integer.MAX_VALUE && (asyncTask.getLlm() == null || asyncTask.getLlm().get("planId") == null)) limit = 8;
                 if (asyncTask.getLlm() != null && newBindings > 0 && active.size() + newBindings > limit) continue;
                 if (candidate == null || active.size() < candidateOwned) {
                     candidate = host;
@@ -181,9 +208,20 @@ public class HostDaoStackImpl implements HostsDao {
         //logger.info("stack size: " + hostStack.size());
         asyncTaskHostMappingDao.getMapping(hostId).setHandler(handler -> {
            if(handler.succeeded()) {
-               if(handler.result() == null || Status.FAILURE.getKeyName().equalsIgnoreCase(handler.result().getStatus())) {
-                   //logger.info("No asyncTask for machine " + hostId + ", adding in stack");
+               if(handler.result() == null) {
                    addInStack(hostId, future);
+               } else if (Status.FAILURE.getKeyName().equalsIgnoreCase(handler.result().getStatus())) {
+                   // hostMapping is unique per host, so a failed task's row would block the next assignment.
+                   String failedTask = handler.result().getUuid();
+                   Future<Void> removed = asyncTaskHostMappingDao.removeMapping(hostId, failedTask);
+                   if (removed == null) {
+                       addInStack(hostId, future);
+                       return;
+                   }
+                   removed.setHandler(cleanup -> {
+                       if (cleanup.failed()) logger.error("could not clear failed task " + failedTask + " from " + hostId, cleanup.cause());
+                       addInStack(hostId, future);
+                   });
                } else {
                    logger.info("Machine " + hostId + " is assigned " + handler.result().getUuid());
                    removeFromStack(hostId);

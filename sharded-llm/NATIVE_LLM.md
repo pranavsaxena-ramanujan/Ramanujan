@@ -86,6 +86,201 @@ Ramanujan on every model.
 `--check-layers` error and llama.cpp agreement per model are in
 [GGUF_MODELS.md](GGUF_MODELS.md).
 
+## Capacity-aware placement (opt-in)
+
+Defaults remain unchanged. To reserve per-run placements rather than rely on
+first-request affinity assignment, use a backend implementing the plan API
+with its opt-in `RAMANUJAN_CAPACITY_AWARE=1` feature enabled:
+
+```sh
+python3 run_gguf_shards.py \
+  --package /path/to/model-layers --metadata /path/to/gguf-metadata.json \
+  --runtime native --homelab https://homelab.example \
+  --capacity-aware --weights auto --max-context 4096
+```
+
+`--capacity-aware` requires both native runtime and homelab. It rejects
+`--resident-weights`; choose `--weights auto|resident|stream` instead. A
+[canonical `--per-layer` conversion](converter/GGUF.md#reusable-per-layer-artifacts-opt-in)
+is reusable across topologies, but existing complete grouped packages also
+work. No conversion is performed during placement.
+
+**VRAM placement (default, `--capacity-placement vram`).** The orchestrator
+decides the shards. The driver splits the model into whole embedding/layer/head
+pieces and sends every piece's capacity estimate to `/llm/plan` with
+`"placement": "vram"`. `CapacityDao` reads each device's latest capacity ping
+(`/pings/capacity`, every 10 s: VRAM, RAM, disk, committed bytes) and sizes
+shards big to small: the device with the most free VRAM gets the longest run
+of consecutive layers that stays resident, then the next device, and so on. A
+20 GB model on 16 GB and 8 GB devices becomes ~16 GB plus ~4 GB, and a model
+that fits one device is not split. If resident memory cannot hold the model,
+one device also streams a run of middle layers from its disk cache
+(`[resident][stream][resident head]`, so the large output head stays resident
+and the streaming window stays small); the device is chosen to stream the
+fewest bytes. Each device range becomes one session; merged budgets add up
+weights and state but count per-session overheads (`sharedScratchBytes`,
+`streamSharedBytes`) once. The reply returns each range's `pieces`
+(`[start, end)`), host, mode and merged graph, which the driver opens verbatim.
+Placement is recomputed per run, so it follows devices joining, leaving or
+filling up. Usable VRAM is the device total minus `max(1 GiB, 10%)` and
+256 MiB headroom (or reported free memory when lower); unified-memory devices
+are also bounded by RAM.
+
+**Cached shards are reused.** Each worker keeps `shards.json` in its cache
+directory: per model (SHA-256 of the graph's key-sorted `hyper` JSON), the
+layer indices, embedding and head it has cached, and the weight files behind
+each. The manifest survives restarts and is scoped to the room's gateway.
+Capacity pings report it as `cachedShards: [{model, embed, head, layers:
+[[start, end), ...], bytes}]`, listing only units whose files are all still
+cached. When a device rejoins, the orchestrator keeps it on its cached range
+(after checking every file's size and mtime against `cachedFiles`, and
+trimming the range to what fits now). The gaps before and after that range are
+sharded big to small across the other devices. Example: a device that cached
+8 GB of a 16 GB model keeps those layers, and the remaining 8 GB starts at its
+end offset on another device. Each device still holds one contiguous range.
+The cache-anchored plan competes with the plain big-to-small plan. The plan
+that streams the fewest bytes wins, because streaming reads disk on every
+token. On a tie, the plan with fewer new downloads wins. Each range in the
+reply carries `downloadBytes` (0 means fully cached).
+
+Add `--capacity-dry-run` (`"dryRun": true`) to print
+each device's planned shard (`capacity-placement` event: layers, shard bytes,
+device bytes and download bytes) and exit before reserving, opening sessions
+or downloading weights. Packages with split
+layers, `--weights stream` and `--capacity-placement search` use the grouping below.
+
+For canonical `--per-layer` packages with `--capacity-placement search`, the driver creates one execution stage
+per embedding/layer/head, then coalesces consecutive pieces **before admission**
+into at most eight graphs/sessions by default (`--capacity-max-stages 8`).
+Every layer remains whole and the graphs read the original canonical files
+across shard directories. Each requested group has distinct per-run affinity
+and session identities.
+Use `--capacity-max-stages 1` for one internally streamed graph, another
+positive count for finer placement, or `0` to keep every piece separate.
+Existing grouped packages retain their coarse execution graphs (unless
+`--check-layers` explicitly requests separate pieces). That diagnostic also
+disables canonical coalescing so every layer remains observable. It does not merge
+graphs after admission or change the returned session bindings.
+Before any session opens it sends (the graph below is abbreviated; the actual
+request includes the complete native graph):
+
+```json
+{
+  "stages": [{
+    "affinity": "per-run-stage-affinity",
+    "session": "per-run-session",
+    "weightBytes": 123456,
+    "streamWorkingBytes": 789012,
+    "stateBytes": 345678,
+    "scratchBytes": 901234,
+    "maxAllocationBytes": 123456,
+    "graph": {"format": "ramanujan-llm-graph/1", "hyper": {}, "layers": []},
+    "files": [{"path": "/absolute/canonical/weights/tensor.bin", "bytes": 123456, "mtime": 1790950000000}]
+  }],
+  "weights": "auto"
+}
+```
+
+`POST /llm/plan` must return `status: "SUCCESS"`, a nonempty string `planId`,
+and the same ordered stages, each with exact `affinity`/`session`, nonempty
+string `hostId`, and resolved `weights: "resident"|"stream"`. The backend owns
+contiguous device assignment, pins the allocations, and honors explicit
+resident/stream requests. A host cannot disappear and reappear in the ordered
+placement. The driver rejects incomplete, reordered or invalid responses
+without opening sessions or releasing possibly pinned allocations.
+
+Returned modes replace each graph's `weights` setting. `planId` accompanies
+every `/llm/step`, `/llm/chain`, and `/llm/close` body, including reset closes.
+The plan request carries an immutable copy of the exact graph later sent at
+position zero, before that mode replacement; the backend stores it, applies
+the selected mode, and checks the first native step against it.
+After attempting **every** close, the driver sends
+`POST /llm/plan/release {"planId": "..."}` **only if all closes succeeded**.
+Timed-out/failed closes retain the reservation and surface an error containing
+the plan ID; retries close only unacknowledged sessions. Release failures are
+retryable. The backend must not acknowledge a close until queued/in-flight
+work is stopped and the session resources really are closed. Invalid prompts
+and tokenizer errors after admission also follow this cleanup path.
+
+### Budget contract and current limits
+
+`converter/ramanujan_shards/llm_capacity.py` derives budgets from each graph and
+the actual manifest descriptors, not package-wide estimates or model names:
+
+- `files.bytes` and `weightBytes` are sums of referenced
+  `tensorFiles.bytes`, validated against file sizes and quantized shapes.
+  Each file also carries its actual `mtime` in Unix-epoch milliseconds for
+  backend stat validation and cache identity.
+  Repeated references are deduplicated within a stage; different sessions
+  conservatively account for their own copies. Full embedding file bytes
+  are included in resident weights even though the runtime reads rows.
+- `streamWorkingBytes` covers a consumed layer/head plus `stream_depth`
+  prefetched cyclic items, bounded by the largest actual layer/head item,
+  and 32 MiB upload staging per loader thread. Embeddings need only one
+  quantized row; the RoPE input file is also included conservatively.
+- `stateBytes` covers FP32 K/V caches at `max_context` and hybrid Qwen35's
+  DeltaNet matrix/conv states, doubled for conservative host/device copies.
+- `scratchBytes` follows native graph allocations: FFN, query/attention,
+  full-context scores and RoPE, head logits, and global SSM workspace even
+  for an embedding/head-only hybrid stage. It doubles workspace, adds
+  full-context transport buffers, resident upload staging, per-file
+  bookkeeping, and an 8 MiB runtime margin per session.
+- `maxAllocationBytes` bounds the largest individual native allocation,
+  including graph weight tensors, mutable KV/DeltaNet buffers, context-sized
+  scratch/RoPE and batched hidden buffers. Embeddings contribute a quantized
+  row rather than the full file. Backend GPU admission can check this bound
+  against its device maximum allocation.
+
+These are conservative **combined host/device** reservation sizes. Backend
+admission must enforce them against effective usable capacity, account for
+other live sessions, and separately enforce native maximum-allocation limits.
+`files.bytes` describes disk transfers, not necessarily a device allocation:
+an embedding file can be huge while its row allocation is small. Conversely,
+KV/DeltaNet/RoPE buffers can exceed a device's maximum allocation even when
+each weight file fits. The driver communicates `maxAllocationBytes` precisely
+to avoid treating file-transfer sizes as those native per-buffer limits.
+
+The driver performs no aggregate resident-model-size rejection: models may
+exceed combined cluster RAM/VRAM if whole-layer streaming working sets and
+persistent state fit. There is **no tensor parallelism**. Streaming is not
+automatically feasible: a runtime that retains prefetched weights in every
+idle stage must reserve the sum of those live working sets. It cannot use a
+shared maximum across adjacent stages unless it actually unloads idle stream
+buffers or coalesces their execution. This Python change alone does not alter
+native streaming/session lifetime behavior.
+
+Explicitly choosing more than eight stages (including `0` or a large
+`--check-layers` diagnostic) can require more than the default eight worker
+sessions per device. Backend admission must honor any advertised session
+limit; workers must preserve every explicitly reserved session rather than
+silently LRU-evict it. For a larger planned ceiling, explicitly configure the
+worker's `--capacity-session-limit N`; it defaults to the legacy session cap
+for all workers unless an operator explicitly raises it. The actual configured
+ceiling is advertised as `capacitySessionLimit`. Backend admission must apply that
+ceiling only to validated plans and include existing/opening sessions. Otherwise
+distribute sessions across enough devices. Default pre-admission
+coalescing avoids that cap for a single plan without worker-side eviction.
+The driver never merges already-reserved sessions into an unreserved
+representative session.
+
+Pre-admission grouping bounds retained streaming windows and lets a 65-layer
+canonical package fit the default eight-session worker cap without eviction.
+The backend still sums the actual per-group windows and persistent state; a
+group's graph streams its own layers internally. Groups are fixed for that
+run before their graph/budgets are reserved, never merged after placement.
+Smaller stage counts reduce independent idle stream windows; larger counts
+offer finer device placement at the cost of more windows and sessions.
+
+Capacity estimation is supported for registered `llama`, `qwen2`, `qwen3`,
+`phi3`, `gemma`, and `qwen35` graph shapes. Unknown architectures/mixers,
+unsupported quantization, missing/invalid bytes or state dimensions, stale
+files, and overflowing context indexing fail before admission instead of
+guessing. Unregistered architectures still work through the unchanged
+non-capacity-aware path.
+
+Unit tests use fixture files, mocked HTTP/native constructors, and fake local
+homelabs; they do not contact a live cluster or prove hardware admission.
+
 ## Design
 
 ```mermaid

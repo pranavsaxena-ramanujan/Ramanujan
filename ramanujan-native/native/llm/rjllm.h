@@ -41,6 +41,15 @@ RJLLM_API void rjllm_reset(rjllm_session *session);
 // valid until the next call on it.
 RJLLM_API const char *rjllm_info(rjllm_session *session);
 
+// Already-selected device telemetry; does not initialize OpenCL. Thread-local JSON.
+// gpuAllocatedBytes counts live runtime buffers; gpuResidentBytes counts resident weights only.
+// Neither includes other processes or driver overhead; free GPU memory remains unknown.
+RJLLM_API const char *rjllm_capacity_info(void);
+
+// Prepares the selected device/context/kernels without creating a session or touching existing state.
+// Returns 0 on success; fills err on failure. Safe to call repeatedly.
+RJLLM_API int rjllm_prepare_capacity(char *err, size_t err_len);
+
 RJLLM_API void rjllm_close(rjllm_session *session);
 
 #ifdef __cplusplus

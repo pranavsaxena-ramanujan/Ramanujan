@@ -6,6 +6,7 @@ import android.content.pm.ServiceInfo;
 import android.os.*;
 import in.ramanujan.cluster.client.common.JoinClient;
 import in.ramanujan.developer.console.operationImpl.ExecuteInlineWorker;
+import in.ramanujan.developer.console.operationImpl.WorkerCapacity;
 import java.util.Arrays;
 import java.util.concurrent.*;
 
@@ -42,7 +43,14 @@ public final class RoomWorkerService extends Service {
                 prefs.edit().putString("status", "Checking native libraries and OpenCL…").apply();
                 NativePreflight.verify(this);
                 if (stopped) return;
-                ExecuteInlineWorker running = new ExecuteInlineWorker();
+                ExecuteInlineWorker running = new ExecuteInlineWorker(root -> {
+                    ActivityManager.MemoryInfo memory = new ActivityManager.MemoryInfo();
+                    getSystemService(ActivityManager.class).getMemoryInfo(memory);
+                    Long disk = null;
+                    try { disk = new StatFs(root.toString()).getAvailableBytes(); }
+                    catch (IllegalArgumentException ignored) {}
+                    return new WorkerCapacity.Snapshot(memory.totalMem, memory.availMem, disk);
+                });
                 worker = running;
                 if (stopped) { running.stop(); return; }
                 prefs.edit().putString("status", "Running — private room, OpenCL available (GPU compatibility untested)").apply();

@@ -117,7 +117,7 @@ function trimAtStop(text, stops) {
   return text.slice(0, end).trim();
 }
 
-function createInference({ runner, python = 'python3' }) {
+function createInference({ runner, python = 'python3', capacityAware = false }) {
   return ({ model, messages, question, roomId, apiToken, publicUrl }) => new Promise((resolve, reject) => {
     const chat = chatTurns(model, messages ?? [{ role: 'user', content: question }]);
     const env = { RAMANUJAN_PORTAL_TOKEN: apiToken };
@@ -126,7 +126,8 @@ function createInference({ runner, python = 'python3' }) {
     }
     const child = spawn(python, [runner, '--runtime', 'native', '--homelab', `${publicUrl}/api/clusters/${roomId}/homelab`,
       '--package', model.package, '--metadata', model.metadata, '--prompt-turns', '-', '--max-new-tokens', String(model.maxNewTokens ?? 128),
-      '--max-context', String(model.maxContext ?? 1024), '--timeout', String(model.requestTimeout ?? 120)],
+      '--max-context', String(model.maxContext ?? 1024), '--timeout', String(model.requestTimeout ?? 120),
+      ...(capacityAware ? ['--capacity-aware'] : [])],
     { env, stdio: ['pipe', 'pipe', 'pipe'] });
     child.stdin.on('error', () => {});
     child.stdin.end(JSON.stringify(chat));
@@ -154,6 +155,8 @@ function createInference({ runner, python = 'python3' }) {
       }
       try {
         const events = stdout.split('\n').filter(line => line.trim().startsWith('{')).map(line => JSON.parse(line));
+        const placement = events.findLast(event => event.event === 'capacity-placement');
+        if (placement) console.log('LLM capacity placement:', JSON.stringify(placement.devices));
         const result = events.findLast(event => event.event === 'completion');
         if (!result || typeof result.text !== 'string') throw new Error('Native runner did not return generated text');
         const fit = events.findLast(event => event.event === 'prompt-fit');

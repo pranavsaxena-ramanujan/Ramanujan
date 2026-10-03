@@ -106,6 +106,34 @@ test('owner LLM gateway tags requests and blocks local filesystem escape', async
   }, owner)).status, 404);
 });
 
+test('capacity telemetry uses authenticated device identity and planning remains owner-only', async t => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'rj-capacity-test-'));
+  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  const file = path.join(root, 'weights.bin');
+  await fs.writeFile(file, 'weights');
+  const f = await fixture(t, { modelRoot: root });
+  const owner = await f.register();
+  const room = await f.room(owner);
+  const joined = await f.request('/api/devices/join', {
+    roomId: room.roomId, joinSecret: room.joinSecret, name: 'Linux', platform: 'linux'
+  });
+  const worker = new URL(joined.data.workerUrl).pathname;
+  assert.equal((await f.request(`${worker}/pings/capacity`, {
+    schemaVersion: 1, hostId: 'forged', clusterId: 'other', sequence: 1, bootId: 'boot'
+  })).status, 200);
+  const payload = JSON.parse(f.calls[0].init.body);
+  assert.equal(payload.hostId, joined.data.deviceId);
+  assert.equal(payload.clusterId, room.clusterId);
+  assert.equal((await f.request(`${worker}/llm/plan`, {})).status, 404);
+  const route = `/api/clusters/${room.roomId}/homelab/llm/plan`;
+  assert.equal((await f.request(route, { stages: [{ files: [{ path: file, bytes: 7 }] }] }, owner)).status, 200);
+  assert.equal(JSON.parse(f.calls[1].init.body).clusterId, room.clusterId);
+  assert.equal((await f.request(route, { stages: [{ files: [{ path: __filename, bytes: 7 }] }] }, owner)).status, 403);
+  assert.equal((await f.request(route, {}, await f.register())).status, 404);
+  assert.equal((await f.request(`/api/clusters/${room.roomId}/homelab/llm/capacity?clusterId=other`, null, owner)).status, 200);
+  assert.equal(f.calls.at(-1).url.searchParams.get('clusterId'), room.clusterId);
+});
+
 test('cookie writes reject CSRF and production requires HTTPS', async t => {
   const f = await fixture(t);
   const owner = await f.register();

@@ -82,6 +82,10 @@ compatibility needs validation on the actual device.
 Binary cache objects are namespaced by a hash of the worker gateway URL, so
 different rooms/devices cannot reuse model bytes solely because paths and file
 stat metadata match. No bearer URL is written into cache metadata.
+The worker records which LLM shards it holds (model, layer offsets, embedding,
+head) in `shards.json` in the cache directory. It reports them in capacity pings,
+so after a restart or rejoin the orchestrator gives the device back its cached
+layers and shards only the remainder to other devices.
 The supplied `ws` interpreter lacks `changeShard`; legacy interpreter tasks
 requiring weight eviction fail visibly in the log and completion response.
 Dedicated LLM chat uses the separate native runtime and does not require that

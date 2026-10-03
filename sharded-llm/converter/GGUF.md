@@ -22,6 +22,36 @@ contiguous layer ranges; other GGUFs fall back to tensor-level grouping. Every
 tensor is assigned once. Unknown GGML quantization types are preserved as opaque
 bytes, including any alignment padding, rather than silently transcoded.
 
+### Reusable per-layer artifacts (opt-in)
+
+Add `--per-layer` to emit a canonical package with one `blk.N` group per shard:
+
+```sh
+PYTHONPATH=. python3 -m ramanujan_shards.emit_gguf \
+  --gguf /path/to/model.gguf --output-dir /path/to/model-layers --per-layer
+```
+
+This mode ignores the requested `--shards` count when partitioning; artifact
+paths and bytes depend on the model, not the current worker topology. Global
+embedding/RoPE tensors accompany block 0, output tensors accompany the final
+block, and every source tensor is copied exactly once. Auxiliary GGUF blocks
+are retained as before. `--shard-index N` selects canonical block N, not a
+worker assignment. GGUFs without decoder blocks are rejected in this mode.
+The existing default grouped conversion is unchanged.
+
+Reuse this same package when workers join/leave; do not reconvert for each
+topology. The native runner's `--capacity-aware` option plans embedding,
+individual decoder layers, and the head from this canonical layout at run time, while the backend can
+chain multiple adjacent stages on one device. It also accepts existing grouped
+packages, preserving their coarse stage graphs. Fine-grained execution graphs
+do not duplicate the canonical tensor files.
+Canonical pieces are coalesced before admission into at most eight sessions
+by default, so a 65-block package does not require 65 live sessions per device.
+`--capacity-max-stages N` controls this bound; `0` requests every piece
+separately. This groups execution graphs, not artifact files, and requires no
+second GGUF conversion.
+See [../NATIVE_LLM.md](../NATIVE_LLM.md#capacity-aware-placement-opt-in).
+
 On an individual device, add `--shard-index 1` (zero-based) to fetch only that
 device's assigned shard from the URL and store it at `--output-dir`. Run the
 same verifier on this partial package; all devices must use the same `--shards`

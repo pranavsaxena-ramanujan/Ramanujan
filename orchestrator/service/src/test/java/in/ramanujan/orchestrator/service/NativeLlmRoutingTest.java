@@ -217,6 +217,37 @@ public class NativeLlmRoutingTest {
     }
 
     @Test
+    public void plannedTaskStaysOnItsCapacityHostAfterReloadingTheQueuedRow() throws Exception {
+        try (Fixture f = new Fixture()) {
+            in.ramanujan.db.layer.utils.CapacityStore store = new in.ramanujan.db.layer.utils.CapacityStore();
+            inject(store, "queryExecutor", f.query);
+            CapacityDao real = new CapacityDao();
+            inject(real, "store", store);
+            CapacityDao capacity = spy(real);
+            doReturn(true).when(capacity).enabled();
+            inject(f.hosts, "capacityDao", capacity);
+            inject(f.llm, "capacityDao", capacity);
+            String binding = NativeLlmService.binding("A", "shard", "s");
+            await(store.<Void>atomic("A", state -> {
+                state.hosts.put("b", map("hostId", "b", "bootId", "boot"));
+                state.plans.put("plan", map("planId", "plan", "state", "ACTIVE", "stages", Collections.singletonList(
+                        map("binding", binding, "affinity", "shard", "session", "s", "hostId", "b", "bootId", "boot",
+                                "graph", map(), "files", Collections.emptyList(), "opened", true))));
+                return null;
+            }));
+            f.hosts.putMachineForComputation("a", "A");
+            f.hosts.putMachineForComputation("b", "A");
+            Future<Map<String, Object>> close = f.llm.execute(map("clusterId", "A", "affinity", "shard",
+                    "session", "s", "planId", "plan", "timeout", 5), "close", f.vertx);
+            // Reserved hosts are hidden from unpinned work, so only the pinned host may take it.
+            AsyncTask task = f.poll("b", "A");
+            assertEquals("b", task.getHostAssigned());
+            f.finish(task, "b", "A", map("closed", true));
+            assertNull(await(close).get("error"));
+        }
+    }
+
+    @Test
     public void untaggedNativeWorkCanUseClusteredDeviceAndNewBindingsSpreadAcrossDevices() throws Exception {
         try (Fixture f = new Fixture()) {
             f.hosts.putMachineForComputation("a", "A", 1);

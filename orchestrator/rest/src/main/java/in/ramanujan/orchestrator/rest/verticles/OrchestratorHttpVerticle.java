@@ -61,6 +61,7 @@ public class OrchestratorHttpVerticle extends AbstractVerticle {
     @Autowired private NativeLlmHandler nativeLlmHandler;
     @Autowired private WorkerBinaryHandler workerBinaryHandler;
     @Autowired private WorkerBinaryUploadHandler workerBinaryUploadHandler;
+    @Autowired private CapacityHandler capacityHandler;
 
 
     @Override
@@ -116,6 +117,10 @@ public class OrchestratorHttpVerticle extends AbstractVerticle {
         router.post("/llm/step").handler(event -> nativeLlmHandler.handle(event, "step"));
         router.post("/llm/chain").handler(event -> nativeLlmHandler.handle(event, "chain"));
         router.post("/llm/close").handler(event -> nativeLlmHandler.handle(event, "close"));
+        router.post("/pings/capacity").handler(event -> capacityHandler.handle(event, "report"));
+        router.get("/llm/capacity").handler(event -> capacityHandler.handle(event, "snapshots"));
+        router.post("/llm/plan").handler(event -> capacityHandler.handle(event, "plan"));
+        router.post("/llm/plan/release").handler(event -> capacityHandler.handle(event, "release"));
         router.get("/binary/fetch").handler(event -> workerBinaryHandler.handle(event, false));
         router.get("/binary/stat").handler(event -> workerBinaryHandler.handle(event, true));
         router.post("/orchestrator/uploadBinary").handler(workerBinaryUploadHandler::handle);

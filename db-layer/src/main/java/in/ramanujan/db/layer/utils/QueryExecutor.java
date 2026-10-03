@@ -65,6 +65,43 @@ public class QueryExecutor {
 
     private DB_TYPE dbType;
 
+    public boolean isInMemory() {
+        return dbType == DB_TYPE.IN_MEM;
+    }
+
+    @FunctionalInterface
+    public interface Transaction<T> {
+        T execute(Connection connection) throws Exception;
+    }
+
+    public <T> Future<T> transaction(Transaction<T> work) {
+        if (dbType != DB_TYPE.GCP || context == null || dataSource == null) {
+            return Future.failedFuture("SQL executor is not initialized");
+        }
+        Future<T> result = Future.future();
+        context.<T>executeBlocking(blocking -> {
+            try (Connection connection = dataSource.getConnection()) {
+                connection.setAutoCommit(false);
+                try {
+                    T value = work.execute(connection);
+                    connection.commit();
+                    blocking.complete(value);
+                } catch (Exception error) {
+                    try { connection.rollback(); }
+                    catch (SQLException rollback) { error.addSuppressed(rollback); }
+                    throw error;
+                }
+            } catch (Exception error) {
+                logger.error("Database transaction failed", error);
+                blocking.fail(error);
+            }
+        }, false, done -> {
+            if (done.succeeded()) result.complete(done.result());
+            else result.fail(done.cause());
+        });
+        return result;
+    }
+
     public static enum DB_TYPE {
         GCP,
         IN_MEM;

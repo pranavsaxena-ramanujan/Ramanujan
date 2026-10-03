@@ -416,6 +416,21 @@ def parse_args():
     parser.add_argument("--weights", choices=["auto", "resident", "stream"], default="auto",
                         help="native runtime: keep stage weights on the device, or stream them per step "
                              "(auto: resident when they fit in half of device and system memory)")
+    parser.add_argument("--capacity-aware", action="store_true",
+                        help="native + homelab only: reserve a per-run contiguous stage placement plan "
+                             "before opening sessions; use backend-selected resident/stream modes")
+    parser.add_argument("--capacity-max-stages", type=int, default=8,
+                        help="capacity-aware canonical packages: coalesce consecutive pieces BEFORE "
+                             "admission into at most this many graph/session stages (default 8); "
+                             "0 keeps every piece separate; used by --capacity-placement search")
+    parser.add_argument("--capacity-placement", choices=["vram", "search"], default="vram",
+                        help="capacity-aware: vram (default) lets the orchestrator give the device with the "
+                             "most free VRAM the largest whole-layer resident shard, then the next device, and "
+                             "stream any remainder on one device; search coalesces to --capacity-max-stages "
+                             "and lets the backend choose hosts")
+    parser.add_argument("--capacity-dry-run", action="store_true",
+                        help="capacity-aware vram placement: print each device's planned shard and exit "
+                             "before reserving, opening sessions or downloading weights")
     parser.add_argument("--stream-depth", type=int, default=2,
                         help="native runtime: layers uploaded ahead while streaming")
     parser.add_argument("--stream-threads", type=int, default=2,
@@ -423,6 +438,16 @@ def parse_args():
     add_model_arguments(parser)
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()
+    if args.capacity_max_stages < 0:
+        parser.error("--capacity-max-stages must be nonnegative")
+    if args.capacity_aware and (args.runtime != "native" or not args.homelab):
+        parser.error("--capacity-aware requires --runtime native and --homelab")
+    if args.capacity_aware and args.resident_weights:
+        parser.error("--capacity-aware uses --weights, not --resident-weights")
+    if args.capacity_aware and args.capacity_placement == "vram" and args.weights == "stream":
+        parser.error("--capacity-placement vram needs --weights auto or resident (use search for stream)")
+    if args.capacity_dry_run and not (args.capacity_aware and args.capacity_placement == "vram"):
+        parser.error("--capacity-dry-run requires --capacity-aware with vram placement")
     if args.prefetch_steps is None:
         args.prefetch_steps = 0 if args.homelab else 1
     if args.runtime == "dsl" and args.work_dir is None:
@@ -449,20 +474,20 @@ def main():
         runner = NativeGgufRunner(args)
     else:
         runner = GgufRunner(args)
-    spec = runner.spec
-    if chat is not None:
-        args.prompt, tokens, dropped = fit_chat_prompt(
-            runner.tokenizer, *chat, budget=args.max_context - args.max_new_tokens)
-        print(json.dumps({"event": "prompt-fit", "droppedTurns": dropped}), flush=True)
-    else:
-        tokens = runner.tokenizer.encode(args.prompt)
-    print(json.dumps({"event": "model", "architecture": spec.architecture, "layers": len(spec.layers),
-                      "kinds": {k.id: k.mixer for k in spec.kinds.values()}, "shards": len(runner.shards),
-                      "assumptions": spec.assumptions}), flush=True)
-    if not tokens or len(tokens) + args.max_new_tokens > args.max_context:
-        raise SystemExit("prompt plus new tokens must fit in --max-context")
-    print(json.dumps({"event": "prompt", "tokens": tokens}), flush=True)
     try:
+        spec = runner.spec
+        if chat is not None:
+            args.prompt, tokens, dropped = fit_chat_prompt(
+                runner.tokenizer, *chat, budget=args.max_context - args.max_new_tokens)
+            print(json.dumps({"event": "prompt-fit", "droppedTurns": dropped}), flush=True)
+        else:
+            tokens = runner.tokenizer.encode(args.prompt)
+        print(json.dumps({"event": "model", "architecture": spec.architecture, "layers": len(spec.layers),
+                          "kinds": {k.id: k.mixer for k in spec.kinds.values()}, "shards": len(runner.shards),
+                          "assumptions": spec.assumptions}), flush=True)
+        if not tokens or len(tokens) + args.max_new_tokens > args.max_context:
+            raise SystemExit("prompt plus new tokens must fit in --max-context")
+        print(json.dumps({"event": "prompt", "tokens": tokens}), flush=True)
         if args.check_layers:
             reference = LlmReference(spec, runner.tensors)
             on_layer, _, report = _compare(reference, runner, tokens)

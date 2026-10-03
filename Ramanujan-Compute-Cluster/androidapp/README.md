@@ -40,7 +40,7 @@ native/OpenCL availability; it is not claimed here.
 ## Actual reuse and native packaging
 
 Gradle copies a narrow set of shared sources into an ignored generated directory:
-`ExecuteInlineWorker`, `WorkerBinaryCache`, `LlmTaskHandler`, `Operation`, and
+`ExecuteInlineWorker`, `WorkerBinaryCache`, `LlmTaskHandler`, `WorkerCapacity`, `Operation`, and
 the desktop join protocol classes. It does not include the developer console's
 server/orchestrator implementation. `rule-engine` supplies the real
 `NativeProcessor`, protobuf serializer, and `LlmSession`.
@@ -70,7 +70,7 @@ browser-held management key; devices only use room ID and join secret.
 
 The joined bearer URL and device/room identity live in app-private preferences.
 The join secret is cleared, never persisted. Backup is disabled. Requests use
-the scoped worker base for `/pings/open`, `/task/complete`, `/binary/stat`,
+the scoped worker base for `/pings/open`, `/pings/capacity`, `/task/complete`, `/binary/stat`,
 `/binary/fetch`, and `/orchestrator/uploadBinary`; room and device identity are
 enforced by the portal gateway.
 Binary uploads retain `uuid=<task UUID>&arrayId=...`, both scoped and legacy.
@@ -104,6 +104,28 @@ interrupt a running JNI/GPU call. The service is not sticky and is not started
 at boot; Android may still stop it under power/memory restrictions.
 The same shared worker paces immediate empty central polls to a 100 ms total
 duration, without adding delay to existing longer homelab polls or task responses.
+
+An independent sampler posts capacity approximately every 10 seconds, including
+during downloads, polling and inference. Before its first post, the sampler
+prepares the selected native LLM device/context and kernels without opening a
+model session, resetting state or evicting weights. Thus cold workers report GPU
+total/max-allocation and runtime readiness before their first capacity plan.
+Probe failures remain explicit in statistics and do not stop legacy polling.
+Android injects physical RAM measurements
+from `ActivityManager.MemoryInfo` and cache-filesystem free space from `StatFs`;
+JVM heap size is never reported as device RAM. GPU counters come only from the
+already-selected native OpenCL device; unsupported free-memory counters are null.
+Sessions stay pinned until explicit `/llm/close` or shutdown, never LRU-evicting state.
+Legacy and planned work both default to an eight-session ceiling. Drivers may
+group adjacent canonical layers into native graphs before capacity admission.
+An operator may explicitly raise the planned ceiling with
+`--capacity-session-limit` on the shared worker, subject to backend resource
+admission, without unbounding legacy work. Downloads preserve a 64 MiB disk reserve.
+Explicit native `weights: "stream"` remains supported for models larger than cluster
+RAM/VRAM; one device can host multiple pinned contiguous stages. Assigned weights
+are preflighted against incremental disk space, not required to fit physical memory.
+See [worker capacity protocol](../../../developer-console/WORKER_CAPACITY.md) for
+schema, counter semantics and limitations.
 
 ## Signed release
 

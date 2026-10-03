@@ -23,8 +23,11 @@ def load_package(package_dir):
             if root not in path.parents:
                 raise ValueError("tensor path escapes shard: {0}".format(name))
             tensors[name] = dict(tensor, file=path, shard=len(shards))
-        shards.append({"id": entry["shardId"], "root": root, "tensors": tensors,
-                       "layerStart": manifest.get("layerStart"), "layerEnd": manifest.get("layerEnd")})
+        shard = {"id": entry["shardId"], "root": root, "tensors": tensors,
+                 "layerStart": manifest.get("layerStart"), "layerEnd": manifest.get("layerEnd")}
+        if "artifactLayout" in package:
+            shard["artifactLayout"] = package["artifactLayout"]
+        shards.append(shard)
     return package, shards
 
 

@@ -7,8 +7,8 @@ const { Readable } = require('node:stream');
 const { pipeline } = require('node:stream/promises');
 const { token, digest, hashSecret, verifySecret, HttpError, text, sessionToken, requireOrigin } = require('./security');
 const asyncRoute = fn => (req, res, next) => Promise.resolve(fn(req, res)).catch(next);
-const workerRoutes = new Set(['/pings/open', '/pings/heartbeat', '/task/complete', '/binary/fetch', '/binary/stat', '/orchestrator/uploadBinary']);
-const ownerRoutes = new Set(['/llm/chain', '/llm/step', '/llm/close']);
+const workerRoutes = new Set(['/pings/open', '/pings/heartbeat', '/pings/capacity', '/task/complete', '/binary/fetch', '/binary/stat', '/orchestrator/uploadBinary']);
+const ownerRoutes = new Set(['/llm/chain', '/llm/step', '/llm/close', '/llm/capacity', '/llm/plan', '/llm/plan/release']);
 const platforms = new Set(['windows', 'linux', 'macos', 'android']);
 const dummyHash = '00000000000000000000000000000000:' + '00'.repeat(64);
 
@@ -122,13 +122,17 @@ function createApp({ store, publicUrl, orchestratorUrl, middlewareUrl, homelabUr
     await store.createDevice({ id, clusterId: room.id, tokenHash: digest(value), name, platform });
     res.status(201).json({ deviceId: id, clusterId: room.id, workerUrl: `${publicOrigin}/worker/${value}` });
   }));
-  async function validateModelFiles(body, ownerId) {
+  async function validateModelFiles(body, ownerId, capacityPlan = false) {
     const candidates = new Set();
     function walk(value, key) {
       if (key === 'file' && typeof value === 'string') candidates.add(value);
       if (key === 'files') {
-        if (!Array.isArray(value) || value.some(file => typeof file !== 'string')) throw new HttpError(400, 'files must be an array of paths');
-        for (const file of value) candidates.add(file);
+        if (!Array.isArray(value)) throw new HttpError(400, 'files must be an array of paths');
+        for (const file of value) {
+          if (typeof file === 'string' && !capacityPlan) candidates.add(file);
+          else if (capacityPlan && file && typeof file.path === 'string') candidates.add(file.path);
+          else throw new HttpError(400, 'Invalid model file declaration');
+        }
       }
       if (value && typeof value === 'object') for (const [name, child] of Object.entries(value)) walk(child, name);
     }
@@ -164,7 +168,7 @@ function createApp({ store, publicUrl, orchestratorUrl, middlewareUrl, homelabUr
       if (req.is('application/json')) {
         const payload = { ...req.body, clusterId };
         if (deviceId) payload.hostId = deviceId;
-        if (!deviceId) await validateModelFiles(payload, ownerId);
+        if (!deviceId) await validateModelFiles(payload, ownerId, route === '/llm/plan');
         body = JSON.stringify(payload);
         headers['Content-Type'] = 'application/json';
       } else {
@@ -189,6 +193,9 @@ function createApp({ store, publicUrl, orchestratorUrl, middlewareUrl, homelabUr
       if (response.body) await pipeline(Readable.fromWeb(response.body), res);
       else res.end();
     } catch (error) {
+      if (['UND_ERR_HEADERS_TIMEOUT', 'UND_ERR_BODY_TIMEOUT', 'UND_ERR_CONNECT_TIMEOUT'].includes(error.cause?.code)) {
+        throw new HttpError(504, 'Execution service timed out. Active device work may still be running; check its status before starting another inference.');
+      }
       if (['ECONNREFUSED', 'ENOTFOUND', 'ETIMEDOUT'].includes(error.cause?.code)) {
         throw new HttpError(503, 'The computation service is not running or reachable. Start the local orchestrator before starting device workers.');
       }
@@ -388,7 +395,7 @@ function createApp({ store, publicUrl, orchestratorUrl, middlewareUrl, homelabUr
   app.use((error, req, res, next) => {
     if (res.headersSent) return next(error);
     const status = error.status || 500;
-    if (status >= 500) console.error('Portal request failed:', error.code || error.name);
+    if (status >= 500) console.error('Portal request failed:', error.cause?.code || error.code || error.name);
     res.status(status).json({ error: error instanceof HttpError || status < 500 ? error.message : 'Service unavailable; check server logs' });
   });
   return app;

@@ -90,6 +90,21 @@ public class ClusterRoutingTest {
     }
 
     @Test
+    public void failedTaskMappingIsClearedSoTheHostCanTakeTheNextTask() throws Exception {
+        AsyncTaskHostMappingDaoHashMapImpl mapping = new AsyncTaskHostMappingDaoHashMapImpl();
+        mapping.init();
+        HostDaoStackImpl hosts = hosts(mapping);
+        hosts.putMachineForComputation("a", "A");
+        AsyncTask failed = task("failed", "A");
+        assertEquals("a", hosts.getMachine(failed, false).result());
+        failed.setStatus(Status.FAILURE.getKeyName());
+        assertNull(hosts.putMachineForComputation("a", "A").result());
+        assertNull(mapping.getMapping("a").result());
+        assertEquals("a", hosts.getMachine(task("next", "A"), false).result());
+        assertEquals("next", mapping.getMapping("a").result().getUuid());
+    }
+
+    @Test
     public void untaggedTasksAcceptEveryClusterAndStaleHostsAreRemoved() throws Exception {
         for (String cluster : new String[]{null, "A", "B"}) {
             AsyncTaskHostMappingDaoHashMapImpl mapping = new AsyncTaskHostMappingDaoHashMapImpl();

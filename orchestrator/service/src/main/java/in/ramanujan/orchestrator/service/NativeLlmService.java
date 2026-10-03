@@ -2,6 +2,7 @@ package in.ramanujan.orchestrator.service;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import in.ramanujan.db.layer.schema.NativeAffinityOwner;
+import in.ramanujan.orchestrator.base.NativeSessionKey;
 import in.ramanujan.orchestrator.base.enums.Status;
 import in.ramanujan.orchestrator.base.pojo.AsyncTask;
 import in.ramanujan.orchestrator.data.dao.*;
@@ -21,20 +22,15 @@ public class NativeLlmService {
     @Autowired private AsyncTaskHostMappingDao hostMappingDao;
     @Autowired private HostsDao hostsDao;
     @Autowired private NativeAffinityDao affinityDao;
+    @Autowired private CapacityDao capacityDao;
     private final ObjectMapper mapper = new ObjectMapper();
 
-    private static String part(String value) {
-        return value == null ? "-1:" : value.length() + ":" + value;
-    }
-
     public static String binding(String cluster, String affinity, String session) {
-        String binding = part(cluster) + part(affinity) + part(session);
-        if (binding.length() > 512) throw new IllegalArgumentException("Native binding is too long");
-        return binding;
+        return NativeSessionKey.binding(cluster, affinity, session);
     }
 
     private static String session(String cluster, String session) {
-        return part(cluster) + part(session);
+        return NativeSessionKey.session(cluster, session);
     }
 
     private static String required(Map<String, Object> request, String field) {
@@ -131,6 +127,7 @@ public class NativeLlmService {
         }
         Map<String, Object> payload = new LinkedHashMap<>();
         payload.put("op", "chain");
+        if (request.get("planId") != null) payload.put("planId", required(request, "planId"));
         payload.put("stages", group);
         payload.put("n", request.get("n"));
         payload.put("pos", request.get("pos"));
@@ -173,7 +170,12 @@ public class NativeLlmService {
         task.setNativeBindings(bindings);
         Set<String> allowedFiles = new LinkedHashSet<>(declaredFiles);
         String position = NativeAffinityDao.position(payload);
-        Future<Void> owners = Future.succeededFuture();
+        Future<Void> owners;
+        if (payload.get("planId") != null) {
+            if (capacityDao == null) return Future.failedFuture("Capacity admission is unavailable");
+            owners = capacityDao.pin(cluster, required(payload, "planId"), bindings, payload, declaredFiles)
+                    .map(host -> { task.setNativePreferredHost(host); return (Void) null; });
+        } else owners = Future.succeededFuture();
         for (String binding : bindings) {
             owners = owners.compose(ignored -> affinityDao.get(binding).compose(owner -> {
                 if (owner == null) return Future.succeededFuture();
@@ -221,6 +223,8 @@ public class NativeLlmService {
                             .map(failed -> failed);
                 }
                 if ("QUEUED".equals(task.getNativeState())) {
+                    // The capacity-plan host is pinned in memory only; the reloaded row does not carry it.
+                    if (task.getNativePreferredHost() == null) task.setNativePreferredHost(submitted.getNativePreferredHost());
                     return refreshPlacement(task).compose(ignoredPlacement -> hostsDao.getMachine(task, false))
                             .map(host -> (Map<String, Object>) null);
                 }
@@ -282,8 +286,11 @@ public class NativeLlmService {
         return asyncTaskDao.update(task.getUuid(), update).compose(ignored ->
                 hostMappingDao.removeMapping(task.getHostAssigned(), task.getUuid())).compose(ignored -> {
                     if (failed) return affinityDao.state(task.getNativeBindings(), "FAILED");
-                    if ("close".equals(task.getLlm().get("op"))) return affinityDao.state(task.getNativeBindings(), "CLOSED");
-                    return Future.succeededFuture();
+                    boolean closed = "close".equals(task.getLlm().get("op"));
+                    Future<Void> state = closed ? affinityDao.state(task.getNativeBindings(), "CLOSED") : Future.succeededFuture();
+                    if (task.getLlm().get("planId") == null) return state;
+                    return state.compose(done -> capacityDao.completed(task.getClusterId(),
+                            (String) task.getLlm().get("planId"), task.getNativeBindings(), closed));
                 });
     }
 
