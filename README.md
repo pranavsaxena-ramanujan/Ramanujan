@@ -30,21 +30,28 @@ They just have to download and install the `ramanujan` client one-time.
 Researchers and simulation developers just need to write their simulation in Python and run it on the cluster. The
 cluster nodes don't need Python installed on them — each node runs the native **Ramanujan interpreter**, which executes
 the compiled simulation directly. See [docs/architecture.md](docs/architecture.md) for more on how Python code is
-compiled down to the Ramanujan runtime.
+compiled down to the Ramanujan runtime, and [docs/python-support.md](docs/python-support.md) for supported syntax, multi-file imports, and execution modes.
+
 
 
 ## Documentation
+The new private compute-room portal, desktop client, Android app and installers
+live in [Ramanujan-Compute-Cluster/](Ramanujan-Compute-Cluster/README.md).
+Rooms use a browser-held management key without login/signup, and devices join
+with a room ID and join secret. The existing middleware, orchestrator and SQL
+layer remain the shared execution backend.
+
 This README covers only the high-level project description. The rest of the documentation has been split into
 focused pages under [docs/](docs/):
 
 | Document | Description |
 |---|---|
-| [docs/python-support.md](docs/python-support.md) | Writing computations in Python (actively developed) — supported/unsupported features, examples. |
+| [docs/python-support.md](docs/python-support.md) | Writing computations in Python (actively developed) — supported/unsupported features, multi-file imports, execution modes, examples. |
 | [docs/gpu-acceleration.md](docs/gpu-acceleration.md) | GPU acceleration support via OpenCL — kernel generation, built-ins, memory management. |
 | [docs/ramanujan-language.md](docs/ramanujan-language.md) | The original `ramanujan` language (**deprecated**) — variables, arrays, functions, loops, threads. |
 | [docs/architecture.md](docs/architecture.md) | Code-flow across dev-console, middleware, orchestrator, and the native interpreter. |
+| [ORCHESTRATION.md](ORCHESTRATION.md) | Cluster rooms, `clusterId` routing, device protocol and the orchestrator's LLM sharding algorithm. |
 | [docs/build-and-usage.md](docs/build-and-usage.md) | Build and usage strategy — Maven build, native build, Docker, configuration. |
 | [docs/contributor-guide.md](docs/contributor-guide.md) | Contributor quick start — running a Monte Carlo example on a computer and Android phone. |
 | [docs/roadmap.md](docs/roadmap.md) | Future of the language and platform. |
 | [docs/csv-data-usage.md](docs/csv-data-usage.md) | Direct CSV data loading, the `dump` command, and the Phi-3 inference example. |
-

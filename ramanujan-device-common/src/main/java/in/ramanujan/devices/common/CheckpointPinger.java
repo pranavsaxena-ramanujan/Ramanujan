@@ -11,7 +11,6 @@ import java.util.concurrent.TimeUnit;
 import static in.ramanujan.devices.common.OrchestratorApiCallHelper.*;
 
 public class CheckpointPinger {
-    private static String heartBeatUri = "/pings/heartbeat";
 
 
     static CompletableFuture startTimer(final Processor processor, final Credentials credentials) {
@@ -27,7 +26,6 @@ public class CheckpointPinger {
     private static void pingCheckpoint(Checkpoint checkpoint, Credentials credentials) {
         Request request = new Request.Builder()
                 .post(RequestBody.create(JSON, ""))
-              //  .url(host + heartBeatUri + "?uuid=" + uuid)
                 .build();
 
         try {

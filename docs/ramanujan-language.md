@@ -386,6 +386,5 @@ def getBest(var train:array, var best:integer, var x1:array, var y1:array, var i
 
 ## How fast is it from Python?:
 The `ramanujan` language is faster than the Python3 language. The above single node code runs in ~350 ms. The same heuristic
-in Python3 takes ~410 ms. The device it was tested on was a MacBook Air M3 : 8GB RAM, Apple M3 chip.
-
+in Python3 takes ~410 ms.
 

@@ -10,17 +10,17 @@ model-specific code.
 
 ### Speed against llama.cpp
 
-Measured on one 8 GB Apple M3. Prompt "The capital of France is", 10 greedy
-tokens, 4 shards. Each cell is decode ms/token (the average after the first
-token), with tokens/s in brackets.
+The benchmark uses the prompt "The capital of France is", 10 greedy tokens,
+and 4 shards. Each cell is decode ms/token (the average after the first token),
+with tokens/s in brackets.
 
 - **llama.cpp:** llama-cpp-python 0.3.35, after one warm-up run, with a
   timestamp taken when each token's logits are read. `llama_decode` returns
   before the GPU finishes, so timing only the decode call undercounts.
 - **Ramanujan:** `run_gguf_shards.py --runtime native`, either local or via one
-  `rj homelab` and one `rj worker --shared-filesystem` on the same machine.
-  The worker owns all 4 shards, so each token is one `/llm/chain` task that
-  returns only the chosen token. The homelab column is the median of 3 runs.
+  `rj homelab` and one `rj worker --shared-filesystem`. The worker owns all 4
+  shards, so each token is one `/llm/chain` task that returns only the chosen
+  token. The homelab column is the median of 3 runs.
 
 | Model | Arch | llama.cpp Metal | llama.cpp CPU (4 threads) | Ramanujan local | Ramanujan via `rj homelab` | Ramanujan output (10 tokens) |
 |---|---|---|---|---|---|---|
@@ -42,8 +42,8 @@ Ramanujan on every model.
 - **Ramanujan local vs llama.cpp Metal:** 1.13–1.49x slower on the small
   models. Compared with llama.cpp CPU it is about even, and faster on the 1.8B
   to 3.8B models.
-- **27B:** on an 8 GB machine, 16 GB of weights are read per token. Ramanujan
-  streams them with its own loader threads at 5.2 s/token. llama.cpp
+- **27B:** 16 GB of weights are read per token. Ramanujan streams them with its
+  own loader threads at 5.2 s/token. llama.cpp
   memory-maps the file and spends its time in page faults at 20.4 s/token, so
   Ramanujan is **3.9x faster**. llama.cpp on Metal cannot hold the model
   (the working-set limit is ~5.7 GB).
@@ -85,6 +85,13 @@ Ramanujan on every model.
 
 `--check-layers` error and llama.cpp agreement per model are in
 [GGUF_MODELS.md](GGUF_MODELS.md).
+
+## Capacity-aware placement (opt-in)
+
+With `--capacity-aware` (and `RAMANUJAN_CAPACITY_AWARE=1` on the services) the
+orchestrator decides which device holds which layers, from the devices' memory
+reports, and reuses shards a device already has cached. The algorithm, budgets,
+plan lifecycle and API are documented in [ORCHESTRATION.md](../ORCHESTRATION.md).
 
 ## Design
 
@@ -209,6 +216,13 @@ rj homelab 8888
 rj worker http://HOMELAB:8888 2 --cache ~/.ramanujan/worker-cache --max-shards 2
 python3 run_gguf_shards.py --runtime native --homelab http://localhost:8888 --package ... --metadata ... --prompt ...
 
+# Multi-turn: rendered chat turns (alternating, ending with the user turn) on stdin; the oldest
+# user/assistant pairs are dropped until prompt + --max-new-tokens fits --max-context
+echo '{"turns": ["<|im_start|>user\nHi, I am Ada.<|im_end|>\n", "<|im_start|>assistant\nHello Ada!<|im_end|>\n",
+  "<|im_start|>user\nWhat is my name?<|im_end|>\n"], "suffix": "<|im_start|>assistant\n"}' |
+  python3 run_gguf_shards.py --runtime native --package $M-shards --metadata $M-ir-plan/gguf-metadata.json \
+  --prompt-turns - --max-new-tokens 16 --max-context 512    # prints {"event":"prompt-fit","droppedTurns":N}
+
 # Tests
 (cd converter && python3 -m unittest discover -s tests -p "test_native_llm.py")   # native vs NumPy parity
 python3 -m unittest tests.test_native_homelab
@@ -243,9 +257,8 @@ It also checks position-mismatch errors and `reset()`.
 
 ## Limitations
 
-- **Device.** Only OpenCL is supported, and it has been validated only on Apple
-  M3 GPUs. Linux, Android and Windows builds are untested. Page-cache bypass is
-  macOS-only.
+- **Device.** Only OpenCL is supported. Linux, Android and Windows builds are
+  untested. Page-cache bypass is macOS-only.
 - **Homelab overhead.** About 3 ms per token for the round trip through the
   homelab, plus one more hop for each change of worker along the pipeline.
   Hidden states between workers travel through the homelab, not directly

@@ -41,7 +41,7 @@ public class ExecuteInlineHomelabServerConcurrencyTest {
 
     @Test
     public void binaryDumpWritesSiblingBinaryAndCompactFreshStub() throws Exception {
-        Path workDir = Files.createTempDirectory("homelab_binary_dump_");
+        Path workDir = Files.createTempDirectory(Paths.get("."), "homelab_binary_dump_");
         try {
             Path source = workDir.resolve("source.bin");
             Path csvOut = workDir.resolve("cache.csv");
@@ -68,7 +68,7 @@ public class ExecuteInlineHomelabServerConcurrencyTest {
         RunningProcess homelab = null;
         RunningProcess worker = null;
         ExecutorService exec = Executors.newFixedThreadPool(2);
-        Path workDir = Files.createTempDirectory("homelab_integration_");
+        Path workDir = Files.createTempDirectory(Paths.get("."), "homelab_integration_");
         Path phi3Out = workDir.resolve("generated_tokens.csv");
         Path cfdOut = workDir.resolve("density.csv");
 

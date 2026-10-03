@@ -22,6 +22,7 @@ import io.vertx.sqlclient.PreparedQuery;
 import io.vertx.sqlclient.Tuple;
 import lombok.AllArgsConstructor;
 import lombok.Data;
+import lombok.ToString;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Component;
 
@@ -41,6 +42,7 @@ public class QueryExecutor {
     public static class DBConfig {
         private String jdbcUrl;
         private String username;
+        @ToString.Exclude
         private String password;
         private String dbName;
     }
@@ -62,6 +64,43 @@ public class QueryExecutor {
     private final InMemQueryExecutor inMemQueryExecutor = new InMemQueryExecutor();
 
     private DB_TYPE dbType;
+
+    public boolean isInMemory() {
+        return dbType == DB_TYPE.IN_MEM;
+    }
+
+    @FunctionalInterface
+    public interface Transaction<T> {
+        T execute(Connection connection) throws Exception;
+    }
+
+    public <T> Future<T> transaction(Transaction<T> work) {
+        if (dbType != DB_TYPE.GCP || context == null || dataSource == null) {
+            return Future.failedFuture("SQL executor is not initialized");
+        }
+        Future<T> result = Future.future();
+        context.<T>executeBlocking(blocking -> {
+            try (Connection connection = dataSource.getConnection()) {
+                connection.setAutoCommit(false);
+                try {
+                    T value = work.execute(connection);
+                    connection.commit();
+                    blocking.complete(value);
+                } catch (Exception error) {
+                    try { connection.rollback(); }
+                    catch (SQLException rollback) { error.addSuppressed(rollback); }
+                    throw error;
+                }
+            } catch (Exception error) {
+                logger.error("Database transaction failed", error);
+                blocking.fail(error);
+            }
+        }, false, done -> {
+            if (done.succeeded()) result.complete(done.result());
+            else result.fail(done.cause());
+        });
+        return result;
+    }
 
     public static enum DB_TYPE {
         GCP,
@@ -88,22 +127,14 @@ public class QueryExecutor {
             config.setUsername(dbConfig.getUsername());
             config.setPassword(dbConfig.getPassword());
 
-            int maxPool = 100 * Runtime.getRuntime().availableProcessors();
+            String poolSize = System.getenv("RAMANUJAN_DB_POOL_SIZE");
+            int maxPool = poolSize == null ? 4 : Integer.parseInt(poolSize);
+            if (maxPool < 1 || maxPool > 100) {
+                throw new IllegalArgumentException("RAMANUJAN_DB_POOL_SIZE must be between 1 and 100");
+            }
             config.setMaximumPoolSize(maxPool);
             config.setConnectionTimeout(5000);
             dataSource = new HikariDataSource(config);
-
-            int connectionsMade = maxPool;
-            while(connectionsMade > 0) {
-                try {
-                    Connection connection = dataSource.getConnection();
-                    connection.close();
-                    connectionsMade--;
-                } catch (SQLException e) {
-                    logger.error("Failed to connect to the database: " + dbConfig.getDbName() + ". Retrying...", e);
-
-                }
-            }
 
             logger.info("Database connection pool initialized with " + maxPool + " connections for database: " + dbConfig.getDbName());
 

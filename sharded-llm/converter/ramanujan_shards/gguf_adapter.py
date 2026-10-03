@@ -10,10 +10,11 @@ _BLOCK_TENSOR = re.compile(r"^blk\.([0-9]+)\..+$")
 
 
 class GGUFArchitectureAdapter(ArchitectureAdapter):
-    def __init__(self, target_shards: int = 4):
+    def __init__(self, target_shards: int = 4, per_layer: bool = False):
         if target_shards <= 0:
             raise ValueError("target_shards must be positive")
         self._target_shards = target_shards
+        self._per_layer = per_layer
 
     def build_graph(self, source: SourceReader) -> AdapterGraph:
         metadata = source.metadata()
@@ -35,7 +36,7 @@ class GGUFArchitectureAdapter(ArchitectureAdapter):
                 raise ValueError("invalid GGUF block count")
             if set(blocks) != set(range(count)):
                 raise ValueError("GGUF layer tensor coverage does not match block count")
-            group_count = min(self._target_shards, count)
+            group_count = count if self._per_layer else min(self._target_shards, count)
             groups = []
             for index in range(group_count):
                 start = index * count // group_count
@@ -47,6 +48,8 @@ class GGUFArchitectureAdapter(ArchitectureAdapter):
                     group_names += [name for name in globals_ if name.startswith("output")]
                 groups.append((group_names, {"layer_start": str(start), "layer_end": str(end)}))
         else:
+            if self._per_layer:
+                raise ValueError("per-layer artifacts require GGUF decoder blocks")
             group_count = min(self._target_shards, len(names))
             groups = [
                 (names[index * len(names) // group_count:(index + 1) * len(names) // group_count], {})

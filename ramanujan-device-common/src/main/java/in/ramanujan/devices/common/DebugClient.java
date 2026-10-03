@@ -25,7 +25,6 @@ public class DebugClient implements IDebugPushClient {
 
     final ObjectMapper objectMapper = new ObjectMapper();
 
-    private String debugValuePush = "/debugValues";
 
     static Logger logger;
 
@@ -71,7 +70,7 @@ public class DebugClient implements IDebugPushClient {
         try {
             Request request = new Request.Builder()
                     .post(RequestBody.create(JSON, data))
-                    .url(host + debugValuePush + "?asyncId=" + asyncId)
+                    .url(DeviceProtocol.debugValuesUrl(host, asyncId))
                     .build();
             Response response = getOkHttpClient().newCall(request).execute();
 

@@ -8,6 +8,9 @@ import lombok.Data;
 @Data
 @Table("asyncTaskMiddleware")
 public class AsyncTaskMiddleware {
+    @ColumnName("clusterId")
+    public String clusterId;
+
     @ColumnName("taskId")
     @PrimaryKey(keyValue = Keys.TASK_ID, order = "1")
     public String taskId;

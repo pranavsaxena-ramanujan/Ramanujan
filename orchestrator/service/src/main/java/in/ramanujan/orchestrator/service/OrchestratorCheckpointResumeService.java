@@ -17,6 +17,9 @@ public class OrchestratorCheckpointResumeService {
     @Autowired
     private HostsDao hostsDao;
 
+    @Autowired
+    private in.ramanujan.orchestrator.data.dao.AsyncTaskDao asyncTaskDao;
+
     /**
      * <pre>
      * 1. add resume checkpoint on storage.
@@ -27,14 +30,23 @@ public class OrchestratorCheckpointResumeService {
         Future<Void> future = Future.future();
         storageDao.storeBreakpoints(asyncId, checkpointResumePayload).setHandler(storeBreakpointHandler -> {
            if(storeBreakpointHandler.succeeded()) {
-               AsyncTask asyncTask = new AsyncTask();
-               asyncTask.setUuid(asyncId); //TODO: asyncTask obj is not necessarily required. To refactor this in the hostDao.getMachine().
-               hostsDao.getMachine(asyncTask, true).setHandler(getMachineHandler -> {
+               asyncTaskDao.getAsyncTask(asyncId).setHandler(taskHandler -> {
+                   if (taskHandler.failed()) {
+                       future.fail(taskHandler.cause());
+                       return;
+                   }
+                   AsyncTask asyncTask = taskHandler.result();
+                   if (asyncTask == null || asyncTask.getUuid() == null) {
+                       future.fail("Unknown async task: " + asyncId);
+                       return;
+                   }
+                   hostsDao.getMachine(asyncTask, true).setHandler(getMachineHandler -> {
                   if(getMachineHandler.succeeded()) {
                       future.complete();
                   } else {
                       future.fail(getMachineHandler.cause());
                   }
+               });
                });
            } else {
                future.fail(storeBreakpointHandler.cause());

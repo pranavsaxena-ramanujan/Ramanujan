@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Ramanujan Computing</title>
+  <link rel="stylesheet" href="/styles.css">
+  <script src="/ide.js" defer></script>
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <header><a href="/" class="brand">Ramanujan Computing</a><a class="github" href="https://github.com/Ramanujan-Computing/Ramanujan" target="_blank" rel="noopener noreferrer" aria-label="Ramanujan on GitHub" title="Ramanujan on GitHub"><svg viewBox="0 0 16 16" width="24" height="24" aria-hidden="true" fill="currentColor"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg></a><button id="access-key" type="button">Private access key</button></header>
+  <main>
+    <section class="hero"><h1>Put idle devices to work for science.</h1></section>
+    <p id="notice" role="status" hidden></p>
+    <section id="key-panel" class="card" hidden><h2>Your private management key</h2><p>No accounts or passwords. This browser keeps access to your rooms. Save this key privately to recover them on another browser; it grants room management and job submission.</p><label>Management key<input id="management-key" type="password" readonly></label><button id="show-key" type="button">Show / hide key</button><form id="restore-form"><label>Restore existing access<input id="restore-key" type="password" autocomplete="off" placeholder="Paste your private management key"></label><button type="submit">Restore rooms</button></form></section>
+    <section id="workspace" hidden>
+      <div class="workspace">
+        <aside class="card rooms"><h2>Your rooms</h2><div id="room-list"></div><form id="room-form"><label>New cluster name<input id="room-name" placeholder="My home lab" maxlength="120" required></label><button class="primary" type="submit">+ Create room</button></form><div id="join-details" hidden><h3>Invite your devices</h3><p>Save this secret now. It is only shown once.</p><label>Room ID<input id="new-room-id" readonly></label><label>Join secret<input id="new-room-secret" readonly type="password"></label><button id="show-secret" type="button">Show / hide secret</button><small>Enter these in the desktop client or Android app. Keep the management key private.</small></div></aside>
+        <div class="main-column">
+          <div class="room-head"><div><h2 id="selected-room">Choose or create a room</h2><small id="room-id-label"></small></div>
+            <div class="tabs" role="tablist" aria-label="Sections"><button id="tab-chat" class="tab" type="button" role="tab" aria-selected="true" aria-controls="chat-panel">LLM Chat</button><button id="tab-code" class="tab" type="button" role="tab" aria-selected="false" aria-controls="code-panel">Code execution</button></div></div>
+          <section id="chat-panel" class="card chat" role="tabpanel" aria-labelledby="tab-chat">
+            <div class="chat-header"><h3>LLM Chat</h3><div class="chat-tools"><label>Model<select id="model-select"><option value="">No model configured</option></select></label><button id="manage-models" type="button" aria-expanded="false" aria-controls="models-panel">Your models</button><button id="new-chat" type="button">New chat</button></div></div>
+            <div id="models-panel" class="models-panel" hidden>
+              <h3>Bring your own GGUF</h3>
+              <p>Add a GGUF model for all of your rooms. The server converts it once; your devices fetch the parts they need when you chat.</p>
+              <div class="model-forms">
+                <form id="model-upload-form"><label>Upload a .gguf file<input id="model-file" type="file" accept=".gguf" required></label><label>Name (optional)<input id="model-upload-name" maxlength="120" placeholder="Uses the file name"></label><button class="primary" type="submit" id="model-upload">Upload</button><progress id="model-upload-progress" max="1" value="0" hidden></progress><small id="model-upload-status"></small></form>
+                <form id="model-url-form"><label>Or import from a URL<input id="model-url" type="url" placeholder="https://huggingface.co/.../resolve/main/model.gguf" required></label><label>Name (optional)<input id="model-url-name" maxlength="120" placeholder="Uses the file name"></label><button class="primary" type="submit">Import</button></form>
+              </div>
+              <div id="model-list" class="model-list"></div>
+            </div>
+            <div id="messages" class="messages" aria-live="polite"><div class="empty"><p>Connect a device to this room, then ask a question.</p></div></div>
+            <form id="chat-form"><label class="sr-only" for="question">Ask a question</label><div class="composer"><textarea id="question" placeholder="Ask your cluster a question..." rows="2" maxlength="16000" required></textarea><button class="primary" id="send" type="submit">Send &rarr;</button></div></form>
+          </section>
+          <section id="code-panel" class="card ide" role="tabpanel" aria-labelledby="tab-code" hidden>
+            <div class="ide-toolbar">
+              <button id="upload-files" type="button">Upload files</button><button id="upload-folder" type="button">Upload folder</button><button id="new-file" type="button">New file</button>
+              <input id="upload-files-input" type="file" accept=".py,text/x-python" multiple hidden><input id="upload-folder-input" type="file" webkitdirectory multiple hidden>
+              <label class="entry-label">Main file<select id="entry-select"></select></label>
+              <button id="run-code" class="primary" type="button">&#9654; Run on cluster</button>
+            </div>
+            <div class="ide-body">
+              <aside class="explorer" aria-label="Files"><div class="explorer-head">Explorer</div><ul id="file-tree"></ul></aside>
+              <div class="editor-area">
+                <div id="editor-tabs" class="editor-tabs" role="tablist" aria-label="Open files"></div>
+                <div id="editor-empty" class="editor-empty" hidden>Open a file from the explorer.</div>
+                <div id="code-surface" class="code-surface"><pre id="code-gutter" class="code-gutter" aria-hidden="true"></pre><div class="code-wrap"><pre id="code-highlight" class="code-highlight" aria-hidden="true"></pre><textarea id="code-editor" spellcheck="false" autocapitalize="off" autocomplete="off" wrap="off" aria-label="Code editor"></textarea></div></div>
+              </div>
+            </div>
+            <div class="ide-panel"><div class="panel-head"><span>Output</span><span id="run-status" class="run-status"></span></div><div id="run-output" class="run-output" aria-live="polite"></div></div>
+            <div class="statusbar"><span id="status-main"></span><span id="status-files"></span><span class="statusbar-right" id="status-position"></span><span>Python</span></div>
+          </section>
+          <section class="card devices"><div class="section-title"><h2>Connected devices</h2><button id="refresh-devices">Refresh</button></div><p>Install a client and enter the room ID and join secret.</p><div id="device-list">Select a room to see its devices.</div></section>
+        </div>
+      </div>
+    </section>
+    <section class="downloads"><div><div class="section-title"><h2>Download the client</h2><button id="refresh-downloads" type="button">Refresh downloads</button></div><p>Install it on any idle device and join a room.</p></div><div id="downloads" class="download-grid"></div><p class="footnote">Available now for macOS on Apple Silicon. Windows, Linux and Android are coming soon.</p></section>
+  </main>
+  <footer><span>Ramanujan Computing</span><span>MIT licensed</span></footer>
+</body>
+</html>

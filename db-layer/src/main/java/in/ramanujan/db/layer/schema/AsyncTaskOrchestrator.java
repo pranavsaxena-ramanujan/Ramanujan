@@ -9,6 +9,24 @@ import lombok.Data;
 @Data
 @Table("asyncTaskOrchestrator")
 public class AsyncTaskOrchestrator {
+    @ColumnName("llm")
+    public String llm;
+    @ColumnName("nativeResult")
+    public String nativeResult;
+    @ColumnName("nativeState")
+    public String nativeState;
+    @ColumnName("nativeDeadline")
+    public Long nativeDeadline;
+    @ColumnName("nativeFiles")
+    public String nativeFiles;
+    @ColumnName("nativeBindings")
+    public String nativeBindings;
+    @ColumnName("binaryArrayFiles")
+    public String binaryArrayFiles;
+
+    @ColumnName("clusterId")
+    public String clusterId;
+
     @ColumnName("uuid")
     @PrimaryKey(keyValue = Keys.UUID, order = "1")
     public String uuid;

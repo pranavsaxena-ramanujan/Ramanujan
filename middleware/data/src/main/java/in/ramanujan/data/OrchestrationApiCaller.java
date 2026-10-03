@@ -120,11 +120,18 @@ public class OrchestrationApiCaller {
 
     public Future<Map<String, Object>> runCode(String asyncId, String firstCommandId,
                                                String dagElementId, Vertx vertx, String orchestratorAsyncId, Boolean toBeDebugged, String commaSeparatedDebugLines) {
+        return runCode(asyncId, firstCommandId, dagElementId, vertx, orchestratorAsyncId, toBeDebugged,
+                commaSeparatedDebugLines, null);
+    }
+
+    public Future<Map<String, Object>> runCode(String asyncId, String firstCommandId,
+                                               String dagElementId, Vertx vertx, String orchestratorAsyncId,
+                                               Boolean toBeDebugged, String commaSeparatedDebugLines, String clusterId) {
         Future<Map<String, Object>> future = Future.future();
 
         JsonObject payload = new JsonObject().put("orchestratorAsyncId", orchestratorAsyncId)
         .put("firstCommandId", firstCommandId).put("dagElementId", dagElementId).put("debug", toBeDebugged)
-                .put("debugLines", commaSeparatedDebugLines);
+                .put("debugLines", commaSeparatedDebugLines).put("clusterId", clusterId);
         List<Integer> debugLines = new ArrayList<>();
         if (commaSeparatedDebugLines != null && !commaSeparatedDebugLines.isEmpty()) {
             String[] debugLinesStr = commaSeparatedDebugLines.split(",");
@@ -137,7 +144,7 @@ public class OrchestrationApiCaller {
         context.executeBlocking(blocking -> {
             try {
                 orchestratorService
-                        .orchestrateService(firstCommandId, orchestratorAsyncId, toBeDebugged, debugLines).setHandler(handler -> {
+                        .orchestrateService(firstCommandId, orchestratorAsyncId, toBeDebugged, debugLines, clusterId).setHandler(handler -> {
                             if(handler.succeeded()){
                                 blocking.complete(orchestratorAsyncId);
                             } else {

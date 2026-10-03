@@ -1,0 +1,57 @@
+CREATE TABLE IF NOT EXISTS cluster_owner (
+  id CHAR(36) PRIMARY KEY,
+  email VARCHAR(254) NOT NULL UNIQUE,
+  password_hash VARCHAR(256) NOT NULL,
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE TABLE IF NOT EXISTS cluster_session (
+  token_hash CHAR(64) PRIMARY KEY,
+  owner_id CHAR(36) NOT NULL,
+  expires_at DATETIME NOT NULL,
+  FOREIGN KEY (owner_id) REFERENCES cluster_owner(id) ON DELETE CASCADE
+);
+CREATE TABLE IF NOT EXISTS compute_cluster (
+  id CHAR(36) PRIMARY KEY,
+  room_id VARCHAR(32) NOT NULL UNIQUE,
+  owner_id CHAR(36) NOT NULL,
+  name VARCHAR(120) NOT NULL,
+  join_secret_hash VARCHAR(256) NOT NULL,
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (owner_id) REFERENCES cluster_owner(id)
+);
+CREATE TABLE IF NOT EXISTS cluster_device (
+  id CHAR(36) PRIMARY KEY,
+  cluster_id CHAR(36) NOT NULL,
+  token_hash CHAR(64) NOT NULL UNIQUE,
+  name VARCHAR(120) NOT NULL,
+  platform VARCHAR(16) NOT NULL,
+  last_seen TIMESTAMP NULL,
+  revoked BOOLEAN NOT NULL DEFAULT FALSE,
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (cluster_id) REFERENCES compute_cluster(id)
+);
+CREATE TABLE IF NOT EXISTS cluster_job (
+  id CHAR(36) PRIMARY KEY,
+  cluster_id CHAR(36) NOT NULL,
+  status VARCHAR(16) NOT NULL,
+  result_json MEDIUMTEXT NULL,
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (cluster_id) REFERENCES compute_cluster(id)
+);
+CREATE TABLE IF NOT EXISTS owner_model (
+  id CHAR(36) PRIMARY KEY,
+  owner_id CHAR(36) NOT NULL,
+  name VARCHAR(120) NOT NULL,
+  source VARCHAR(8) NOT NULL,
+  source_url VARCHAR(2048) NULL,
+  status VARCHAR(16) NOT NULL,
+  progress DOUBLE NOT NULL DEFAULT 0,
+  detail VARCHAR(600) NULL,
+  size_bytes BIGINT NULL,
+  architecture VARCHAR(64) NULL,
+  chat_format VARCHAR(16) NULL,
+  generation_prefix VARCHAR(200) NULL,
+  context_length INT NULL,
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (owner_id) REFERENCES cluster_owner(id) ON DELETE CASCADE
+);

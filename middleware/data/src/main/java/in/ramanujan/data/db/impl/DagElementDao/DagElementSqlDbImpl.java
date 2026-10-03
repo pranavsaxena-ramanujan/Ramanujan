@@ -110,6 +110,7 @@ public class DagElementSqlDbImpl implements DagElementDao {
 
             DagElementMetadata dagElementMetadata = new DagElementMetadata();
             dagElementMetadata.setDagElementId(dagElement.getId());
+            dagElementMetadata.setClusterId(dagElement.getClusterId());
             dagElementMetadata.setFirstCommandId(dagElement.getFirstCommandId());
             dagElementMetadata.setMaxPart(ruleEngineInputSubStrings.size());
 
@@ -266,6 +267,7 @@ public class DagElementSqlDbImpl implements DagElementDao {
                    final int maxPart = metadataFetchHandler.result().getMaxPart();
                    BasicDagElement basicDagElement = new BasicDagElement();
                    basicDagElement.setCommaSeparatedDebugPoints(metadataFetchHandler.result().debugPoints);
+                   basicDagElement.setClusterId(metadataFetchHandler.result().getClusterId());
                    basicDagElement.setId(dagElementId);
                    basicDagElement.setFirstCommandId(firstCommandId);
                    populateRuleEngineInDagElement(future, basicDagElement, maxPart);

@@ -1,5 +1,6 @@
 package in.ramanujan.db.layer.utils;
 
+import in.ramanujan.db.layer.annotations.InClauseSupport;
 import in.ramanujan.db.layer.annotations.Operation;
 import in.ramanujan.db.layer.annotations.PrimaryKey;
 import in.ramanujan.db.layer.annotations.PrimaryKeys;
@@ -48,6 +49,9 @@ public class InMemQueryExecutor {
         inMemDb.put(DagElementOrchestratorAsyncIdMapping.class.getSimpleName(), new TreeMap<>());
         inMemDb.put(DagElementRelationShip.class.getSimpleName(), new TreeMap<>());
         inMemDb.put(HostMapping.class.getSimpleName(), new TreeMap<>());
+        inMemDb.put(NativeAffinityOwner.class.getSimpleName(), new TreeMap<>());
+        inMemDb.put(NativeTaskDelivery.class.getSimpleName(), new TreeMap<>());
+        inMemDb.put(NativePositionClaim.class.getSimpleName(), new TreeMap<>());
         inMemDb.put(OrchestratorCallLocker.class.getSimpleName(), new TreeMap<>());
         inMemDb.put(OrchestratorMiddlewareMapping.class.getSimpleName(), new TreeMap<>());
         inMemDb.put(VariableMapping.class.getSimpleName(), new TreeMap<>());
@@ -59,6 +63,12 @@ public class InMemQueryExecutor {
         //iterate through the fields of the object and get the primary key
         //and insert the object in the tableData
         GetAllPrimaryKeyOrders result = getGetAllPrimaryKeyOrders(object);
+        if (object instanceof NativeAffinityOwner || object instanceof NativeTaskDelivery || object instanceof NativePositionClaim) {
+            String id = String.valueOf(result.primaryKeyOrder.get(in.ramanujan.db.layer.constants.Keys.UUID).get(1));
+            if (tableData.containsKey(id) && !tableData.get(id).isEmpty()) {
+                throw new IllegalStateException("Native primary key is already claimed");
+            }
+        }
 
         for(String key : result.primaryKeyOrder.keySet()) {
             Map<Integer, Object> primaryKeyMap = result.primaryKeyOrder.get(key);
@@ -220,12 +230,46 @@ public class InMemQueryExecutor {
                     //get field of dataObj and check if it matches with the field.get(dataObj)
                     if(field.get(dataObj).equals(field.get(object))) {
                         finalResult.add(dataObj);
+                        break;
                     }
                 }
 
             }
         }
         return finalResult;
+    }
+
+    /**
+     * Rows whose {@code @InClauseSupport(keyValue = inKey)} field is one of the given values and whose other
+     * non-null template fields match, mirroring {@code WHERE f1 = ? AND inField IN (...)}.
+     */
+    @SuppressWarnings("unchecked")
+    List<Object> selectIn(Object object, String inKey, List<Object>... batchOpObjectsListArray) throws Exception {
+        if (batchOpObjectsListArray.length == 0 || batchOpObjectsListArray[0] == null || batchOpObjectsListArray[0].isEmpty()) {
+            throw new IllegalArgumentException("SELECT_IN requires a list of values");
+        }
+        Set<Object> values = new HashSet<>((List<Object>) batchOpObjectsListArray[0].get(0));
+        Field inField = null;
+        for (Field field : object.getClass().getFields()) {
+            InClauseSupport support = field.getAnnotation(InClauseSupport.class);
+            if (support != null && support.keyValue().equals(inKey)) inField = field;
+        }
+        if (inField == null) throw new IllegalArgumentException("No IN clause field for " + inKey);
+        Map<String, List<Object>> tableData = inMemDb.get(object.getClass().getSimpleName());
+        Set<Object> seen = Collections.newSetFromMap(new IdentityHashMap<>());
+        List<Object> result = new ArrayList<>();
+        for (List<Object> rows : tableData.values()) {
+            for (Object row : rows) {
+                if (!seen.add(row) || !values.contains(inField.get(row))) continue;
+                boolean matches = true;
+                for (Field field : object.getClass().getFields()) {
+                    Object expected = field.get(object);
+                    if (field != inField && expected != null && !expected.equals(field.get(row))) { matches = false; break; }
+                }
+                if (matches) result.add(row);
+            }
+        }
+        return result;
     }
 
     void delete(Object object, String indexType) throws  Exception {
@@ -274,18 +318,24 @@ public class InMemQueryExecutor {
         }
     }
 
+    /** The SQL executor applies batch writes to every row in the batch list; mirror that, without repeating {@code object}. */
+    private static List<Object> batchRows(Object object, List<Object>[] batchObjs) {
+        List<Object> rows = new ArrayList<>();
+        rows.add(object);
+        if(batchObjs != null && batchObjs.length == 1 && batchObjs[0] != null) {
+            for(Object batchObj : batchObjs[0]) {
+                if(batchObj != object) rows.add(batchObj);
+            }
+        }
+        return rows;
+    }
+
     /**If the object is already present, update it, else insert it*/
     void upsert(Object object, String indexType, List<Object>... batchObjs) throws Exception {
-        StringBuilder indexBuilder = getIndexBuilder(object, indexType);
-        String index = indexBuilder.toString();
-        List<Object> batchObjsList = new ArrayList<>();
-        batchObjsList.add(object);
-        if(batchObjs != null && batchObjs.length == 1) {
-            batchObjsList.addAll(Arrays.asList(batchObjs));
-        }
-        Map<String, List<Object>> tableData = inMemDb.get(object.getClass().getSimpleName());
-        for(Object obj : batchObjsList) {
-            List<Object> data = tableData.get(index);
+        for(Object obj : batchRows(object, batchObjs)) {
+            String index = getIndexBuilder(obj, indexType).toString();
+            Map<String, List<Object>> tableData = inMemDb.get(obj.getClass().getSimpleName());
+            List<Object> data = tableData == null ? null : tableData.get(index);
             if(data == null || data.size() == 0) {
                 insert(obj);
             } else {
@@ -294,15 +344,15 @@ public class InMemQueryExecutor {
         }
     }
 
-    public Future<List<Object>> execute(Object object, String index, QueryType queryType,
+    public synchronized Future<List<Object>> execute(Object object, String index, QueryType queryType,
                                         List<Object>... batchOpObjectsListArray) throws Exception {
         try {
             switch (queryType) {
                 case INSERT:
-                    insert(object);
+                    for(Object row : batchRows(object, batchOpObjectsListArray)) insert(row);
                     break;
                 case UPDATE:
-                    update(object, index);
+                    for(Object row : batchRows(object, batchOpObjectsListArray)) update(row, index);
                     break;
                 case SELECT:
                     return Future.succeededFuture(select(object, index));
@@ -312,6 +362,8 @@ public class InMemQueryExecutor {
                 case UPSERT:
                     upsert(object, index, batchOpObjectsListArray);
                     break;
+                case SELECT_IN:
+                    return Future.succeededFuture(selectIn(object, index, batchOpObjectsListArray));
                 default:
                     throw new Exception("QueryType not supported");
             }

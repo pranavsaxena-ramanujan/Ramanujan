@@ -34,9 +34,15 @@ public class OrchestrateService {
     private StorageDao storageDao;
 
     public Future<Void> orchestrateService(String firstCommandId, String orchestratorAsyncId, Boolean debug, List<Integer> debugLines) {
+        return orchestrateService(firstCommandId, orchestratorAsyncId, debug, debugLines, null);
+    }
+
+    public Future<Void> orchestrateService(String firstCommandId, String orchestratorAsyncId, Boolean debug,
+                                          List<Integer> debugLines, String clusterId) {
         Future<Void> future = Future.future();
         AsyncTask asyncTask = new AsyncTask(orchestratorAsyncId, Status.PROCESSING.getKeyName(),
                null, null, null, firstCommandId, null, debug, debugLines);
+        asyncTask.setClusterId(clusterId);
         if(debugLines != null && debugLines.size() > 0) {
             CheckpointResumePayload payload = new CheckpointResumePayload();
             payload.setLines(debugLines);
@@ -61,26 +67,20 @@ public class OrchestrateService {
     }
 
     private void assignMachine(String asyncId, Future<Void> future, AsyncTask asyncTask) {
-        hostsDao.getMachine(asyncTask,false).setHandler(hostMachineGetHandler -> {
-            if(hostMachineGetHandler.succeeded()) {
-                logger.info(asyncId + " got machine " + hostMachineGetHandler.result());
-                asyncTask.setHostAssigned(hostMachineGetHandler.result());
-
-                asyncTaskDao.insert(asyncTask).setHandler(asyncTaskInsertHandler -> {
-                    if(asyncTaskInsertHandler.succeeded()) {
-                        logger.info(asyncId + "inserted asyncTask in asyncTaskDataStore");
-                        // vertx.eventBus().publish(EventBus.PINGER, JsonObject.mapFrom(asyncTask));
-                        future.complete();
-                    } else {
-                        logger.error(asyncId + " couldn't insert in asyncTaskDataStore", asyncTaskInsertHandler.cause());
-                        future.fail(asyncTaskInsertHandler.cause());
-                    }
-                });
-
-            } else {
-                logger.error(asyncId + " couldn't find machine", hostMachineGetHandler.cause());
-                future.fail(hostMachineGetHandler.cause());
+        // Make the task visible before its host mapping can be retrieved by a polling worker.
+        asyncTaskDao.insert(asyncTask).setHandler(insertHandler -> {
+            if (insertHandler.failed()) {
+                future.fail(insertHandler.cause());
+                return;
             }
+            hostsDao.getMachine(asyncTask, false).setHandler(hostMachineGetHandler -> {
+                if (hostMachineGetHandler.succeeded()) {
+                    asyncTask.setHostAssigned(hostMachineGetHandler.result());
+                    future.complete();
+                } else {
+                    future.fail(hostMachineGetHandler.cause());
+                }
+            });
         });
     }
 

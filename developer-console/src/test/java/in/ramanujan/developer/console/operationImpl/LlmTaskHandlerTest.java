@@ -97,15 +97,85 @@ public class LlmTaskHandlerTest {
     }
 
     @Test
-    public void leastRecentlyUsedSessionIsClosedOverTheLimit() throws Exception {
+    public void sessionLimitRejectsWithoutEvictingPinnedState() throws Exception {
         LlmTaskHandler handler = handler(2);
         handler.handle(step("a", 0, graph("/a"), Arrays.asList(1), null, 1));
         handler.handle(step("b", 0, graph("/b"), Arrays.asList(1), null, 1));
         handler.handle(step("a", 1, null, Arrays.asList(1), null, 1));
+        try {
+            handler.handle(step("c", 0, graph("/c"), Arrays.asList(1), null, 1));
+            fail("expected capacity error");
+        } catch (IllegalStateException expected) {
+            assertTrue(expected.getMessage().contains("capacity reached"));
+        }
+        assertEquals(2, handler.openSessions());
+        assertEquals(2, opened.size());
+        assertTrue(!opened.get(0).closed && !opened.get(1).closed);
+        assertTrue(!handler.acceptingNewSessions());
+        handler.handle(step("b", 1, null, Arrays.asList(1), null, 1));
+        Map<String, Object> close = new HashMap<>();
+        close.put("op", "close");
+        close.put("session", "a");
+        handler.handle(close);
+        assertTrue(handler.acceptingNewSessions());
         handler.handle(step("c", 0, graph("/c"), Arrays.asList(1), null, 1));
         assertEquals(2, handler.openSessions());
-        assertTrue("b was least recently used", opened.get(1).closed);
-        assertTrue(!opened.get(0).closed && !opened.get(2).closed);
+    }
+
+    @Test
+    public void openingReservationsCountAndFailuresReleaseCapacity() throws Exception {
+        final LlmTaskHandler[] holder = new LlmTaskHandler[1];
+        holder[0] = new LlmTaskHandler(null, 1, graph -> {
+            assertEquals(1, holder[0].openSessions());
+            assertTrue(!holder[0].acceptingNewSessions());
+            assertEquals(Integer.valueOf(1), holder[0].activePlans().get("failed-plan"));
+            throw new IllegalStateException("open failed");
+        });
+        try {
+            Map<String, Object> opening = step("a", 0, graph("/a"), Arrays.asList(1), null, 1);
+            opening.put("planId", "failed-plan");
+            holder[0].handle(opening);
+            fail("expected factory failure");
+        } catch (IllegalStateException expected) {
+            assertEquals("open failed", expected.getMessage());
+        }
+        assertEquals(0, holder[0].openSessions());
+        assertTrue(holder[0].activePlans().isEmpty());
+        assertTrue(holder[0].acceptingNewSessions());
+    }
+
+    @Test
+    public void concurrentOpenCannotExceedThePinnedSessionCap() throws Exception {
+        java.util.concurrent.CountDownLatch entered = new java.util.concurrent.CountDownLatch(1);
+        java.util.concurrent.CountDownLatch release = new java.util.concurrent.CountDownLatch(1);
+        java.util.concurrent.atomic.AtomicReference<Throwable> error = new java.util.concurrent.atomic.AtomicReference<>();
+        LlmTaskHandler handler = new LlmTaskHandler(null, 1, graph -> {
+            entered.countDown();
+            try { release.await(); }
+            catch (InterruptedException e) { Thread.currentThread().interrupt(); throw new IllegalStateException(e); }
+            return new FakeSession(graph);
+        });
+        Thread opening = new Thread(() -> {
+            try { handler.handle(step("a", 0, graph("/a"), Arrays.asList(1), null, 1)); }
+            catch (Throwable e) { error.set(e); }
+        });
+        try {
+            opening.start();
+            assertTrue(entered.await(5, java.util.concurrent.TimeUnit.SECONDS));
+            assertEquals(1, handler.openSessions());
+            try {
+                handler.handle(step("b", 0, graph("/b"), Arrays.asList(1), null, 1));
+                fail("expected concurrent capacity rejection");
+            } catch (IllegalStateException expected) {
+                assertTrue(expected.getMessage().contains("capacity reached"));
+            }
+        } finally {
+            release.countDown();
+            opening.join(5000);
+            handler.closeAll();
+        }
+        assertTrue(!opening.isAlive());
+        assertEquals(null, error.get());
     }
 
     @Test
@@ -145,6 +215,135 @@ public class LlmTaskHandlerTest {
         if (hidden != null) task.put("hidden", hidden);
         if (output != null) task.put("output", output);
         return task;
+    }
+
+    @Test
+    public void optedInCanonicalPlanPinsAllSixtySixStagesWithoutLegacyEviction() throws Exception {
+        LlmTaskHandler handler = new LlmTaskHandler(null, 8, 128,
+                graph -> {
+                    FakeSession session = new FakeSession(graph);
+                    opened.add(session);
+                    return session;
+                });
+        for (int i = 0; i < 66; i++) {
+            Map<String, Object> task = step("canonical" + i, 0, graph("/" + i), Arrays.asList(1), null, 1);
+            task.put("planId", "validated-canonical-plan");
+            handler.handle(task);
+        }
+        assertEquals(66, handler.openSessions());
+        assertEquals(Integer.valueOf(66), handler.activePlans().get("validated-canonical-plan"));
+        for (FakeSession session : opened) assertTrue(!session.closed);
+        try {
+            handler.handle(step("legacy", 0, graph("/legacy"), Arrays.asList(1), null, 1));
+            fail("the legacy total-session limit must remain unchanged");
+        } catch (IllegalStateException expected) {
+            assertTrue(expected.getMessage().contains("capacity reached (8)"));
+        }
+        handler.closeAll();
+        for (FakeSession session : opened) assertTrue(session.closed);
+    }
+
+    @Test
+    public void planIdCannotBypassTheDefaultSessionCap() throws Exception {
+        LlmTaskHandler handler = handler(1);
+        for (int i = 0; i < 2; i++) {
+            Map<String, Object> task = step("stage" + i, 0, graph("/" + i), Arrays.asList(1), null, 1);
+            task.put("planId", "plan-a");
+            try {
+                handler.handle(task);
+                assertEquals(0, i);
+            } catch (IllegalStateException expected) {
+                assertEquals(1, i);
+                assertTrue(expected.getMessage().contains("capacity reached"));
+            }
+        }
+        assertEquals(1, handler.openSessions());
+        assertEquals(1, handler.sessionLimit());
+        assertEquals(1, handler.capacitySessionLimit());
+    }
+
+    @Test
+    public void optedInPlannedSessionLimitIsBoundedAndDoesNotLiftLegacyCap() throws Exception {
+        LlmTaskHandler handler = new LlmTaskHandler(null, 1, 3, FakeSession::new);
+        handler.handle(step("legacy", 0, graph("/legacy"), Arrays.asList(1), null, 1));
+        for (int i = 0; i < 3; i++) {
+            Map<String, Object> task = step("planned" + i, 0, graph("/" + i), Arrays.asList(1), null, 1);
+            task.put("planId", "backend-plan");
+            try {
+                handler.handle(task);
+                assertTrue(i < 2);
+            } catch (IllegalStateException expected) {
+                assertEquals(2, i);
+                assertTrue(expected.getMessage().contains("capacity reached (3)"));
+            }
+        }
+        try {
+            handler.handle(step("other-legacy", 0, graph("/other"), Arrays.asList(1), null, 1));
+            fail("legacy requests must remain bounded");
+        } catch (IllegalStateException expected) {
+            assertTrue(expected.getMessage().contains("capacity reached (1)"));
+        }
+        assertEquals(3, handler.openSessions());
+        assertEquals(Integer.valueOf(2), handler.activePlans().get("backend-plan"));
+        assertTrue(!handler.acceptingNewSessions());
+        handler.closeAll();
+    }
+
+    @Test
+    public void planCountsAggregateStagesAndDisappearOnExplicitClose() throws Exception {
+        LlmTaskHandler handler = handler(4);
+        Map<String, Object> stages = chain(0, Arrays.asList(1), null, 1, null,
+                "stage0", graph("/0"), "stage1", graph("/1"));
+        stages.put("planId", "plan-a");
+        handler.handle(stages);
+        Map<String, Object> other = step("stage2", 0, graph("/2"), Arrays.asList(1), null, 1);
+        other.put("planId", "plan-b");
+        handler.handle(other);
+        assertEquals(Integer.valueOf(2), handler.activePlans().get("plan-a"));
+        assertEquals(Integer.valueOf(1), handler.activePlans().get("plan-b"));
+        Map<String, Object> close = new HashMap<>();
+        close.put("op", "close");
+        close.put("session", "stage0");
+        handler.handle(close);
+        assertEquals(Integer.valueOf(1), handler.activePlans().get("plan-a"));
+        handler.closeAll();
+        assertTrue(handler.activePlans().isEmpty());
+    }
+
+    @Test
+    public void multipleContiguousStagesPreserveExplicitStreamingAndMemoryMetadata() throws Exception {
+        LlmTaskHandler handler = handler(4);
+        Map<String, Object> first = graph("/layer0");
+        Map<String, Object> second = graph("/layer1");
+        for (Map<String, Object> graph : Arrays.asList(first, second)) {
+            graph.put("weights", "stream");
+            graph.put("weightBytes", Long.MAX_VALUE / 4);
+            graph.put("streamWorkingBytes", 1024);
+            graph.put("stateBytes", 256);
+            graph.put("scratchBytes", 128);
+        }
+        handler.handle(chain(0, Arrays.asList(1), null, 1, null, "stage0", first, "stage1", second));
+        assertEquals(2, handler.openSessions());
+        for (FakeSession session : opened) {
+            assertTrue(session.graph.contains("\"weights\":\"stream\""));
+            assertTrue(session.graph.contains("\"streamWorkingBytes\":1024"));
+            assertTrue(session.graph.contains("\"weightBytes\":" + Long.MAX_VALUE / 4));
+            assertTrue(!session.closed);
+        }
+        handler.handle(chain(1, Arrays.asList(1), null, 1, null, "stage0", null, "stage1", null));
+        assertEquals(2, opened.get(0).position);
+        assertEquals(2, opened.get(1).position);
+    }
+
+    @Test
+    public void autoAndResidentModesAreNotRewritten() throws Exception {
+        LlmTaskHandler handler = handler(2);
+        for (String mode : Arrays.asList("auto", "resident")) {
+            Map<String, Object> graph = graph("/" + mode);
+            graph.put("weights", mode);
+            handler.handle(step(mode, 0, graph, Arrays.asList(1), null, 1));
+            assertTrue(opened.get(opened.size() - 1).graph.contains("\"weights\":\"" + mode + "\""));
+        }
     }
 
     @Test

@@ -8,7 +8,6 @@ import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.util.ArrayList;
 import java.util.Base64;
-import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -40,12 +39,18 @@ final class LlmTaskHandler {
 
     private final WorkerBinaryCache binaryCache;
     private final int maxSessions;
+    private final int capacityMaxSessions;
     private final SessionFactory factory;
-    // Access-ordered: the least recently used session is closed when over the limit.
-    private final LinkedHashMap<String, Session> sessions = new LinkedHashMap<>(16, 0.75f, true);
+    private final LinkedHashMap<String, Session> sessions = new LinkedHashMap<>();
+    private final java.util.Set<String> opening = new java.util.HashSet<>();
+    private final Map<String, String> sessionPlans = new LinkedHashMap<>();
 
     LlmTaskHandler(WorkerBinaryCache binaryCache, int maxSessions) {
-        this(binaryCache, maxSessions, graph -> {
+        this(binaryCache, maxSessions, maxSessions);
+    }
+
+    LlmTaskHandler(WorkerBinaryCache binaryCache, int maxSessions, int capacityMaxSessions) {
+        this(binaryCache, maxSessions, capacityMaxSessions, graph -> {
             final LlmSession session = new LlmSession(graph);
             return new Session() {
                 public float[] step(int[] tokens, float[] hidden, int n, int pos) {
@@ -64,8 +69,15 @@ final class LlmTaskHandler {
     }
 
     LlmTaskHandler(WorkerBinaryCache binaryCache, int maxSessions, SessionFactory factory) {
+        this(binaryCache, maxSessions, maxSessions, factory);
+    }
+
+    LlmTaskHandler(WorkerBinaryCache binaryCache, int maxSessions, int capacityMaxSessions, SessionFactory factory) {
         this.binaryCache = binaryCache;
+        if (maxSessions < 1) throw new IllegalArgumentException("maxSessions must be >= 1");
         this.maxSessions = maxSessions;
+        if (capacityMaxSessions < maxSessions) throw new IllegalArgumentException("capacity session limit must be >= maxSessions");
+        this.capacityMaxSessions = capacityMaxSessions;
         this.factory = factory;
     }
 
@@ -78,7 +90,9 @@ final class LlmTaskHandler {
         if ("close".equals(op)) {
             Session session;
             synchronized (sessions) {
+                if (opening.contains(key)) throw new IllegalStateException("LLM session " + key + " is opening; retry close");
                 session = sessions.remove(key);
+                sessionPlans.remove(key);
             }
             if (session != null) session.close();
             result.put("closed", session != null);
@@ -88,7 +102,7 @@ final class LlmTaskHandler {
         if (!"step".equals(op)) throw new IllegalArgumentException("unknown llm op " + op);
         int n = ((Number) task.get("n")).intValue();
         int pos = ((Number) task.get("pos")).intValue();
-        Session session = session(key, pos, (Map<String, Object>) task.get("graph"));
+        Session session = session(key, pos, (Map<String, Object>) task.get("graph"), planId(task));
         float[] hidden = task.get("hidden") != null ? decodeFloats(String.valueOf(task.get("hidden"))) : null;
         float[] out = session.step(tokens(task), hidden, n, pos);
         putOutput(result, out, task.get("output"));
@@ -105,12 +119,22 @@ final class LlmTaskHandler {
     private Map<String, Object> chain(Map<String, Object> task) throws IOException {
         int n = ((Number) task.get("n")).intValue();
         int pos = ((Number) task.get("pos")).intValue();
+        if (binaryCache != null && pos == 0) {
+            List<String> assigned = new ArrayList<>();
+            synchronized (sessions) {
+                for (Map<String, Object> stage : (List<Map<String, Object>>) task.get("stages")) {
+                    if (!sessions.containsKey(String.valueOf(stage.get("session")))) collectFiles(stage.get("graph"), assigned);
+                }
+            }
+            binaryCache.preflight(assigned);
+        }
         int[] tokens = tokens(task);
         float[] hidden = task.get("hidden") != null ? decodeFloats(String.valueOf(task.get("hidden"))) : null;
         List<Object> infos = new ArrayList<>();
         Map<String, Object> info = null;
         for (Map<String, Object> stage : (List<Map<String, Object>>) task.get("stages")) {
-            Session session = session(String.valueOf(stage.get("session")), pos, (Map<String, Object>) stage.get("graph"));
+            Session session = session(String.valueOf(stage.get("session")), pos, (Map<String, Object>) stage.get("graph"),
+                    planId(task));
             hidden = session.step(tokens, hidden, n, pos);
             tokens = null;
             info = MAPPER.readValue(session.info(), Map.class);
@@ -150,36 +174,68 @@ final class LlmTaskHandler {
         return tokens;
     }
 
-    private Session session(String key, int pos, Map<String, Object> graph) throws IOException {
+    private static String planId(Map<String, Object> task) {
+        Object id = task.get("planId");
+        return id == null || String.valueOf(id).trim().isEmpty() ? null : String.valueOf(id);
+    }
+
+    @SuppressWarnings("unchecked")
+    private Session session(String key, int pos, Map<String, Object> graph, String planId) throws IOException {
         synchronized (sessions) {
             Session existing = sessions.get(key);
             if (existing != null) return existing;
+            if (opening.contains(key)) throw new IllegalStateException("LLM session " + key + " is opening; retry");
+            if (pos != 0 || graph == null) {
+                throw new IllegalStateException("LLM session " + key + " is not open on this worker (restarted or the "
+                        + "shard moved); restart the generation from position 0");
+            }
+            int limit = planId == null ? maxSessions : capacityMaxSessions;
+            if (sessions.size() + opening.size() >= limit) {
+                throw new IllegalStateException("LLM session capacity reached (" + limit
+                        + "); explicitly close an existing session before opening another");
+            }
+            opening.add(key);
+            if (planId != null) sessionPlans.put(key, planId);
         }
-        if (pos != 0 || graph == null) {
-            throw new IllegalStateException("LLM session " + key + " is not open on this worker (restarted or the "
-                    + "shard moved); restart the generation from position 0");
-        }
-        localize(graph);
-        Session opened = factory.open(MAPPER.writeValueAsString(graph));
-        List<Session> evicted = new ArrayList<>();
-        synchronized (sessions) {
-            Session raced = sessions.get(key);
-            if (raced != null) {
-                evicted.add(opened);
-                opened = raced;
-            } else {
-                sessions.put(key, opened);
-                Iterator<Map.Entry<String, Session>> oldest = sessions.entrySet().iterator();
-                while (sessions.size() > maxSessions && oldest.hasNext()) {
-                    Map.Entry<String, Session> entry = oldest.next();
-                    if (entry.getKey().equals(key)) continue;
-                    evicted.add(entry.getValue());
-                    oldest.remove();
+        try {
+            if (binaryCache != null) {
+                List<String> weights = new ArrayList<>();
+                collectFiles(graph, weights);
+                binaryCache.preflight(weights);
+            }
+            Map<String, Object> original = binaryCache == null ? null : MAPPER.readValue(MAPPER.writeValueAsBytes(graph), Map.class);
+            localize(graph);
+            if (original != null) {
+                try {
+                    binaryCache.shards().record(original);
+                } catch (IOException | RuntimeException e) {
+                    System.err.println("[Worker] shard manifest not updated: " + e.getClass().getSimpleName());
                 }
             }
+            Session opened = factory.open(MAPPER.writeValueAsString(graph));
+            synchronized (sessions) {
+                sessions.put(key, opened);
+                opening.remove(key);
+            }
+            return opened;
+        } finally {
+            synchronized (sessions) {
+                opening.remove(key);
+                if (!sessions.containsKey(key)) sessionPlans.remove(key);
+            }
         }
-        for (Session session : evicted) session.close();
-        return opened;
+    }
+
+    /** Collects immutable tensor files without treating full weight bytes as an in-memory requirement. */
+    private static void collectFiles(Object node, List<String> files) {
+        if (node instanceof Map) {
+            for (Map.Entry<?, ?> entry : ((Map<?, ?>) node).entrySet()) {
+                if ("file".equals(entry.getKey()) && entry.getValue() instanceof String) files.add((String) entry.getValue());
+                else collectFiles(entry.getValue(), files);
+            }
+        } else if (node instanceof List) {
+            for (Object item : (List<?>) node) collectFiles(item, files);
+        }
     }
 
     /** Rewrites every tensor "file" in the graph to a worker-local cached copy. */
@@ -202,7 +258,23 @@ final class LlmTaskHandler {
 
     int openSessions() {
         synchronized (sessions) {
-            return sessions.size();
+            return sessions.size() + opening.size();
+        }
+    }
+
+    boolean acceptingNewSessions() {
+        synchronized (sessions) { return sessions.size() + opening.size() < capacityMaxSessions; }
+    }
+
+    int sessionLimit() { return maxSessions; }
+
+    int capacitySessionLimit() { return capacityMaxSessions; }
+
+    Map<String, Integer> activePlans() {
+        synchronized (sessions) {
+            Map<String, Integer> counts = new LinkedHashMap<>();
+            for (String plan : sessionPlans.values()) counts.put(plan, counts.getOrDefault(plan, 0) + 1);
+            return counts;
         }
     }
 
@@ -211,6 +283,7 @@ final class LlmTaskHandler {
         synchronized (sessions) {
             all = new ArrayList<>(sessions.values());
             sessions.clear();
+            sessionPlans.clear();
         }
         for (Session session : all) session.close();
     }

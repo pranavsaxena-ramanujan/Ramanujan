@@ -22,6 +22,34 @@ contiguous layer ranges; other GGUFs fall back to tensor-level grouping. Every
 tensor is assigned once. Unknown GGML quantization types are preserved as opaque
 bytes, including any alignment padding, rather than silently transcoded.
 
+### Reusable per-layer artifacts (opt-in)
+
+Add `--per-layer` to emit a canonical package with one `blk.N` group per shard:
+
+```sh
+PYTHONPATH=. python3 -m ramanujan_shards.emit_gguf \
+  --gguf /path/to/model.gguf --output-dir /path/to/model-layers --per-layer
+```
+
+This mode ignores the requested `--shards` count when partitioning; artifact
+paths and bytes depend on the model, not the current worker topology. Global
+embedding/RoPE tensors accompany block 0, output tensors accompany the final
+block, and every source tensor is copied exactly once. Auxiliary GGUF blocks
+are retained as before. `--shard-index N` selects canonical block N, not a
+worker assignment. GGUFs without decoder blocks are rejected in this mode.
+The existing default grouped conversion is unchanged.
+
+Reuse this same package when workers join/leave; do not reconvert for each
+topology. The native runner's `--capacity-aware` option plans embedding,
+individual decoder layers, and the head from this canonical layout at run time, while the backend can
+chain multiple adjacent stages on one device. It also accepts existing grouped
+packages, preserving their coarse stage graphs. Fine-grained execution graphs
+do not duplicate the canonical tensor files.
+The orchestrator merges each device's contiguous pieces into one session, so a
+65-block package does not require 65 live sessions per device. This groups
+execution graphs, not artifact files, and requires no second GGUF conversion.
+See [../../ORCHESTRATION.md](../../ORCHESTRATION.md).
+
 On an individual device, add `--shard-index 1` (zero-based) to fetch only that
 device's assigned shard from the URL and store it at `--output-dir`. Run the
 same verifier on this partial package; all devices must use the same `--shards`
@@ -77,13 +105,12 @@ executed as OpenCL kernels. Layers run one at a time: the runner binds that
 layer's raw GGUF weights, returns the hidden state plus DeltaNet recurrent/conv
 state or KV cache (`*_state.bin`, `*_k_cache.bin`, `*_v_cache.bin`) with `take`,
 then sends `EVICT_WEIGHTS` so each worker holds about one layer of weights.
-On an 8 GB Apple M3 the prompt above yields " Paris." at roughly 16 s per
-token with each worker under 300 MB RSS. Decoding is greedy, and
-`--max-context` bounds the KV cache.
+Decoding is greedy, and `--max-context` bounds the KV cache.
 
 `--check-layers N` compares the hidden state after each of the first N layers
-with `llm_reference.py` (bit-identical on Qwen35 to `qwen35_reference.py`, a NumPy port of swarmllm's llama.cpp-checked
-`ref_q38.mjs`); `--reference-token` also compares the first token's logits.
+with `llm_reference.py` (bit-identical on Qwen35 to
+`qwen35_reference.py`); `--reference-token` also compares the first token's
+logits.
 All 64 layers matched within 2e-5 relative error, and the output head chose the
 same token with a maximum logit error of 5e-5.
 

@@ -5,6 +5,7 @@ import unittest
 from pathlib import Path
 
 from ramanujan_shards.gguf_emitter import emit_gguf_package
+from ramanujan_shards.llm_package import all_tensors, load_package
 from ramanujan_shards.verify_gguf import verify_gguf_package
 
 
@@ -30,6 +31,49 @@ def _write_gguf(path, architecture, tensors, block_count=None):
 
 
 class GenericGGUFEmitterTest(unittest.TestCase):
+    def test_per_layer_artifacts_are_canonical_across_worker_counts(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            tensors = [("token_embd.weight", 0, [8], b"e" * 32)]
+            tensors += [("blk.{0}.attn_q.weight".format(index), 2, [32], bytes([index]) * 18)
+                        for index in range(4)]
+            tensors += [("output_norm.weight", 0, [8], b"n" * 32),
+                        ("output.weight", 0, [8], b"o" * 32)]
+            _write_gguf(root / "model.gguf", "llama", tensors, block_count=4)
+            snapshots = []
+            for workers in (1, 8):
+                output = root / ("layers-" + str(workers))
+                package = emit_gguf_package(root / "model.gguf", output, shards=workers, per_layer=True)
+                self.assertEqual(package["artifactLayout"], "per-layer")
+                self.assertEqual(package["totalShards"], 4)
+                self.assertEqual(verify_gguf_package(output), len(tensors))
+                _, loaded_shards = load_package(output)
+                self.assertTrue(all(shard["artifactLayout"] == "per-layer" for shard in loaded_shards))
+                loaded = all_tensors(loaded_shards)
+                self.assertEqual(set(loaded), {name for name, _, _, _ in tensors})
+                self.assertTrue(all(tensor["file"].stat().st_size == tensor["bytes"]
+                                    for tensor in loaded.values()))
+                snapshot = {}
+                seen = set()
+                for index, entry in enumerate(package["shards"]):
+                    shard = output / entry["shardId"]
+                    manifest = json.loads((shard / "manifest.json").read_text())
+                    self.assertEqual((manifest["layerStart"], manifest["layerEnd"]), (index, index + 1))
+                    for name, tensor in manifest["tensorFiles"].items():
+                        self.assertNotIn(name, seen)
+                        seen.add(name)
+                        snapshot[str((shard / tensor["path"]).relative_to(output))] = (
+                            (shard / tensor["path"]).read_bytes())
+                    snapshot[entry["manifestPath"]] = (shard / "manifest.json").read_bytes()
+                self.assertEqual(seen, {name for name, _, _, _ in tensors})
+                snapshots.append(snapshot)
+            self.assertEqual(snapshots[0], snapshots[1])
+            partial = emit_gguf_package(root / "model.gguf", root / "partial", shards=1,
+                                        shard_index=2, per_layer=True)
+            self.assertEqual(partial["totalShards"], 4)
+            self.assertEqual(partial["shards"][0]["shardId"], "shard-02")
+            self.assertEqual(verify_gguf_package(root / "partial"), 1)
+
     def test_shards_non_qwen_layers_without_output_head(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

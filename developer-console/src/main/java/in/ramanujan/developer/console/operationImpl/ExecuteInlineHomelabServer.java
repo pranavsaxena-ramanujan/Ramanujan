@@ -57,7 +57,7 @@ public class ExecuteInlineHomelabServer extends ExecuteInline {
     // Tasks compiled and waiting to be served to a polling worker
     private final AffinityTaskQueue<PendingTask> taskQueue = new AffinityTaskQueue<>();
     // Binary files referenced by dispatched tasks; /binary/fetch serves only these.
-    private final Set<String> fetchableBinaryFiles = ConcurrentHashMap.newKeySet();
+    private final Map<String, Set<String>> fetchableBinaryFiles = new ConcurrentHashMap<>();
     // Tasks served but not yet completed (keyed by uuid sent to worker)
     private final ConcurrentHashMap<String, PendingTask> inflight = new ConcurrentHashMap<>();
     // Completed run outputs keyed by orchestrator requestId.
@@ -66,6 +66,41 @@ public class ExecuteInlineHomelabServer extends ExecuteInline {
     private final AtomicReference<String> latestRequestId = new AtomicReference<>();
     private final ReadWriteLock runStateLock = new ReentrantReadWriteLock();
     private HttpServer server;
+    private ExecutorService httpExecutor;
+
+    private static String string(Object value) {
+        return value == null ? null : String.valueOf(value);
+    }
+
+    private static String scope(String clusterId, String value) {
+        return (clusterId == null ? "-1:" : clusterId.length() + ":" + clusterId + ":") + value;
+    }
+
+    private void allowFile(String clusterId, String path) {
+        fetchableBinaryFiles.computeIfAbsent(scope(clusterId, ""), k -> ConcurrentHashMap.newKeySet()).add(path);
+    }
+
+    private static Map<String, String> queryParameters(HttpExchange ex) throws IOException {
+        Map<String, String> params = new HashMap<>();
+        String query = ex.getRequestURI().getRawQuery();
+        if (query != null) {
+            for (String pair : query.split("&")) {
+                int index = pair.indexOf('=');
+                if (index > 0) params.put(URLDecoder.decode(pair.substring(0, index), "UTF-8"),
+                        URLDecoder.decode(pair.substring(index + 1), "UTF-8"));
+            }
+        }
+        return params;
+    }
+
+    private boolean hasAssignedWorker(String hostId, String clusterId) {
+        if (hostId == null) return false;
+        for (PendingTask task : inflight.values()) {
+            if (hostId.equals(task.assignedHost) && Objects.equals(clusterId, task.assignedCluster)
+                    && (task.clusterId == null || clusterId.equals(task.clusterId))) return true;
+        }
+        return false;
+    }
 
     // -------------------------------------------------------------------------
     // Inner types
@@ -85,6 +120,7 @@ public class ExecuteInlineHomelabServer extends ExecuteInline {
         // Optional sticky placement key (e.g. model shard id) and post-task weight eviction.
         final String                affinity;
         final boolean               evictWeights;
+        String                      clusterId;
         volatile Throwable          failure = null;
 
         KernelRun(Map<String, Variable> variableMap, Map<String, Array> arrayMap, List<DagElement> allElements,
@@ -110,6 +146,9 @@ public class ExecuteInlineHomelabServer extends ExecuteInline {
         final String     responseJson; // full OpenPingHttpResponse JSON to return to worker
         // Set for native LLM stage tasks (/llm/*): completed with the worker's /task/complete payload.
         final CompletableFuture<Map<String, Object>> llmResult;
+        String clusterId;
+        volatile String assignedHost;
+        volatile String assignedCluster;
 
         PendingTask(String uuid, DagElement dagElement, KernelRun kernelRun, String responseJson) {
             this(uuid, dagElement, kernelRun, responseJson, null);
@@ -130,6 +169,7 @@ public class ExecuteInlineHomelabServer extends ExecuteInline {
         final Map<String, Map<String, Object>> arrayStore;
         final Map<String, List<Integer>> arrayDimensions;
         final Map<String, String> binaryArrayFileStore;
+        String clusterId;
 
         CompletedRunState(Map<String, Object> variableStore,
                           Map<String, Map<String, Object>> arrayStore,
@@ -156,7 +196,9 @@ public class ExecuteInlineHomelabServer extends ExecuteInline {
 
         startHttpServer(port);
 
-        String ip = getLocalIp();
+        String ip = server.getAddress().getAddress().isAnyLocalAddress()
+                ? getLocalIp() : server.getAddress().getAddress().getHostAddress();
+        if (ip.contains(":")) ip = "[" + ip + "]";
         System.out.println("HOMELAB_READY");
         System.out.println("HOMELAB_ADDRESS http://" + ip + ":" + port);
         System.out.flush();
@@ -215,6 +257,7 @@ public class ExecuteInlineHomelabServer extends ExecuteInline {
             String taskUuid = UUID.randomUUID().toString();
             Map<String, Object> data = new LinkedHashMap<>();
             data.put("uuid",           taskUuid);
+            data.put("clusterId",      run.clusterId);
             data.put("ruleEngineInput", element.getRuleEngineInput());
             data.put("firstCommandId", element.getFirstCommandId());
             data.put("debug",          false);
@@ -224,7 +267,7 @@ public class ExecuteInlineHomelabServer extends ExecuteInline {
             if (element.getRuleEngineInput() != null && element.getRuleEngineInput().getArrays() != null) {
                 for (Array array : element.getRuleEngineInput().getArrays()) {
                     if (array.getBinaryFile() != null && !array.getBinaryFile().isEmpty()) {
-                        fetchableBinaryFiles.add(array.getBinaryFile());
+                        allowFile(run.clusterId, array.getBinaryFile());
                     }
                 }
             }
@@ -235,7 +278,8 @@ public class ExecuteInlineHomelabServer extends ExecuteInline {
 
             PendingTask task = new PendingTask(taskUuid, element, run, responseJson);
             inflight.put(taskUuid, task);
-            taskQueue.add(task, run.affinity);
+            task.clusterId = run.clusterId;
+            taskQueue.add(task, run.affinity, run.clusterId);
 
             System.err.println("[Homelab] dispatched task (firstCmd=" + element.getFirstCommandId()
                     + ", uuid=" + taskUuid + (run.affinity != null ? ", affinity=" + run.affinity : "")
@@ -290,12 +334,21 @@ public class ExecuteInlineHomelabServer extends ExecuteInline {
 
     protected void dispatchToWorkers(List<String> args, String requestId, String affinity,
                                      boolean evictWeights) throws Exception {
+        dispatchToWorkers(args, requestId, affinity, evictWeights, null);
+    }
+
+    protected void dispatchToWorkers(List<String> args, String requestId, String affinity,
+                                     boolean evictWeights, String clusterId) throws Exception {
+        dispatchCodeToWorkers(createJson(args), requestId, affinity, evictWeights, clusterId);
+    }
+
+    protected void dispatchCodeToWorkers(CodeRunRequest req, String requestId, String affinity,
+                                         boolean evictWeights, String clusterId) throws Exception {
         long t0 = System.currentTimeMillis();
 
         Map<String, Variable> variableMap = new HashMap<>();
         Map<String, Array>    arrayMap    = new HashMap<>();
 
-        CodeRunRequest req = createJson(args);
         String code = req.getCode();
         List<CsvInformation> csvList = req.getCsvInformationList() != null
                 ? req.getCsvInformationList() : new ArrayList<>();
@@ -326,7 +379,7 @@ public class ExecuteInlineHomelabServer extends ExecuteInline {
         List<DagElement> dagList   = new ArrayList<>();
         Map<String, String> dagCodeMap = new HashMap<>();
         DagElement firstDag = translateUtil.populateAllDagElements(
-                firstSnippet, csvList, functionCallsREI,
+                firstSnippet, req.getAllFiles(), csvList, functionCallsREI,
                 variableMap, arrayMap, dagList, dagCodeMap, linesForFunctions);
 
         Set<DagElement> uniqueElements = new LinkedHashSet<>();
@@ -334,10 +387,11 @@ public class ExecuteInlineHomelabServer extends ExecuteInline {
         uniqueElements.addAll(dagList);
         List<DagElement> allElements = new ArrayList<>(uniqueElements);
 
-        System.err.println("[Homelab] compiled " + args.get(0)
+        System.err.println("[Homelab] compiled request " + requestId
                 + " in " + (System.currentTimeMillis() - t0) + "ms  DAG=" + allElements.size());
 
         KernelRun run = new KernelRun(variableMap, arrayMap, allElements, affinity, evictWeights);
+        run.clusterId = clusterId;
 
         // Identify all root DAG elements (elements with no previous dependencies)
         List<DagElement> roots = new ArrayList<>();
@@ -396,7 +450,7 @@ public class ExecuteInlineHomelabServer extends ExecuteInline {
             binaryStore.put(name, e.getValue());
         }
         System.err.println("[Homelab] setStores: binaryStore keys=" + binaryStore.keySet());
-        completeRunState(requestId, varStore, arrStore, arrDimensions, binaryStore);
+        completeRunState(requestId, varStore, arrStore, arrDimensions, binaryStore, clusterId);
     }
 
     protected void completeRunState(String requestId,
@@ -404,6 +458,14 @@ public class ExecuteInlineHomelabServer extends ExecuteInline {
                                     Map<String, Map<String, Object>> arrayStore,
                                     Map<String, List<Integer>> arrayDimensions,
                                     Map<String, String> binaryArrayFileStore) {
+        completeRunState(requestId, variableStore, arrayStore, arrayDimensions, binaryArrayFileStore, null);
+    }
+
+    protected void completeRunState(String requestId,
+                                    Map<String, Object> variableStore,
+                                    Map<String, Map<String, Object>> arrayStore,
+                                    Map<String, List<Integer>> arrayDimensions,
+                                    Map<String, String> binaryArrayFileStore, String clusterId) {
         Map<String, Object> varCopy = new HashMap<>();
         if (variableStore != null) varCopy.putAll(variableStore);
         Map<String, Map<String, Object>> arrCopy = deepCopyArrayStore(arrayStore);
@@ -414,18 +476,21 @@ public class ExecuteInlineHomelabServer extends ExecuteInline {
         runStateLock.writeLock().lock();
         try {
             // Preserve existing interactive query behavior for stdin clients.
-            ExecutorImpl.setStores(varCopy, arrCopy);
+            if (clusterId == null) ExecutorImpl.setStores(varCopy, arrCopy);
 
             if (requestId == null || requestId.trim().isEmpty()) {
-                ExecutorImpl.setBinaryArrayFileStore(binaryCopy);
+                if (clusterId == null) ExecutorImpl.setBinaryArrayFileStore(binaryCopy);
                 return;
             }
 
-            CompletedRunState previous = completedRunStates.put(requestId, new CompletedRunState(varCopy, arrCopy, dimCopy, binaryCopy));
+            String stateKey = scope(clusterId, requestId);
+            CompletedRunState state = new CompletedRunState(varCopy, arrCopy, dimCopy, binaryCopy);
+            state.clusterId = clusterId;
+            CompletedRunState previous = completedRunStates.put(stateKey, state);
             if (previous == null) {
-                completedRunOrder.add(requestId);
+                completedRunOrder.add(stateKey);
             }
-            latestRequestId.set(requestId);
+            if (clusterId == null) latestRequestId.set(stateKey);
             evictOldCompletedStatesIfNeeded();
         } finally {
             runStateLock.writeLock().unlock();
@@ -466,20 +531,25 @@ public class ExecuteInlineHomelabServer extends ExecuteInline {
     // -------------------------------------------------------------------------
 
     protected void startHttpServer(int port) throws IOException {
-        HttpServer createdServer = HttpServer.create(new InetSocketAddress(port), 0);
+        String bindAddress = System.getenv("RAMANUJAN_HOMELAB_BIND_ADDRESS");
+        InetSocketAddress address = bindAddress == null || bindAddress.isEmpty()
+                ? new InetSocketAddress(port) : new InetSocketAddress(bindAddress, port);
+        HttpServer createdServer = HttpServer.create(address, 0);
         this.server = createdServer;
         createdServer.createContext("/pings/open",        this::handleOpenPing);
         createdServer.createContext("/pings/heartbeat",   this::handleHeartbeat);
         createdServer.createContext("/task/complete",     this::handleTaskComplete);
         createdServer.createContext("/orchestrator/run",  this::handleOrchestratorRun);
         createdServer.createContext("/orchestrator/dump", this::handleOrchestratorDump);
+        createdServer.createContext("/orchestrator/var",  this::handleOrchestratorVar);
         createdServer.createContext("/binary/fetch",      this::handleBinaryFetch);
         createdServer.createContext("/binary/stat",       this::handleBinaryStat);
         createdServer.createContext("/orchestrator/uploadBinary", this::handleUploadBinary);
         createdServer.createContext("/llm/step",          ex -> handleLlm(ex, "step"));
         createdServer.createContext("/llm/close",         ex -> handleLlm(ex, "close"));
         createdServer.createContext("/llm/chain",         this::handleLlmChain);
-        createdServer.setExecutor(Executors.newCachedThreadPool());
+        httpExecutor = Executors.newCachedThreadPool();
+        createdServer.setExecutor(httpExecutor);
         createdServer.start();
         System.err.println("[Homelab] HTTP server listening on :" + port);
     }
@@ -489,6 +559,8 @@ public class ExecuteInlineHomelabServer extends ExecuteInline {
         if (runningServer != null) {
             runningServer.stop(0);
             this.server = null;
+            httpExecutor.shutdownNow();
+            httpExecutor = null;
         }
     }
 
@@ -504,7 +576,28 @@ public class ExecuteInlineHomelabServer extends ExecuteInline {
         Object affinity = req.get("affinity");
         boolean evictWeights = Boolean.TRUE.equals(req.get("evictWeights"));
         try {
-            dispatchToWorkers(args, requestId, affinity != null ? String.valueOf(affinity) : null, evictWeights);
+            String clusterId = string(req.get("clusterId"));
+            if (req.get("code") instanceof String) {
+                CodeRunRequest codeRequest = MAPPER.convertValue(req, CodeRunRequest.class);
+                if (codeRequest.getCsvInformationList() != null) {
+                    for (CsvInformation csv : codeRequest.getCsvInformationList()) {
+                        if (csv == null || csv.getFileName() == null || csv.getData() == null
+                                || !csv.getFileName().matches("[A-Za-z_][A-Za-z0-9_]*(\\.csv)?")) {
+                            sendJson(ex, 400, "{\"status\":\"ERROR\",\"message\":\"Inline CSV requires a logical fileName and data string\"}");
+                            return;
+                        }
+                        csv.setInlineData(true);
+                    }
+                }
+                dispatchCodeToWorkers(codeRequest, requestId, string(affinity), evictWeights, clusterId);
+            } else if (args == null || args.isEmpty()) {
+                sendJson(ex, 400, "{\"status\":\"ERROR\",\"message\":\"code or nonempty args is required\"}");
+                return;
+            } else if (clusterId == null) {
+                dispatchToWorkers(args, requestId, string(affinity), evictWeights);
+            } else {
+                dispatchToWorkers(args, requestId, string(affinity), evictWeights, clusterId);
+            }
             Map<String, Object> response = new LinkedHashMap<>();
             response.put("status", "SUCCESS");
             response.put("requestId", requestId);
@@ -530,6 +623,7 @@ public class ExecuteInlineHomelabServer extends ExecuteInline {
         Map<String, Object> result = new LinkedHashMap<>();
         try {
             Map<String, Object> req = MAPPER.readValue(readAllBytes(ex.getRequestBody()), Map.class);
+            String clusterId = string(req.get("clusterId"));
             Object affinity = req.get("affinity");
             if (affinity == null || req.get("session") == null) {
                 sendJson(ex, 400, "{\"status\":\"ERROR\",\"error\":\"affinity and session are required\"}");
@@ -537,12 +631,13 @@ public class ExecuteInlineHomelabServer extends ExecuteInline {
             }
             if (req.get("files") instanceof List) {
                 for (Object file : (List<Object>) req.get("files")) {
-                    if (file instanceof String && new File((String) file).isFile()) fetchableBinaryFiles.add((String) file);
+                    if (file instanceof String && new File((String) file).isFile()) allowFile(clusterId, (String) file);
                 }
             }
             req.remove("files");
             req.put("op", op);
-            Map<String, Object> payload = runLlmTask(req, String.valueOf(affinity), llmTimeoutSeconds(req));
+            req.put("session", scope(clusterId, string(req.get("session"))));
+            Map<String, Object> payload = runLlmTask(req, String.valueOf(affinity), llmTimeoutSeconds(req), clusterId);
             if (payload == null) {
                 sendJson(ex, 504, "{\"status\":\"ERROR\",\"error\":\"no worker completed the llm task in time\"}");
                 return;
@@ -580,6 +675,7 @@ public class ExecuteInlineHomelabServer extends ExecuteInline {
         Map<String, Object> result = new LinkedHashMap<>();
         try {
             Map<String, Object> req = MAPPER.readValue(readAllBytes(ex.getRequestBody()), Map.class);
+            String clusterId = string(req.get("clusterId"));
             List<Map<String, Object>> stages = req.get("stages") instanceof List
                     ? (List<Map<String, Object>>) req.get("stages") : null;
             if (stages == null || stages.isEmpty()) {
@@ -593,7 +689,7 @@ public class ExecuteInlineHomelabServer extends ExecuteInline {
                 }
                 if (stage.get("files") instanceof List) {
                     for (Object file : (List<Object>) stage.get("files")) {
-                        if (file instanceof String && new File((String) file).isFile()) fetchableBinaryFiles.add((String) file);
+                        if (file instanceof String && new File((String) file).isFile()) allowFile(clusterId, (String) file);
                     }
                 }
             }
@@ -606,11 +702,11 @@ public class ExecuteInlineHomelabServer extends ExecuteInline {
             int tasks = 0;
             int i = 0;
             while (i < stages.size()) {
-                int end = groupEnd(stages, i, taskQueue.owners());
+                int end = groupEnd(stages, i, taskQueue.owners(clusterId));
                 List<Map<String, Object>> group = new ArrayList<>();
                 for (Map<String, Object> stage : stages.subList(i, end)) {
                     Map<String, Object> s = new LinkedHashMap<>();
-                    s.put("session", stage.get("session"));
+                    s.put("session", scope(clusterId, string(stage.get("session"))));
                     if (stage.get("graph") != null) s.put("graph", stage.get("graph"));
                     group.add(s);
                 }
@@ -622,7 +718,7 @@ public class ExecuteInlineHomelabServer extends ExecuteInline {
                 task.put("n", req.get("n"));
                 task.put("pos", req.get("pos"));
                 if (end == stages.size() && req.get("output") != null) task.put("output", req.get("output"));
-                Map<String, Object> payload = runLlmTask(task, String.valueOf(stages.get(i).get("affinity")), timeoutSeconds);
+                Map<String, Object> payload = runLlmTask(task, String.valueOf(stages.get(i).get("affinity")), timeoutSeconds, clusterId);
                 tasks++;
                 if (payload == null) {
                     sendJson(ex, 504, "{\"status\":\"ERROR\",\"error\":\"no worker completed the llm chain task for stage "
@@ -675,22 +771,27 @@ public class ExecuteInlineHomelabServer extends ExecuteInline {
     }
 
     /** Queues one llm task for the worker owning {@code affinity}; returns its /task/complete payload, or null on timeout. */
-    private Map<String, Object> runLlmTask(Map<String, Object> llm, String affinity, long timeoutSeconds) throws Exception {
+    private Map<String, Object> runLlmTask(Map<String, Object> llm, String affinity, long timeoutSeconds,
+                                        String clusterId) throws Exception {
         String taskUuid = UUID.randomUUID().toString();
         Map<String, Object> data = new LinkedHashMap<>();
         data.put("uuid", taskUuid);
+        data.put("clusterId", clusterId);
         data.put("llm", llm);
         Map<String, Object> envelope = new LinkedHashMap<>();
         envelope.put("status", "SUCCESS");
         envelope.put("data", data);
         CompletableFuture<Map<String, Object>> done = new CompletableFuture<>();
         PendingTask task = new PendingTask(taskUuid, null, null, MAPPER.writeValueAsString(envelope), done);
+        task.clusterId = clusterId;
         inflight.put(taskUuid, task);
-        taskQueue.add(task, affinity);
+        taskQueue.add(task, affinity, clusterId);
         try {
             return done.get(timeoutSeconds, TimeUnit.SECONDS);
         } catch (TimeoutException e) {
             inflight.remove(taskUuid);
+            taskQueue.remove(task);
+            taskQueue.completed(task.assignedHost, task.assignedCluster);
             return null;
         }
     }
@@ -703,7 +804,9 @@ public class ExecuteInlineHomelabServer extends ExecuteInline {
         String path = (String) req.get("path");
         String requestId = req.get("requestId") != null ? String.valueOf(req.get("requestId")) : null;
 
-        CompletedRunState runState = resolveStateForDump(requestId);
+        String clusterId = queryParameters(ex).get("clusterId");
+        if (clusterId == null) clusterId = string(req.get("clusterId"));
+        CompletedRunState runState = resolveStateForDump(requestId, clusterId);
         if (runState == null) {
             sendJson(ex, 404, "{\"status\":\"ERROR\",\"message\":\"No completed run state found\"}");
             return;
@@ -807,12 +910,40 @@ public class ExecuteInlineHomelabServer extends ExecuteInline {
         }
     }
 
-    private CompletedRunState resolveStateForDump(String requestId) {
+    private void handleOrchestratorVar(HttpExchange ex) throws IOException {
+        byte[] body = readAllBytes(ex.getRequestBody());
+        Map<String, Object> req = MAPPER.readValue(body, Map.class);
+        String name = (String) req.get("name");
+        String requestId = req.get("requestId") != null ? String.valueOf(req.get("requestId")) : null;
+        String clusterId = queryParameters(ex).get("clusterId");
+        if (clusterId == null) clusterId = string(req.get("clusterId"));
+
+        CompletedRunState runState = resolveStateForDump(requestId, clusterId);
+        if (runState == null) {
+            sendJson(ex, 404, "{\"status\":\"ERROR\",\"message\":\"No completed run state found\"}");
+            return;
+        }
+
+        Object val = runState.variableStore.get(name);
+        if (val == null && clusterId == null) {
+            // Also check ExecutorImpl.variableStore fallback (unscoped runs only)
+            val = ExecutorImpl.variableStore.get(name);
+        }
+
+        Map<String, Object> res = new LinkedHashMap<>();
+        res.put("status", "SUCCESS");
+        res.put("name", name);
+        res.put("value", val);
+        sendJson(ex, 200, MAPPER.writeValueAsString(res));
+    }
+
+    private CompletedRunState resolveStateForDump(String requestId, String clusterId) {
         runStateLock.readLock().lock();
         try {
             if (requestId != null && !requestId.trim().isEmpty()) {
-                return completedRunStates.get(requestId);
+                return completedRunStates.get(scope(clusterId, requestId));
             }
+            if (clusterId != null) return null;
 
             String latest = latestRequestId.get();
             if (latest != null) {
@@ -837,6 +968,13 @@ public class ExecuteInlineHomelabServer extends ExecuteInline {
 
     /** Resolves the {@code path} query parameter to a file referenced by a dispatched task, or sends an error. */
     private File resolveFetchableFile(HttpExchange ex) throws IOException {
+        Map<String, String> params = queryParameters(ex);
+        String clusterId = params.get("clusterId");
+        if (clusterId != null && !hasAssignedWorker(params.get("uuid"), clusterId)) {
+            consumeBody(ex);
+            sendJson(ex, 403, "{\"status\":\"ERROR\",\"message\":\"Worker has no assignment in this cluster\"}");
+            return null;
+        }
         String query = ex.getRequestURI().getRawQuery();
         String path = null;
         if (query != null) {
@@ -853,7 +991,8 @@ public class ExecuteInlineHomelabServer extends ExecuteInline {
             sendJson(ex, 400, "{\"status\":\"ERROR\",\"message\":\"Missing path parameter\"}");
             return null;
         }
-        if (!fetchableBinaryFiles.contains(path)) {
+        if (!fetchableBinaryFiles.getOrDefault(scope(clusterId, ""), Collections.emptySet()).contains(path)
+                && !fetchableBinaryFiles.getOrDefault(scope(null, ""), Collections.emptySet()).contains(path)) {
             consumeBody(ex);
             sendJson(ex, 403, "{\"status\":\"ERROR\",\"message\":\"Path is not referenced by a dispatched task\"}");
             return null;
@@ -936,13 +1075,31 @@ public class ExecuteInlineHomelabServer extends ExecuteInline {
             }
 
             PendingTask task = inflight.get(uuid);
+            Map<String, String> params = queryParameters(ex);
+            String clusterId = params.get("clusterId");
+            if (params.get("taskUuid") != null) task = inflight.get(params.get("taskUuid"));
             if (task == null || task.kernelRun == null) {
                 consumeBody(ex);
                 sendJson(ex, 404, "{\"status\":\"ERROR\",\"message\":\"Unknown task uuid: " + uuid + "\"}");
                 return;
             }
+            String hostId = params.get("taskUuid") != null ? params.get("uuid") : params.get("hostId");
+            if (!Objects.equals(clusterId, task.assignedCluster)
+                    || task.assignedHost == null
+                    || (clusterId != null && !task.assignedHost.equals(hostId))) {
+                consumeBody(ex);
+                sendJson(ex, 403, "{\"status\":\"ERROR\",\"message\":\"Wrong task assignment\"}");
+                return;
+            }
+            if (!task.kernelRun.arrayMap.containsKey(arrayId)) {
+                consumeBody(ex);
+                sendJson(ex, 403, "{\"status\":\"ERROR\",\"message\":\"Unknown array for task\"}");
+                return;
+            }
 
-            File dest = File.createTempFile("ramanujan_homelab_recv_", ".bin");
+            File directory = new File(".ramanujan-homelab-outputs");
+            if (!directory.isDirectory() && !directory.mkdirs()) throw new IOException("Cannot create output directory");
+            File dest = new File(directory, UUID.randomUUID().toString() + ".bin");
             try (InputStream is = ex.getRequestBody();
                  OutputStream os = new FileOutputStream(dest)) {
                 byte[] buf = new byte[65536];
@@ -1005,8 +1162,17 @@ public class ExecuteInlineHomelabServer extends ExecuteInline {
             }
         }
         PendingTask task;
+        String clusterId = queryParameters(ex).get("clusterId");
+        if (hostId == null || hostId.isEmpty()) {
+            sendJson(ex, 400, "{\"status\":\"ERROR\",\"message\":\"uuid is required\"}");
+            return;
+        }
         try {
-            task = taskQueue.poll(hostId, affinityLimit, 900);
+            task = taskQueue.poll(hostId, affinityLimit, 900, clusterId);
+            if (task != null) {
+                task.assignedCluster = clusterId;
+                task.assignedHost = hostId;
+            }
             if (task != null && task.kernelRun != null && task.kernelRun.affinity != null) {
                 System.err.println("[Homelab] affinity " + task.kernelRun.affinity + " -> worker " + hostId);
             }
@@ -1031,22 +1197,24 @@ public class ExecuteInlineHomelabServer extends ExecuteInline {
     private void handleTaskComplete(HttpExchange ex) throws IOException {
         // Java 8 compatible way to read request body
         byte[] body = readAllBytes(ex.getRequestBody());
+        Map<String, Object> payload = MAPPER.readValue(body, Map.class);
+        String uuid = string(payload.get("uuid"));
+        String hostId = string(payload.get("hostId"));
+        String clusterId = string(payload.get("clusterId"));
+        PendingTask task = uuid == null ? null : inflight.get(uuid);
+        if (task == null || task.assignedHost == null || !task.assignedHost.equals(hostId)
+                || !Objects.equals(task.assignedCluster, clusterId)
+                || !inflight.remove(uuid, task)) {
+            sendJson(ex, 403, "{\"status\":\"ERROR\",\"message\":\"Wrong task assignment\"}");
+            return;
+        }
+        taskQueue.completed(hostId, clusterId);
         sendJson(ex, 200, "{\"status\":\"SUCCESS\"}");
 
         // Process asynchronously so we don't hold the worker's HTTP connection
         new Thread(() -> {
             try {
-                Map<String, Object> payload = MAPPER.readValue(body, Map.class);
-                String             uuid    = (String) payload.get("uuid");
                 Map<String, Object> results = (Map<String, Object>) payload.get("data");
-                Object hostId = payload.get("hostId");
-                taskQueue.completed(hostId != null ? String.valueOf(hostId) : null);
-
-                PendingTask task = inflight.remove(uuid);
-                if (task == null) {
-                    System.err.println("[Homelab] received unknown uuid: " + uuid);
-                    return;
-                }
                 if (task.llmResult != null) {
                     task.llmResult.complete(payload);
                     return;

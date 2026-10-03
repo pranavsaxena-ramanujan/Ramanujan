@@ -23,7 +23,18 @@ public class OpenPingHandler implements Handler<RoutingContext> {
     @Override
     public void handle(RoutingContext event) {
         String hostId = event.queryParams().get("uuid");
-        openPingService.storePing(hostId).setHandler(new MonitoringHandler<>("openPing", handler -> {
+        if (hostId == null || hostId.isEmpty()) {
+            event.response().setStatusCode(HttpResponseStatus.BAD_REQUEST.code()).end("uuid is required");
+            return;
+        }
+        int affinityLimit = Integer.MAX_VALUE;
+        try {
+            if (event.queryParams().get("affinityLimit") != null) affinityLimit = Integer.parseInt(event.queryParams().get("affinityLimit"));
+        } catch (NumberFormatException ex) {
+            event.response().setStatusCode(400).end("Invalid affinityLimit");
+            return;
+        }
+        openPingService.storePing(hostId, event.queryParams().get("clusterId"), affinityLimit).setHandler(new MonitoringHandler<>("openPing", handler -> {
             if(handler.succeeded()) {
                 ApiResponse apiResponse = new ApiResponse(Status.SUCCESS.getKeyName(), handler.result());
                 try {

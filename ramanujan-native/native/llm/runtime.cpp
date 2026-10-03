@@ -29,6 +29,7 @@
 #include <vector>
 
 #if defined(_WIN32)
+#define NOMINMAX
 #include <windows.h>
 #else
 #include <fcntl.h>
@@ -113,10 +114,17 @@ struct Device {
     cl_context context = nullptr;
     cl_program program = nullptr;
     int wg = 64;
-    std::string name, platformName;
+    std::string name, platformName, vendor, driverVersion, runtimeVersion;
     cl_ulong globalMem = 0, maxAlloc = 0;
+    cl_bool unifiedMemory = CL_FALSE;
+    cl_device_type type = 0;
     std::mutex mutex;           // guards residentBytes
     size_t residentBytes = 0;   // resident weights across all sessions in this process
+
+    ~Device() {
+        if (program) clReleaseProgram(program);
+        if (context) clReleaseContext(context);
+    }
 };
 
 static std::string deviceString(cl_device_id device, cl_device_info what) {
@@ -207,12 +215,17 @@ static Device &device() {
     }
     if (!d->device) throw std::runtime_error("no OpenCL device found");
     d->name = deviceString(d->device, CL_DEVICE_NAME);
+    d->vendor = deviceString(d->device, CL_DEVICE_VENDOR);
+    d->driverVersion = deviceString(d->device, CL_DRIVER_VERSION);
+    d->runtimeVersion = deviceString(d->device, CL_DEVICE_VERSION);
     size_t size = 0;
     clGetPlatformInfo(d->platform, CL_PLATFORM_NAME, 0, nullptr, &size);
     d->platformName.assign(size, '\0');
     clGetPlatformInfo(d->platform, CL_PLATFORM_NAME, size, &d->platformName[0], nullptr);
     while (!d->platformName.empty() && d->platformName.back() == '\0') d->platformName.pop_back();
     clGetDeviceInfo(d->device, CL_DEVICE_GLOBAL_MEM_SIZE, sizeof(d->globalMem), &d->globalMem, nullptr);
+    clGetDeviceInfo(d->device, CL_DEVICE_HOST_UNIFIED_MEMORY, sizeof(d->unifiedMemory), &d->unifiedMemory, nullptr);
+    clGetDeviceInfo(d->device, CL_DEVICE_TYPE, sizeof(d->type), &d->type, nullptr);
     clGetDeviceInfo(d->device, CL_DEVICE_MAX_MEM_ALLOC_SIZE, sizeof(d->maxAlloc), &d->maxAlloc, nullptr);
     size_t maxGroup = 0;
     clGetDeviceInfo(d->device, CL_DEVICE_MAX_WORK_GROUP_SIZE, sizeof(maxGroup), &maxGroup, nullptr);
@@ -251,11 +264,42 @@ static size_t physicalMemory() {
 
 // ---------------------------------------------------------------- weight loading
 
+static std::mutex g_allocationMutex;
+static std::map<cl_mem, size_t> g_allocations;
+static size_t g_allocatedBytes = 0;
+
+static cl_mem trackedCreateBuffer(cl_context context, cl_mem_flags flags, size_t bytes, void *host, cl_int *status) {
+    cl_mem buffer = clCreateBuffer(context, flags, bytes, host, status);
+    if (buffer) {
+        try {
+            std::lock_guard<std::mutex> lock(g_allocationMutex);
+            g_allocations.emplace(buffer, bytes);
+            g_allocatedBytes += bytes;
+        } catch (...) {
+            clReleaseMemObject(buffer);
+            throw;
+        }
+    }
+    return buffer;
+}
+
+static void trackedReleaseBuffer(cl_mem buffer) {
+    {
+        std::lock_guard<std::mutex> lock(g_allocationMutex);
+        auto it = g_allocations.find(buffer);
+        if (it != g_allocations.end()) {
+            g_allocatedBytes -= it->second;
+            g_allocations.erase(it);
+        }
+    }
+    clReleaseMemObject(buffer);
+}
+
 using Buffers = std::map<std::string, cl_mem>;
 
 static void release(Buffers &buffers) {
     for (auto &entry : buffers)
-        if (entry.second) clReleaseMemObject(entry.second);
+        if (entry.second) trackedReleaseBuffer(entry.second);
     buffers.clear();
 }
 
@@ -306,7 +350,7 @@ static cl_mem upload(Device &d, cl_command_queue queue, const TensorRef &t, std:
         throw std::runtime_error(t.file + ": " + std::to_string(t.bytes) + " bytes exceeds the device's max allocation (" +
                                  std::to_string(d.maxAlloc) + ")");
     cl_int status;
-    cl_mem buffer = clCreateBuffer(d.context, CL_MEM_READ_ONLY, t.bytes, nullptr, &status);
+    cl_mem buffer = trackedCreateBuffer(d.context, CL_MEM_READ_ONLY, t.bytes, nullptr, &status);
     check(status, "clCreateBuffer(weights)");
     try {
         if (staging.size() < STAGING) staging.resize(STAGING);
@@ -318,7 +362,7 @@ static cl_mem upload(Device &d, cl_command_queue queue, const TensorRef &t, std:
                   "clEnqueueWriteBuffer(weights)");
         }
     } catch (...) {
-        clReleaseMemObject(buffer);
+        trackedReleaseBuffer(buffer);
         throw;
     }
     return buffer;
@@ -681,7 +725,7 @@ private:
 
     cl_mem scratch(size_t floats) {
         cl_int status;
-        cl_mem buffer = clCreateBuffer(d_.context, CL_MEM_READ_WRITE, sizeof(float) * std::max<size_t>(floats, 1),
+        cl_mem buffer = trackedCreateBuffer(d_.context, CL_MEM_READ_WRITE, sizeof(float) * std::max<size_t>(floats, 1),
                                        nullptr, &status);
         check(status, "clCreateBuffer(scratch)");
         owned_.push_back(buffer);
@@ -728,7 +772,7 @@ private:
         if (hasHead_) logits_ = scratch(h_.vocab);
         if (hasEmbed_) {
             cl_int status;
-            embedRow_ = clCreateBuffer(d_.context, CL_MEM_READ_ONLY, embed_.rowBytes, nullptr, &status);
+            embedRow_ = trackedCreateBuffer(d_.context, CL_MEM_READ_ONLY, embed_.rowBytes, nullptr, &status);
             check(status, "clCreateBuffer(embed row)");
             owned_.push_back(embedRow_);
             embedReader_.reset(new FileReader(embed_.file));
@@ -754,7 +798,7 @@ private:
             }
         }
         cl_int status;
-        rope_ = clCreateBuffer(d_.context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, sizeof(float) * table.size(),
+        rope_ = trackedCreateBuffer(d_.context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, sizeof(float) * table.size(),
                                table.data(), &status);
         check(status, "clCreateBuffer(rope)");
         owned_.push_back(rope_);
@@ -823,7 +867,7 @@ private:
             d_.residentBytes -= weightBytes_;
             residentCounted_ = false;
         }
-        for (cl_mem buffer : owned_) clReleaseMemObject(buffer);
+        for (cl_mem buffer : owned_) trackedReleaseBuffer(buffer);
         owned_.clear();
         for (auto &entry : kernels_) clReleaseKernel(entry.second);
         kernels_.clear();
@@ -834,12 +878,12 @@ private:
     void ensureHidden(int n) {
         if (n <= hiddenCapacity_) return;
         cl_int status;
-        cl_mem buffer = clCreateBuffer(d_.context, CL_MEM_READ_WRITE, sizeof(float) * (size_t)n * h_.dim, nullptr, &status);
+        cl_mem buffer = trackedCreateBuffer(d_.context, CL_MEM_READ_WRITE, sizeof(float) * (size_t)n * h_.dim, nullptr, &status);
         check(status, "clCreateBuffer(hidden)");
         if (hiddenBuf_) {
             clFinish(queue_);
             owned_.erase(std::remove(owned_.begin(), owned_.end(), hiddenBuf_), owned_.end());
-            clReleaseMemObject(hiddenBuf_);
+            trackedReleaseBuffer(hiddenBuf_);
         }
         hiddenBuf_ = buffer;
         owned_.push_back(buffer);
@@ -1134,5 +1178,65 @@ RJLLM_API const char *rjllm_info(rjllm_session *session) {
 }
 
 RJLLM_API void rjllm_close(rjllm_session *session) { delete session; }
+
+RJLLM_API int rjllm_prepare_capacity(char *err, size_t err_len) {
+    try {
+        (void)rjllm::device();
+        return 0;
+    } catch (const std::exception &e) {
+        setError(err, err_len, e.what());
+    } catch (...) {
+        setError(err, err_len, "unknown native capacity preflight error");
+    }
+    return 1;
+}
+
+RJLLM_API const char *rjllm_capacity_info() {
+    static thread_local std::string json;
+    std::unique_lock<std::mutex> deviceLock(rjllm::g_deviceMutex, std::try_to_lock);
+    if (!deviceLock.owns_lock() || !rjllm::g_device)
+        return "{\"supportsStreaming\":true,\"supportsRuntime\":null,\"nativeReady\":null}";
+    const rjllm::Device &d = *rjllm::g_device;
+    std::ostringstream out;
+    out << "{\"supportsStreaming\":true,\"supportsRuntime\":true,\"nativeReady\":true,\"gpuAvailableBytes\":null,\"unifiedMemory\":"
+        << (d.unifiedMemory ? "true" : "false");
+    if (d.type & CL_DEVICE_TYPE_GPU) {
+        auto quoted = [](const std::string &text) {
+            std::string value = "\"";
+            static const char hex[] = "0123456789abcdef";
+            for (unsigned char c : text) {
+                if (c == '"' || c == '\\') { value += '\\'; value += (char)c; }
+                else if (c < 0x20) {
+                    value += "\\u00";
+                    value += hex[c >> 4];
+                    value += hex[c & 15];
+                } else value += (char)c;
+            }
+            return value + "\"";
+        };
+        out << ",\"gpuTotalBytes\":";
+        if (d.globalMem) out << d.globalMem;
+        else out << "null";
+        out << ",\"gpuMaxAllocationBytes\":";
+        if (d.maxAlloc) out << d.maxAlloc;
+        else out << "null";
+        out << ",\"gpuDeviceName\":" << quoted(d.name)
+            << ",\"gpuDeviceVendor\":" << quoted(d.vendor)
+            << ",\"gpuDriverVersion\":" << quoted(d.driverVersion)
+            << ",\"gpuRuntime\":\"OpenCL\",\"gpuRuntimeVersion\":" << quoted(d.runtimeVersion);
+        // All live runtime OpenCL buffers, including streamed weights, scratch, KV and recurrent state.
+        {
+            std::lock_guard<std::mutex> lock(rjllm::g_allocationMutex);
+            out << ",\"gpuAllocatedBytes\":" << rjllm::g_allocatedBytes;
+        }
+        std::unique_lock<std::mutex> weightLock(rjllm::g_device->mutex, std::try_to_lock);
+        out << ",\"gpuResidentBytes\":";
+        if (weightLock.owns_lock()) out << d.residentBytes;
+        else out << "null";
+    }
+    out << "}";
+    json = out.str();
+    return json.c_str();
+}
 
 }  // extern "C"

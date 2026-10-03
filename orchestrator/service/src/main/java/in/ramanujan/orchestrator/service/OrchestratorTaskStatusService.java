@@ -35,6 +35,23 @@ public class OrchestratorTaskStatusService {
 
     private Logger logger= LoggerFactory.getLogger(OrchestratorTaskStatusService.class);
 
+    public Future<AsyncTask> getAsyncTaskStatus(String asyncTaskId, String clusterId) {
+        Future<AsyncTask> future = Future.future();
+        asyncTaskDao.getAsyncTask(asyncTaskId).setHandler(taskHandler -> {
+            if (taskHandler.failed()) {
+                future.fail(taskHandler.cause());
+            } else if (taskHandler.result() == null || taskHandler.result().getUuid() == null
+                    || !java.util.Objects.equals(taskHandler.result().getClusterId(), clusterId)) {
+                future.fail(new SecurityException("Unknown task or wrong cluster"));
+            } else {
+                getAsyncTaskStatus(asyncTaskId).setHandler(handler -> {
+                    if (handler.succeeded()) future.complete(handler.result()); else future.fail(handler.cause());
+                });
+            }
+        });
+        return future;
+    }
+
     public Future<AsyncTask> getAsyncTaskStatus(String asyncTaskId) {
         Future<AsyncTask> future = Future.future();
         Future<AsyncTask> getAsyncTaskFut = asyncTaskDao.getAsyncTask(asyncTaskId);
@@ -42,6 +59,11 @@ public class OrchestratorTaskStatusService {
         CompositeFuture.all(getAsyncTaskFut, getHostInfo).setHandler(handler -> {
             if(handler.succeeded()) {
                 AsyncTask asyncTask = getAsyncTaskFut.result();
+                if (asyncTask.getLlm() != null) {
+                    asyncTask.setHostAssigned(getHostInfo.result());
+                    future.complete(asyncTask);
+                    return;
+                }
                 if(Status.SUCCESS.getKeyName().equalsIgnoreCase(asyncTask.getStatus()))  {
                     future.complete(asyncTask);
                     return;

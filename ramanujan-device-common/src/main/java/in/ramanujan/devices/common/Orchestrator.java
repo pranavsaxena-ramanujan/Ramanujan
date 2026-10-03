@@ -20,9 +20,6 @@ public class Orchestrator {
 
     private Credentials credentials;
 
-    private String pingUri = "/pings/open";
-    private String completionUri = "/task/complete";
-    private String debugValuePush = "/debugValues";
 
     private ObjectMapper objectMapper = new ObjectMapper();
 
@@ -73,7 +70,7 @@ public class Orchestrator {
         try {
             Request request = new Request.Builder()
                     .post(RequestBody.create(JSON, data))
-                    .url(host + debugValuePush + "?asyncId=" + asyncId)
+                    .url(DeviceProtocol.debugValuesUrl(host, asyncId))
                     .build();
             Response response = getOkHttpClient().newCall(request).execute();
 
@@ -110,7 +107,7 @@ public class Orchestrator {
             ResultSubmitPayload resultSubmitPayload = new ResultSubmitPayload(uuid, hostId, processorFutureMap.getResult());
             Request request = new Request.Builder()
                     .post(RequestBody.create(JSON, objectMapper.writeValueAsString(resultSubmitPayload)))
-                    .url(host + completionUri)
+                    .url(DeviceProtocol.taskCompleteUrl(host))
                     .build();
             Response response = getOkHttpClient().newCall(request).execute();
 
@@ -134,7 +131,7 @@ public class Orchestrator {
     private OpenPingApiResponse callBackendOpenAPI(final String uuid, final Credentials credentials) throws Exception {
         Request request = new Request.Builder()
                 .post(RequestBody.create(JSON, ""))
-                .url(host + pingUri + "?uuid=" + uuid)
+                .url(DeviceProtocol.openUrl(host, uuid, null))
                 .build();
         final Response response = getOkHttpClient().newCall(request).execute();
         if(response.code() != 200) {

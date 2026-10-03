@@ -9,6 +9,12 @@ import lombok.Data;
 @Data
 @Table("hostMapping")
 public class HostMapping {
+    @ColumnName("assignedNonce")
+    public String assignedNonce;
+
+    @ColumnName("clusterId")
+    public String clusterId;
+
     @ColumnName("uuid")
     @PrimaryKey(keyValue = Keys.UUID, order = "1")
     @PrimaryKey(keyValue = Keys.UUID_HOST_ID, order = "1")

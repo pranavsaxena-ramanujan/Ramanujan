@@ -78,4 +78,18 @@ JNIEXPORT void JNICALL Java_in_ramanujan_rule_engine_LlmSession_nativeClose(JNIE
     rjllm_close(reinterpret_cast<rjllm_session *>(value));
 }
 
+JNIEXPORT jstring JNICALL Java_in_ramanujan_rule_engine_LlmSession_nativeCapacityInfo(JNIEnv *env, jclass) {
+    try {
+        return env->NewStringUTF(rjllm_capacity_info());
+    } catch (const std::exception &e) {
+        throwState(env, e.what());
+        return nullptr;
+    }
+}
+
+JNIEXPORT void JNICALL Java_in_ramanujan_rule_engine_LlmSession_nativePrepareCapacity(JNIEnv *env, jclass) {
+    char err[4096] = {0};
+    if (rjllm_prepare_capacity(err, sizeof(err)) != 0) throwState(env, err);
+}
+
 }  // extern "C"

@@ -8,6 +8,7 @@ import lombok.Data;
 @JsonIgnoreProperties(ignoreUnknown = true)
 public class AsyncTask {
     private String taskId;
+    private String clusterId;
     private TaskStatus taskStatus;
     private Object result;
 
@@ -21,7 +22,8 @@ public class AsyncTask {
     public AsyncTaskMiddleware getAsyncTaskMiddleware() {
         AsyncTaskMiddleware asyncTaskMiddleware = new AsyncTaskMiddleware();
         asyncTaskMiddleware.setTaskId(taskId);
-        asyncTaskMiddleware.setTaskStatus(taskStatus.name());
+        asyncTaskMiddleware.setClusterId(clusterId);
+        if (taskStatus != null) asyncTaskMiddleware.setTaskStatus(taskStatus.name());
         if(result != null) {
             asyncTaskMiddleware.setResult(result.toString());
         }
@@ -35,6 +37,7 @@ public class AsyncTask {
     public AsyncTask(AsyncTaskMiddleware asyncTaskMiddleware) {
         this.setResult(asyncTaskMiddleware.getResult());
         this.setTaskId(asyncTaskMiddleware.getTaskId());
+        this.setClusterId(asyncTaskMiddleware.getClusterId());
         this.setTaskStatus(TaskStatus.valueOf(asyncTaskMiddleware.getTaskStatus()));
     }
 }

@@ -18,7 +18,6 @@ import static in.ramanujan.devices.common.OrchestratorApiCallHelper.*;
 
 public class CheckpointPushClient implements ICheckpointPushClient {
 
-    private String uri = "/pings/checkpoint";
     private final ObjectMapper objectMapper = new ObjectMapper();
     final static ExecutorService executorService = Executors.newFixedThreadPool(16);
     final String asyncId;
@@ -33,7 +32,7 @@ public class CheckpointPushClient implements ICheckpointPushClient {
             CheckpointWrapper checkpointWrapper = new CheckpointWrapper(checkpoint, asyncId);
             Request request = new Request.Builder()
                     .post(RequestBody.create(JSON, objectMapper.writeValueAsString(checkpointWrapper)))
-                    .url(host + uri + "?asyncId=" + asyncId)
+                    .url(DeviceProtocol.checkpointUrl(host, asyncId))
                     .build();
             return executorService.submit(() -> {
                 try {

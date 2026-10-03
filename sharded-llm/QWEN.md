@@ -2,7 +2,7 @@
 
 ## 1. Overview & Goals
 
-This plan details the architecture and roadmap for enabling **Ramanujan** to run **Qwen 3.8 27B 4-bit Quantized (`Qwen3.8-27B-Q4_0.gguf`)**, drawing on the layer-sharding concepts proven by **SwarmLLM**.
+This plan details the architecture and roadmap for enabling **Ramanujan** to run **Qwen 3.8 27B 4-bit Quantized (`Qwen3.8-27B-Q4_0.gguf`)**.
 
 ### Key Model Specifications
 * **Source Repository:** [`unsloth/Qwen3.8-27B-GGUF`](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF)
@@ -16,11 +16,10 @@ This plan details the architecture and roadmap for enabling **Ramanujan** to run
 
 ---
 
-## 2. Inspiration from SwarmLLM: How GGUF Sharding Works
+## 2. How GGUF Sharding Works
 
-SwarmLLM does **not** check in weights to Git. Instead:
 1. It parses the remote or local GGUF file header and tensor directory.
-2. It partitions the 64 layers into contiguous slices across participants in a swarm session.
+2. It partitions the 64 layers into contiguous slices across participating devices.
 3. Each participant fetches **only the byte offsets corresponding to its assigned layers** (via HTTP Range headers or local slice reading) and caches them on disk.
 4. During inference, devices do not transfer weights; they only pass the **10 KB activation vector** ($h_{\text{state}}$) down the pipeline.
 
@@ -75,7 +74,7 @@ flowchart TD
   * Tensors are extracted via streaming file slicing (`_TensorSlice` with `seek` and buffered chunks, e.g. 4 MB read/write buffer) or `mmap`:
     $$\text{RAM Usage} \le \text{Header Size} + \text{Chunk Buffer} \approx 20\text{–}50\text{ MB}$$
   * A 2 GB or 4 GB RAM machine can shard 15 GB, 70 GB, or even 500 GB models without out-of-memory errors.
-  * For remote sharding (SwarmLLM style), HTTP `Range: bytes=X-Y` requests fetch only the slices assigned to that device directly to disk without ever downloading or storing the full monolithic file.
+  * For remote sharding, HTTP `Range: bytes=X-Y` requests fetch only the slices assigned to that device directly to disk without ever downloading or storing the full monolithic file.
 * **Functionality:**
   * Implement the `SourceReader` interface:
     * `metadata()`: Parse GGUF metadata key-value pairs (architecture, context length, layer types, head dimensions).

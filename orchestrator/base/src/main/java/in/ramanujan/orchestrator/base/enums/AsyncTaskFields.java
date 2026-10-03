@@ -6,6 +6,9 @@ import in.ramanujan.pojo.checkpoint.Checkpoint;
 public enum AsyncTaskFields {
     uuid("uuid", (task, object) ->{task.setUuid((String) object);}),
     status("status", ((task, update) -> {task.setStatus((String) update);})),
+    nativeState("nativeState", (task, value) -> task.setNativeState((String) value)),
+    nativeResult("nativeResult", (task, value) -> task.setNativeResult((java.util.Map<String, Object>) value)),
+    binaryArrayFiles("binaryArrayFiles", (task, value) -> task.setBinaryArrayFiles((java.util.Map<String, String>) value)),
 //    hostAssigned("hostAssigned", ((task, update) -> {task.setHostAssigned((String) update);})),
 //    data("data", ((task, update) -> {task.setData(update);})),
     checkpoint("checkpoint", ((task, update) -> {task.setCheckpoint((Checkpoint) update);}));

@@ -17,13 +17,13 @@ _CHUNK_SIZE = 4 * 1024 * 1024
 
 
 def emit_gguf_package(gguf_path: Union[str, Path], output_dir: Path, shards: int = 4,
-                      shard_index: Optional[int] = None) -> Dict:
+                      shard_index: Optional[int] = None, per_layer: bool = False) -> Dict:
     output_dir = Path(output_dir)
     if output_dir.exists():
         raise ValueError("output directory already exists: {0}".format(output_dir))
     reader = GGUFSourceReader(gguf_path)
-    graph = GGUFArchitectureAdapter(shards).build_graph(reader)
-    plans = plan_shards(graph, shards)
+    graph = GGUFArchitectureAdapter(shards, per_layer=per_layer).build_graph(reader)
+    plans = plan_shards(graph, len(graph.stages) if per_layer else shards)
     if shard_index is not None:
         if shard_index < 0 or shard_index >= len(plans):
             raise ValueError("shard_index must be between 0 and {0}".format(len(plans) - 1))
@@ -55,6 +55,8 @@ def emit_gguf_package(gguf_path: Union[str, Path], output_dir: Path, shards: int
             "metadata": graph.metadata,
             "shards": entries,
         }
+        if per_layer:
+            package["artifactLayout"] = "per-layer"
         (staging / "model-manifest.json").write_text(
             json.dumps(package, sort_keys=True, indent=2) + "\n", encoding="utf-8"
         )

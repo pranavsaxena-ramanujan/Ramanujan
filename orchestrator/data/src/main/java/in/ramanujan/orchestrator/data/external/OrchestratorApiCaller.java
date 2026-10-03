@@ -38,15 +38,25 @@ public class OrchestratorApiCaller {
     }
 
     public Future<Void> callOpenPingApiWithRetry(final String hostId, final Integer retryNumber) {
+        return callOpenPingApiWithRetry(hostId, retryNumber, null);
+    }
+
+    public Future<Void> callOpenPingApiWithRetry(final String hostId, final Integer retryNumber,
+                                                final String clusterId) {
+        return callOpenPingApiWithRetry(hostId, retryNumber, clusterId, Integer.MAX_VALUE);
+    }
+
+    public Future<Void> callOpenPingApiWithRetry(final String hostId, final Integer retryNumber,
+                                                final String clusterId, final int affinityLimit) {
         Future<Void> future = Future.future();
-        callOpenPingApi(hostId).setHandler(handler -> {
+        callOpenPingApi(hostId, clusterId, affinityLimit).setHandler(handler -> {
             if(handler.succeeded()){
                 future.complete();
             } else {
                 if(retryNumber == 0) {
                     future.fail(handler.cause());
                 } else {
-                    callOpenPingApiWithRetry(hostId, retryNumber - 1).setHandler(retryHandler -> {
+                    callOpenPingApiWithRetry(hostId, retryNumber - 1, clusterId, affinityLimit).setHandler(retryHandler -> {
                        if(retryHandler.succeeded()) {
                            future.complete();
                        } else {
@@ -59,14 +69,18 @@ public class OrchestratorApiCaller {
         return future;
     }
 
-    private Future<Void> callOpenPingApi(final String hostId) {
+    private Future<Void> callOpenPingApi(final String hostId, final String clusterId, final int affinityLimit) {
         Future<Void> future = Future.future();
-        String queryParam = "?uuid=" + hostId;
-        getWebClient().post(openPingUri + queryParam).sendJsonObject(new JsonObject(), handler -> {
-            if(handler.succeeded()) {
+        io.vertx.ext.web.client.HttpRequest<io.vertx.core.buffer.Buffer> request =
+                getWebClient().post(openPingUri).addQueryParam("uuid", hostId);
+        if (clusterId != null) request.addQueryParam("clusterId", clusterId);
+        if (affinityLimit != Integer.MAX_VALUE) request.addQueryParam("affinityLimit", Integer.toString(affinityLimit));
+        request.sendJsonObject(new JsonObject(), handler -> {
+            if(handler.succeeded() && handler.result().statusCode() == 200) {
                 future.complete();
             } else {
-                future.fail(handler.cause());
+                future.fail(handler.failed() ? handler.cause() :
+                        new IllegalStateException("Open ping forwarding failed: " + handler.result().statusCode()));
             }
         });
         return future;

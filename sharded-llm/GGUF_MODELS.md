@@ -12,8 +12,6 @@ OpenCL LLM runtime. On small models it is 56–75x faster; see
 
 ### Validated models (native runtime)
 
-Measured on an 8 GB Apple M3 (4 shards, greedy decoding, no chat template):
-
 - **`--check-layers`:** native OpenCL against the NumPy reference, every layer,
   as the max relative error.
 - **llama.cpp agreement:** `compare_llama_cpp.py --gpu-layers -1` (llama.cpp on

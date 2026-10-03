@@ -29,17 +29,20 @@ public class MainVerticle extends AbstractVerticle {
     CustomDeploymentOption option = new CustomDeploymentOption();
     @Override
     public void start(Future<Void> startFuture) throws Exception {
-        ApplicationContext applicationContext = new AnnotationConfigApplicationContext(SpringConfig.class);
         ConfigurationGetter.init(config());
         in.ramanujan.orchestrator.base.configuration.ConfigurationGetter.init(config());
         in.ramanujan.base.configuration.ConfigurationGetter.init(config());
+        ApplicationContext applicationContext = new AnnotationConfigApplicationContext(SpringConfig.class);
         logger.info("deploying application verticles");
-        vertx.deployVerticle(applicationContext.getBean(HttpVerticle.class), option.getDeployOptions("HttpVerticle", 250));
+        vertx.deployVerticle(applicationContext.getBean(HttpVerticle.class),
+                option.getDeployOptions("HttpVerticle", 250).setConfig(config()), deployed -> {
+                    if (deployed.succeeded()) startFuture.complete(); else startFuture.fail(deployed.cause());
+                });
         //vertx.deployVerticle(applicationContext.getBean(OrchestratorHttpVerticle.class), option.getDeployOptions("OrchHttpVerticle", 250));
         final String projectId = "ramanujan-340512";
         final String metricPusherCredPath = ConfigurationGetter.getString(in.ramanujan.middleware.base.configuration.ConfigKey.METRIC_PUSHER_CRED_PATH);
         final MonitoringVerticle monitoringVerticle = new MonitoringVerticle(projectId, metricPusherCredPath, ConfigurationGetter.getMonitoringType());
-        vertx.deployVerticle(monitoringVerticle, option.getDeployOptions("MonitoringVerticle", 1));
+        vertx.deployVerticle(monitoringVerticle, option.getDeployOptions("MonitoringVerticle", 1).setConfig(config()));
 
         QueueDaoImpl queueDaoImpl = applicationContext.getBean(QueueDaoImpl.class);
         queueDaoImpl.init(QueueDaoImpl.QueueType.fromString(ConfigurationGetter.getString(QUEUE_TYPE)));
@@ -78,7 +81,7 @@ public class MainVerticle extends AbstractVerticle {
             }
 
         });
-        vertx.deployVerticle(applicationContext.getBean(ConsumerVerticle.class), option.getDeployOptions("ConsumerVerticle", 1));
+        vertx.deployVerticle(applicationContext.getBean(ConsumerVerticle.class), option.getDeployOptions("ConsumerVerticle", 1).setConfig(config()));
 
 //        applicationContext.getBean(ConnectionCreator.class).init(vertx);
     }
