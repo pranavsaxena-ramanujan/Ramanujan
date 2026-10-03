@@ -89,12 +89,11 @@ keeps its empty `<think>` block). Other templates stay single-turn.
 Generation is greedy, not streamed. `maxContext` (default 1024) and
 `maxNewTokens` (default 128) bound it, and output is cut at the format's
 end-of-turn tokens (or `stopSequences`). Large models need small budgets: the
-example's Qwen3.8 27B entry (24 new tokens) answered in 30-55 s on one 8 GB
-Apple M3 at ~5 s/token, streaming 16 GB of weights from SSD per token. A
-non-shared device caches every shard it owns, so a single device needs ~16 GB
-of free disk for that model. That first download happens inside the first
-chat request, so the entry sets `requestTimeout` (seconds per request,
-default 120, max 1800) to 1800. The existing runtime's
+example's Qwen3.8 27B entry uses 24 new tokens. A non-shared device caches
+every shard it owns, so a single device needs ~16 GB of free disk for that
+model. That first download happens inside the first chat request, so the entry
+sets `requestTimeout` (seconds per request, default 120, max 1800) to 1800. The
+existing runtime's
 architecture/quantization limits still apply. See
 [`GGUF_MODELS.md`](../../sharded-llm/GGUF_MODELS.md) and
 [`NATIVE_LLM.md`](../../sharded-llm/NATIVE_LLM.md).

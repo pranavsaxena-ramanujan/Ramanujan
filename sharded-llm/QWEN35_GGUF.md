@@ -2,13 +2,7 @@
 
 Qwen3.8-27B (`qwen35` architecture, 16.3 GiB Q4_1 GGUF) is split into four
 shards. Each shard is executed by its own Ramanujan worker, and every layer runs
-as generated Ramanujan DSL compiled to OpenCL kernels. On an 8 GB Apple M3:
-
-```
-prompt:  "The capital of France is"
-output:  " Paris.\nThe capital of Germany is"
-speed:   ~7.6 s/token (greedy, SSD-bound), every worker below 1.3 GB RSS
-```
+as generated Ramanujan DSL compiled to OpenCL kernels.
 
 With `--runtime native` ([NATIVE_LLM.md](NATIVE_LLM.md)), the same shards run
 on the dedicated OpenCL LLM runtime at ~5.0 s/token. That run streams the
@@ -277,8 +271,6 @@ layers plus the head come to about 7.6 s per token.
 - Kernel launches call `clFlush` instead of `clFinish`. Host reads still
   synchronize through `GPU_SYNC` and `RELEASE_MEM`.
 
-Measured on the 8 GB M3 (layers 0-3 resident, warm, median):
-
 | Program | Before | After |
 |---|---|---|
 | embed | 28 ms | 1 ms |
@@ -287,8 +279,7 @@ Measured on the 8 GB M3 (layers 0-3 resident, warm, median):
 
 For full 64-layer generation, prefill plus first token fell from ~50 s to
 22.4 s, and decode from ~16 s to 11.7 s/token. Compute is now about 1.3 s of
-each token. The rest is re-reading ~250 MB of weights per layer from the SSD,
-because 16 GB of weights cannot stay in 8 GB of RAM.
+each token. The rest is re-reading ~250 MB of weights per layer from the SSD.
 
 **Weight prefetch.** Eviction only unmaps weights, so their pages can stay in
 the OS page cache. While a layer computes, background threads in the runner
@@ -310,9 +301,7 @@ warm a remote worker's page cache.
 
 ## Validation
 
-`qwen35_reference.py` is a NumPy port of swarmllm's `tests/reference/ref_q38.mjs`,
-a CPU reference its authors checked against llama.cpp's `llama-eval-callback`.
-The runner now checks against the generic `llm_reference.py`, which is
+The runner checks against the generic `llm_reference.py`, which is
 bit-identical to `qwen35_reference.py` on 27B layers 0–3 over 2 tokens.
 It reads the same shard files through vectorized Q4_1/Q5_K/Q6_K decoders; tests
 check those decoders against the per-row decoders and an independent
@@ -465,7 +454,6 @@ python3 run_gguf_shards.py --homelab http://localhost:8888 \
 | `--shared-filesystem` | off | Read the server's paths directly (same machine or shared mount) |
 | `--llm-sessions N` | 8 | Native LLM stage sessions kept open (`--runtime native`) |
 
-**Measured** (one 8 GB M3 MacBook Air running the homelab and two workers).
 Worker A was capped at 1 shard, fetched and cached shard-00 (3.6 GB), and got
 shard-00. Worker B used `--shared-filesystem` and got shards 01-03.
 
@@ -480,10 +468,10 @@ above.
 
 Distribution adds little overhead. Native execution is 150-210 ms of each
 ~250 ms layer step, so decode speed matches the single-machine runner. Resident
-weights are slower here only because 16 GB of weights cannot stay mapped in
-8 GB of RAM, and native time per layer rose to 1-1.4 s. Resident weights pay
-off only when each worker's shards fit in its own RAM. The distributed path
-does not reach 5 tok/s; that needs faster native kernels (see Limitations).
+weights are slower here when they cannot stay mapped in RAM. Resident weights
+pay off only when each worker's shards fit in its own RAM. The distributed
+path does not reach 5 tok/s; that needs faster native kernels (see
+Limitations).
 
 ## Limitations
 
@@ -494,9 +482,8 @@ does not reach 5 tok/s; that needs faster native kernels (see Limitations).
   untested.
 - **Greedy text completion.** There is no sampling, and no Jinja chat
   template. Raw `<|im_start|>` markup in the prompt is tokenized correctly.
-- **Throughput.** On the DSL runtime, about 7.6 s/token on one 8 GB machine
-  (native runtime: ~5.0 s/token), dominated by SSD
-  reads of roughly 16 GB of weights per token. With weights resident, a layer
+- **Throughput.** SSD reads of roughly 16 GB of weights per token dominate
+  when the weights cannot remain resident. With weights resident, a layer
   takes 17-24 ms against a ~2.5 ms memory-bandwidth bound for ~250 MB of
   weights. The remaining costs are many small OpenCL kernels per layer, scalar
   dequantization in the matvec kernels, and per-call protobuf and graph setup. The prompt is

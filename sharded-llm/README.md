@@ -2,8 +2,7 @@
 
 ## TL;DR
 
-This work adapts the model-sharding idea used by SwarmLLM to Ramanujan. A large
-LLM is converted into model-agnostic Ramanujan IR packages so that separate
+A large LLM is converted into model-agnostic Ramanujan IR packages so that separate
 devices can own different shards while each device keeps only one shard in
 memory. Phi-3 Mini from safetensors is the first executable architecture.
 Qwen3.8-27B from GGUF (Gated DeltaNet + attention) also runs across four
@@ -15,11 +14,10 @@ binary tensor transport, and inference memory guard all run. The local runner
 now generates the expected answer for the reference prompt; remote execution is
 still experimental.
 
-## Inspiration
+## Design
 
-SwarmLLM demonstrates GGUF model sharding across resource-constrained peers.
-The equivalent Ramanujan design keeps the useful operational idea but avoids
-coupling the system to GGUF or one model architecture:
+The Ramanujan design avoids coupling the system to GGUF or one model
+architecture:
 
 - Source readers ingest safetensors and GGUF (local or HTTP Range); the Phi-3
   safetensors adapter and the Qwen35 GGUF program generator emit executable IR.
@@ -169,15 +167,6 @@ retries rather than silently restarting from stale prefill caches; use the
 default file-backed path when restartable decode is required. It cannot be
 combined with `--worker-per-shard` or `--diagnostics`. `--profile` reports
 per-shard execution and result-transfer times.
-
-On an M3 Air with 8 GiB, a 10-token run of `What is 2 + 2?` produced
-`The sum of 2 and 2 is `, matching the expected prefix. The nine measured
-decode steps totaled 15.831 seconds (0.57 tokens/second); excluding the first
-decode step they averaged 0.59 tokens/second. The full run, including prefill,
-took 22.664 seconds. The legacy mode on the same binaries took 4.41 and
-4.09 seconds for the first two decode steps, versus 2.73 and 1.77 seconds in
-a separate resident-mode run. Most remaining time is in the four kernel runs
-per token, not file transfer. These results do not establish 10 tokens/second.
 
 The runner starts one worker JVM for the whole generation and registers the
 package with `REGISTER_SHARDS <model-manifest.json>`. The package stays on

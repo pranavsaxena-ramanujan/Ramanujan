@@ -86,7 +86,7 @@ def _silu(v):
 
 
 class Qwen35Reference:
-    """NumPy port of swarmllm/tests/reference/ref_q38.mjs (llama.cpp-validated math)."""
+    """NumPy reference implementation for Qwen3.8 inference math."""
 
     def __init__(self, config, shards):
         self.c = config

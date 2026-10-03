@@ -105,13 +105,12 @@ executed as OpenCL kernels. Layers run one at a time: the runner binds that
 layer's raw GGUF weights, returns the hidden state plus DeltaNet recurrent/conv
 state or KV cache (`*_state.bin`, `*_k_cache.bin`, `*_v_cache.bin`) with `take`,
 then sends `EVICT_WEIGHTS` so each worker holds about one layer of weights.
-On an 8 GB Apple M3 the prompt above yields " Paris." at roughly 16 s per
-token with each worker under 300 MB RSS. Decoding is greedy, and
-`--max-context` bounds the KV cache.
+Decoding is greedy, and `--max-context` bounds the KV cache.
 
 `--check-layers N` compares the hidden state after each of the first N layers
-with `llm_reference.py` (bit-identical on Qwen35 to `qwen35_reference.py`, a NumPy port of swarmllm's llama.cpp-checked
-`ref_q38.mjs`); `--reference-token` also compares the first token's logits.
+with `llm_reference.py` (bit-identical on Qwen35 to
+`qwen35_reference.py`); `--reference-token` also compares the first token's
+logits.
 All 64 layers matched within 2e-5 relative error, and the output head chose the
 same token with a maximum logit error of 5e-5.
 

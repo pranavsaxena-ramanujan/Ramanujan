@@ -254,9 +254,6 @@ const LandingPage = () => {
               </Box>
             </Grid>
           </Grid>
-          <Typography variant="body2" sx={{ textAlign: 'center', mt: 3, fontStyle: 'italic', color: 'text.secondary' }}>
-            Tested on MacBook Air M3 with 8GB RAM
-          </Typography>
         </Paper>
       </Container>
 
